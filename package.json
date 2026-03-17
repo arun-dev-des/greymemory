@@ -23,7 +23,7 @@
   "homepage": "https://github.com/arun-dev-des/greymemory",
   "repository": {
     "type": "git",
-    "url": "https://github.com/arun-dev-des/greymemory.git"
+    "url": "git+https://github.com/arun-dev-des/greymemory.git"
   },
   "bugs": {
     "url": "https://github.com/arun-dev-des/greymemory/issues"
