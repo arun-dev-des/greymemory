@@ -4,7 +4,7 @@
 
 I built this while learning AI agents from scratch. This is v0.1 — single user, file-based, honest scope. Built in public, growing in public.
 
-**Why the name?** Grey matter is where intelligence actually lives in the brain. Small footprint. Quietly powerful.
+**Why the name?** Named after Grey Matter from Ben 10 — the tiniest alien in the universe, but the smartest being in existence. Also a nod to grey matter in the brain, where intelligence actually lives. Small footprint. Quietly powerful.
 
 ---
 
