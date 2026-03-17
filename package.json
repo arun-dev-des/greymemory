@@ -1,0 +1,38 @@
+{
+  "name": "greymemory",
+  "version": "0.1.0",
+  "description": "Self-hosted memory layer for AI agents. Local embeddings, semantic search, persistent facts. No API keys required for embeddings.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "memory",
+    "embeddings",
+    "semantic-search",
+    "llm",
+    "local",
+    "privacy",
+    "ollama"
+  ],
+  "author": "Arunkumar",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/arun-dev-des/greymemory",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/arun-dev-des/greymemory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/arun-dev-des/greymemory/issues"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.20.0",
+    "dotenv": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
