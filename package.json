@@ -30,6 +30,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.20.0",
+    "better-sqlite3": "^12.8.0",
     "dotenv": "^16.0.0"
   },
   "engines": {
