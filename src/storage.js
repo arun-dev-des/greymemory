@@ -38,6 +38,35 @@ export class Storage {
         created_at  TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE(fact_key, container)
       );
+
+      CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
+      USING fts5(
+        key,
+        value,
+        container UNINDEXED,
+        content='facts',
+        content_rowid='id'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS facts_ai
+      AFTER INSERT ON facts BEGIN
+        INSERT INTO facts_fts(rowid, key, value, container)
+        VALUES (new.id, new.key, new.value, new.container);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS facts_au
+      AFTER UPDATE ON facts BEGIN
+        INSERT INTO facts_fts(facts_fts, rowid, key, value, container)
+        VALUES ('delete', old.id, old.key, old.value, old.container);
+        INSERT INTO facts_fts(rowid, key, value, container)
+        VALUES (new.id, new.key, new.value, new.container);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS facts_ad
+      AFTER DELETE ON facts BEGIN
+        INSERT INTO facts_fts(facts_fts, rowid, key, value, container)
+        VALUES ('delete', old.id, old.key, old.value, old.container);
+      END;
     `);
   }
 
@@ -49,6 +78,101 @@ export class Storage {
       .all(this.container);
 
     return Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  }
+
+  bm25Search(query, container, topN = 10) {
+    // transform "morning HDFC" → "morning OR HDFC"
+    const ftsQuery = query
+      .trim()
+      .split(/\s+/)
+      .join(" OR ");
+    
+    const rows = this.db.prepare(`
+      SELECT
+        f.key,
+        f.value,
+        bm25(facts_fts) AS score
+      FROM facts_fts
+      JOIN facts f ON facts_fts.rowid = f.id
+      WHERE facts_fts MATCH ?
+      AND f.container = ?
+      ORDER BY score
+      LIMIT ?
+    `).all(ftsQuery, container, topN);
+
+    return rows.map((r, index) => ({
+      key: r.key,
+      value: r.value,
+      rank: index + 1,
+      score: r.score
+    }));
+  }
+
+  vectorSearch(queryVector, container, topN = 10) {
+    const embeddings = this.db
+      .prepare(`SELECT fact_key, vector FROM embeddings WHERE container = ?`)
+      .all(container);
+
+    const facts = this.loadFacts();
+
+    const scored = embeddings
+      .map(row => {
+        const vector = JSON.parse(row.vector);
+        const score = this._cosineSimilarity(queryVector, vector);
+        return {
+          key: row.fact_key,
+          value: facts[row.fact_key] ?? "",
+          score
+        };
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topN);
+
+    return scored.map((r, index) => ({
+      ...r,
+      rank: index + 1
+    }));
+  }
+
+  //RRF fusion method
+  hybridSearch(query, queryVector, container, topN = 5) {
+    const k = 60; // RRF constant — industry standard
+
+    // run both searches
+    let bm25Results = [];
+    try {
+      bm25Results = this.bm25Search(query, container, topN * 2);
+    } catch (e) {
+      // query might have special chars — fallback to vector only
+    }
+
+    const vectorResults = this.vectorSearch(queryVector, container, topN * 2);
+
+    // build RRF score map
+    const scores = {};
+
+    const addScore = (key, value, rank, source) => {
+      if (!scores[key]) scores[key] = { key, value, rrf: 0, sources: [] };
+      scores[key].rrf += 1 / (k + rank);
+      scores[key].sources.push(source);
+    };
+
+    bm25Results.forEach(r => addScore(r.key, r.value, r.rank, "bm25"));
+    vectorResults.forEach(r => addScore(r.key, r.value, r.rank, "vector"));
+
+    // sort by RRF score, return top N
+    return Object.values(scores)
+      .sort((a, b) => b.rrf - a.rrf)
+      .slice(0, topN);
+  }
+
+  _cosineSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    const dot = a.reduce((sum, val, i) => sum + val * b[i], 0);
+    const magA = Math.sqrt(a.reduce((sum, val) => sum + val * val, 0));
+    const magB = Math.sqrt(b.reduce((sum, val) => sum + val * val, 0));
+    if (magA === 0 || magB === 0) return 0;
+    return dot / (magA * magB);
   }
 
   saveFacts(facts) {
@@ -69,7 +193,7 @@ export class Storage {
 
         upsert.run({
           key,
-          value,
+          value: typeof value === 'string' ? value : JSON.stringify(value),
           container: this.container,
           previous: existing?.value ?? null,
         });

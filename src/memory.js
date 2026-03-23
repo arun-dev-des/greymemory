@@ -26,22 +26,15 @@ export class Memory {
   }
 
   // PUBLIC API 2 — search relevant facts
-  async search(query, topN = 3) {
-    const stored = this.storage.loadEmbeddings();
-    if (Object.keys(stored).length === 0) return {};
+  async search(query, topN = 5) {
+    const queryEmbedding = await this.embeddings.embed(query);
 
-    const queryVector = await this.embeddings.embed(query);
-
-    const scored = Object.entries(stored).map(([key, { text, vector }]) => ({
-      key,
-      text,
-      score: this.embeddings.cosineSimilarity(queryVector, vector),
-    }));
-
-    return scored
-        .sort((a, b) => b.score - a.score)
-        .slice(0, topN)
-        .reduce((acc, f) => ({ ...acc, [f.key]: f.text.split(": ").slice(1).join(": ") }), {});
+    return this.storage.hybridSearch(
+      query,
+      queryEmbedding,
+      this.storage.container,
+      topN
+    );
   }
 
   // PUBLIC API 3 — clear everything
