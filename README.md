@@ -1,8 +1,6 @@
-# GreyMemory 🧠
+# greymemory 🧠
 
-> Self-hosted memory layer for AI agents. Local embeddings, semantic search, persistent facts. No API keys required for embeddings.
-
-I built this while learning AI agents from scratch. This is v0.1 — single user, file-based, honest scope. Built in public, growing in public.
+> Private, self-hosted memory for AI agents. Bring your own LLM. Your data never leaves your server.
 
 **Why the name?** Named after Grey Matter from Ben 10 — the tiniest alien in the universe, but the smartest being in existence. Also a nod to grey matter in the brain, where intelligence actually lives. Small footprint. Quietly powerful.
 
@@ -10,115 +8,183 @@ I built this while learning AI agents from scratch. This is v0.1 — single user
 
 ## The problem
 
-Most memory solutions for AI agents send your data to a cloud API:
+Every AI agent forgets everything when the conversation ends.
+
+The obvious fix is memory. But every solution — Supermemory, Mem0 — stores your data on their cloud. You're trading one problem for another.
+
+greymemory runs entirely on your server:
 ```
-Your user's data → their servers → embeddings → back to you
+Your data → your machine → your LLM → stays with you. Always.
 ```
 
-GreyMemory runs entirely on your machine:
-```
-Your user's data → your machine → Ollama embeddings → stays with you
-```
+Hospitals, banks, factories, defence — entire industries are locked out of AI memory because every solution requires trusting a third party with their most sensitive data. greymemory is built for them.
 
 ---
 
-## What it does
+## What's new in v0.2.0
 
-- **Extracts facts** from conversations automatically using Claude
-- **Remembers across sessions** — survives restarts
-- **Finds relevant facts** by meaning, not keywords
-- **Resolves contradictions** — overwrites automatically
-- **Runs locally** — embeddings via Ollama, zero API cost
-
----
-
-## Prerequisites
-
-- Node.js 18+
-- Ollama → [ollama.com](https://ollama.com)
-- Anthropic API key (for fact extraction only)
-```bash
-ollama pull nomic-embed-text
-```
-
----
-
-## Install
-```bash
-npm install greymemory
-```
+- **Model-agnostic** — bring your own LLM and embedder. Works with Anthropic, OpenAI, Ollama, anything.
+- **SQLite storage** — replaces flat JSON files. Concurrent writes, container isolation, timestamps, history preserved.
+- **Hybrid search** — BM25 keyword search + vector semantic search fused via RRF. Nothing falls through the cracks.
+- **Raw chunk storage** — every message stored alongside extracted facts. Details Claude might miss are still searchable.
+- **Container isolation** — separate memory namespaces for different users or projects.
+- **TypeScript types** — full type safety and autocomplete in your editor.
+- **CLI setup wizard** — `npx greymemory init` gets you running in 3 minutes.
 
 ---
 
 ## Quick start
+```bash
+npm install greymemory
+npx greymemory init
+```
+
+The CLI asks 4 questions and generates a ready-to-use config file:
+```
+✦ greymemory — private memory for AI agents
+
+? Extraction provider: Anthropic
+? Extraction model: claude-haiku-4-5-20251001 (fast, cheap — recommended)
+? Anthropic API key: ****
+? Embedding provider: Ollama (free, local)
+? Embedding model: mxbai-embed-large (recommended)
+? Storage directory: .greymemory
+? Container name: default
+
+✔ greymemory.config.js created
+✔ .env updated
+✔ @anthropic-ai/sdk installed
+
+✦ Ready. Add to your project:
+  import memory from './greymemory.config.js'
+  await memory.add(messages)
+  await memory.search('query')
+```
+
+---
+
+## Usage
 ```javascript
-import GreyMemory from "greymemory"
+import memory from './greymemory.config.js'
 
-const memory = new GreyMemory()
-
-// add a conversation — facts extracted automatically
-const facts = await memory.add([
-  { role: "user", content: "Hi, I'm Arun and I train powerlifting" },
-  { role: "assistant", content: "Great to meet you Arun!" },
-  { role: "user", content: "I want an annual membership" },
-  { role: "assistant", content: "Annual is our best value!" },
+// add a conversation — facts extracted + chunks stored automatically
+await memory.add([
+  { role: 'user',      content: 'My name is Arun and I train powerlifting' },
+  { role: 'assistant', content: 'Got it.' }
 ])
 
-console.log(facts)
-// { name: 'Arun', interest: 'powerlifting', membership: 'annual' }
-
-// search by meaning — not keywords
-const context = await memory.search("what sport does this person train?")
-// { interest: 'powerlifting' }
+// hybrid search — finds by meaning AND exact keywords
+const results = await memory.search('what sport does this person train')
+// [
+//   { type: 'fact',  key: 'interest', value: 'powerlifting', sources: ['bm25+vector'] },
+//   { type: 'chunk', key: 'chunk_1',  value: 'user: My name is Arun...', sources: ['vector'] }
+// ]
 
 // inject into your agent
+const facts   = memory.getFacts()
+const context = results.map(r => r.value).join('\n')
+
 const systemPrompt = `You are a helpful assistant.
-What you know about this user: ${JSON.stringify(context)}`
+What you know about this user: ${JSON.stringify(facts)}`
+```
+
+---
+
+## Manual setup (without CLI)
+
+If you prefer to wire it up yourself:
+```javascript
+import GreyMemory from 'greymemory'
+import Anthropic  from '@anthropic-ai/sdk'
+
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
+
+const memory = new GreyMemory({
+  extractor: async (messages) => {
+    const res = await anthropic.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: `Extract facts as flat JSON. Keys: snake_case strings. Values: strings only.
+Conversation: ${JSON.stringify(messages)}`
+      }]
+    })
+    return JSON.parse(res.content[0].text.trim())
+  },
+
+  embedder: async (text) => {
+    const res = await fetch('http://localhost:11434/api/embeddings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'mxbai-embed-large', prompt: text })
+    })
+    return (await res.json()).embedding
+  }
+})
 ```
 
 ---
 
 ## API
 
-### `new GreyMemory(options?)`
-```javascript
-const memory = new GreyMemory({
-  dir: ".greymemory",                    // storage folder
-  model: "nomic-embed-text",             // Ollama embedding model
-  ollamaUrl: "http://localhost:11434",   // Ollama URL
-  apiKey: process.env.ANTHROPIC_API_KEY  // Claude API key
+### `new GreyMemory(options)`
+```typescript
+new GreyMemory({
+  extractor:  async (messages: Message[]) => Facts,  // required
+  embedder:   async (text: string) => number[],      // required
+  dir?:       string,   // storage directory, default: ".greymemory"
+  container?: string    // namespace isolation, default: "default"
 })
 ```
 
 ### `await memory.add(messages)`
 
-Extracts facts from a conversation and stores them with embeddings.
+Extracts facts, stores raw chunks, generates embeddings. All three happen automatically.
 ```javascript
-const facts = await memory.add(messages)
-// returns: { name: 'Arun', interest: 'powerlifting' }
+await memory.add([
+  { role: 'user',      content: 'I met Priya at the Bangalore AI meetup' },
+  { role: 'assistant', content: 'Got it.' }
+])
 ```
 
 ### `await memory.search(query, topN?)`
 
-Finds relevant facts by semantic similarity. Default topN = 3.
+Hybrid BM25 + vector search across facts and chunks. Default topN = 5.
 ```javascript
-const context = await memory.search("what does this user want?")
-// returns: { membership: 'annual' }
+const results = await memory.search('Priya hiring')
+// [
+//   { type: 'fact',  key: 'person',  value: 'Priya',            sources: ['bm25', 'vector'] },
+//   { type: 'chunk', key: 'chunk_1', value: 'user: I met Priya...', sources: ['bm25'] }
+// ]
 ```
 
 ### `memory.getFacts()`
 
-Returns all stored facts.
+Returns all extracted facts for this container.
 ```javascript
-const all = memory.getFacts()
-// returns: { name: 'Arun', interest: 'powerlifting', membership: 'annual' }
+memory.getFacts()
+// { name: 'Arun', interest: 'powerlifting', location: 'Bangalore' }
 ```
 
 ### `memory.clear()`
 
-Deletes all stored facts and embeddings from disk and memory.
+Deletes all facts, chunks and embeddings for this container. Other containers untouched.
 ```javascript
 memory.clear()
+```
+
+---
+
+## Container isolation
+
+Use different containers to isolate memory between users or projects:
+```javascript
+const userMemory    = new GreyMemory({ container: 'user-123', ...options })
+const projectMemory = new GreyMemory({ container: 'project-xyz', ...options })
+
+// each container has its own facts, chunks and embeddings
+// clearing one never touches the other
 ```
 
 ---
@@ -127,42 +193,62 @@ memory.clear()
 ```
 Conversation
     ↓
-Claude extracts facts → facts.json
+extractor()          → extracts facts → saved to SQLite facts table
     ↓
-Ollama embeds each fact → embeddings.json
+Each message         → saved to SQLite chunks table
+    ↓
+embedder()           → embeds facts and chunks → saved to SQLite
 
 Query
     ↓
-Ollama embeds query
+BM25 search          → exact keyword match on facts + chunks
+Vector search        → semantic similarity on facts + chunks
     ↓
-Cosine similarity vs stored embeddings
+RRF fusion           → combines both rankings
     ↓
-Top N relevant facts returned
+Top N results returned (type: fact | chunk)
 ```
 
 ---
 
-## v0.1 — honest scope
+## Supported LLM providers
 
-This is a learning-in-public project. v0.1 is intentionally simple:
+| Provider | Extractor | Embedder |
+|---|---|---|
+| Anthropic | ✅ Claude Haiku, Sonnet, Opus | ❌ |
+| OpenAI | ✅ GPT-4o-mini, GPT-4o | ✅ text-embedding-3-small/large |
+| Ollama | ✅ llama3, mistral, any model | ✅ mxbai-embed-large, nomic-embed-text |
+| Cohere | ❌ | ✅ embed-english-v3.0 |
+| Custom | ✅ any function | ✅ any function |
 
-- Single user only
-- File-based storage (not SQLite)
-- No TypeScript types yet
-- No streaming support
+---
 
-It works. Use it. Break it. File issues.
+## Prerequisites
+
+- Node.js 18+
+- Ollama (if using local models) → [ollama.com](https://ollama.com)
+```bash
+# pull embedding model if using Ollama
+ollama pull mxbai-embed-large
+```
 
 ---
 
 ## Roadmap
 
-- [ ] SQLite storage + multi-user support
-- [ ] TypeScript types
-- [ ] OpenAI / Voyage embedding support
-- [ ] Automatic compaction for long conversations
-- [ ] MCP server
-- [ ] Cloud option (GreyMemory Cloud)
+- [x] SQLite storage
+- [x] Hybrid BM25 + vector search
+- [x] Raw chunk storage
+- [x] Model-agnostic LLM interface
+- [x] Container isolation
+- [x] TypeScript types
+- [x] CLI setup wizard
+- [ ] UPDATES relationship — temporal facts, current truth always returned
+- [ ] Entity graph — persons, companies, projects and relationships
+- [ ] Decision context — what was decided and why
+- [ ] MCP server — works in Claude Code, Cursor, any agent tool
+- [ ] greymemory Cloud — managed hosting
+- [ ] Python SDK
 
 ---
 
