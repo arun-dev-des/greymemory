@@ -5,7 +5,7 @@ import ora   from 'ora'
 import chalk from 'chalk'
 import fs    from 'fs'
 import path  from 'path'
-import { execSync }      from 'child_process'
+import { execSync }       from 'child_process'
 import { generateConfig } from './templates.js'
 
 // ── Welcome ────────────────────────────────────────
@@ -16,7 +16,6 @@ console.log()
 
 // ── Questions ──────────────────────────────────────
 
-// extraction provider
 const extractorProvider = await select({
   message: 'Extraction provider:',
   choices: [
@@ -26,7 +25,6 @@ const extractorProvider = await select({
   ]
 })
 
-// extraction model
 const extractorModel = await select({
   message: 'Extraction model:',
   choices: extractorProvider === 'Anthropic'
@@ -48,12 +46,11 @@ const extractorModel = await select({
       ]
 })
 
-// custom ollama model
 const extractorModelFinal = extractorModel === 'custom'
   ? await input({ message: 'Enter Ollama model name:' })
   : extractorModel
 
-// extraction API key
+// API key for cloud extractors
 let extractorKey = ''
 if (extractorProvider === 'Anthropic') {
   extractorKey = await password({
@@ -70,17 +67,15 @@ if (extractorProvider === 'OpenAI') {
   })
 }
 
-// embedder provider
 const embedderProvider = await select({
   message: 'Embedding provider:',
   choices: [
-    { name: 'Ollama  (free, local)',  value: 'Ollama'  },
-    { name: 'OpenAI  (paid)',         value: 'OpenAI'  },
-    { name: 'Cohere  (paid)',         value: 'Cohere'  }
+    { name: 'Ollama  (free, local)', value: 'Ollama'  },
+    { name: 'OpenAI  (paid)',        value: 'OpenAI'  },
+    { name: 'Cohere  (paid)',        value: 'Cohere'  }
   ]
 })
 
-// embedder model
 const embedderModel = await select({
   message: 'Embedding model:',
   choices: embedderProvider === 'Ollama'
@@ -100,12 +95,11 @@ const embedderModel = await select({
       ]
 })
 
-// custom ollama embed model
 const embedderModelFinal = embedderModel === 'custom'
   ? await input({ message: 'Enter Ollama embedding model name:' })
   : embedderModel
 
-// embedder API key
+// API key for cloud embedders
 let embedderKey = ''
 if (embedderProvider === 'OpenAI') {
   embedderKey = await password({
@@ -121,7 +115,6 @@ if (embedderProvider === 'Cohere') {
   })
 }
 
-// storage settings
 const dir = await input({
   message: 'Storage directory:',
   default: '.greymemory'
@@ -136,15 +129,13 @@ console.log()
 
 // ── Generate config ────────────────────────────────
 
-const spinner = ora('Generating greymemory.config.js...').start()
+const configSpinner = ora('Generating greymemory.config.js...').start()
 
-const config = generateConfig({
+const config     = generateConfig({
   extractorProvider,
   extractorModel:   extractorModelFinal,
-  extractorKey,
   embedderProvider,
   embedderModel:    embedderModelFinal,
-  embedderKey,
   dir,
   container
 })
@@ -152,15 +143,49 @@ const config = generateConfig({
 const outputPath = path.join(process.cwd(), 'greymemory.config.js')
 fs.writeFileSync(outputPath, config, 'utf-8')
 
-spinner.succeed('greymemory.config.js created')
+configSpinner.succeed('greymemory.config.js created')
+
+// ── Write .env ─────────────────────────────────────
+
+const envLines = []
+if (extractorProvider === 'Anthropic')                                envLines.push(`ANTHROPIC_API_KEY=${extractorKey}`)
+if (extractorProvider === 'OpenAI')                                   envLines.push(`OPENAI_API_KEY=${extractorKey}`)
+if (embedderProvider  === 'OpenAI' && extractorProvider !== 'OpenAI') envLines.push(`OPENAI_API_KEY=${embedderKey}`)
+if (embedderProvider  === 'Cohere')                                   envLines.push(`COHERE_API_KEY=${embedderKey}`)
+
+if (envLines.length > 0) {
+  const envSpinner = ora('Saving API keys to .env...').start()
+  const envPath    = path.join(process.cwd(), '.env')
+  const existing   = fs.existsSync(envPath) ? fs.readFileSync(envPath, 'utf-8') : ''
+  const toAdd      = envLines.filter(line => !existing.includes(line.split('=')[0]))
+
+  if (toAdd.length > 0) {
+    fs.appendFileSync(envPath, '\n' + toAdd.join('\n') + '\n')
+  }
+
+  envSpinner.succeed('.env updated')
+}
+
+// ── Update .gitignore ──────────────────────────────
+
+const gitignorePath    = path.join(process.cwd(), '.gitignore')
+const gitignoreContent = fs.existsSync(gitignorePath)
+  ? fs.readFileSync(gitignorePath, 'utf-8')
+  : ''
+
+if (!gitignoreContent.includes('.env')) {
+  fs.appendFileSync(gitignorePath, '\n.env\n')
+  console.log(chalk.dim('  .env added to .gitignore'))
+}
 
 // ── Install dependencies ───────────────────────────
 
 const packages = []
-if (extractorProvider === 'Anthropic')                          packages.push('@anthropic-ai/sdk')
-if (extractorProvider === 'OpenAI')                             packages.push('openai')
-if (embedderProvider  === 'OpenAI' && extractorProvider !== 'OpenAI') packages.push('openai')
-if (embedderProvider  === 'Cohere')                             packages.push('cohere-ai')
+if (extractorProvider === 'Anthropic')                                    packages.push('@anthropic-ai/sdk')
+if (extractorProvider === 'OpenAI')                                       packages.push('openai')
+if (embedderProvider  === 'OpenAI' && extractorProvider !== 'OpenAI')     packages.push('openai')
+if (embedderProvider  === 'Cohere')                                       packages.push('cohere-ai')
+packages.push('dotenv')
 
 if (packages.length > 0) {
   const installSpinner = ora(`Installing ${packages.join(', ')}...`).start()
@@ -180,4 +205,6 @@ console.log()
 console.log(chalk.dim("  import memory from './greymemory.config.js'"))
 console.log(chalk.dim("  await memory.add(messages)"))
 console.log(chalk.dim("  await memory.search('query')"))
+console.log()
+console.log(chalk.yellow('  ⚠ Never commit .env to git. Your API keys are inside.'))
 console.log()
