@@ -248,7 +248,10 @@ Top N results returned (type: fact | chunk)
 - Ollama (if using local models) → [ollama.com](https://ollama.com)
 
 ```bash
-# pull embedding model if using Ollama
+# install Ollama on Mac
+brew install ollama
+
+# pull embedding model
 ollama pull mxbai-embed-large
 ```
 

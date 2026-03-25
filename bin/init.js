@@ -127,6 +127,36 @@ const container = await input({
 
 console.log()
 
+// ── Check Ollama ───────────────────────────────────
+
+if (extractorProvider === 'Ollama' || embedderProvider === 'Ollama') {
+  const ollamaSpinner = ora('Checking Ollama...').start()
+  try {
+    const res    = await fetch('http://localhost:11434/api/tags')
+    const data   = await res.json()
+    const models = data.models.map(m => m.name)
+
+    const modelsToCheck = []
+    if (extractorProvider === 'Ollama') modelsToCheck.push(extractorModelFinal)
+    if (embedderProvider  === 'Ollama') modelsToCheck.push(embedderModelFinal)
+
+    const missing = modelsToCheck.filter(m => !models.some(installed => installed.includes(m)))
+
+    if (missing.length === 0) {
+      ollamaSpinner.succeed(`Ollama running. ${modelsToCheck.join(', ')} found.`)
+    } else {
+      ollamaSpinner.warn(`Ollama running but missing: ${missing.join(', ')}`)
+      missing.forEach(m => console.log(chalk.yellow(`  Pull it with: ollama pull ${m}`)))
+    }
+  } catch (e) {
+    ollamaSpinner.warn('Ollama not detected.')
+    console.log(chalk.yellow('  Install Ollama: https://ollama.com'))
+    if (embedderProvider  === 'Ollama') console.log(chalk.yellow(`  Then run: ollama pull ${embedderModelFinal}`))
+    if (extractorProvider === 'Ollama') console.log(chalk.yellow(`  Then run: ollama pull ${extractorModelFinal}`))
+  }
+  console.log()
+}
+
 // ── Generate config ────────────────────────────────
 
 const configSpinner = ora('Generating greymemory.config.js...').start()

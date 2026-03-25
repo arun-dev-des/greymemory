@@ -1,7 +1,7 @@
 {
   "name": "greymemory",
   "version": "0.2.0",
-  "description": "Self-hosted memory layer for AI agents. Local embeddings, semantic search, persistent facts. No API keys required for embeddings.",
+  "description": "Private, self-hosted memory for AI agents. Bring your own LLM. Hybrid BM25 + vector search. Your data never leaves your server.",
   "type": "module",
   "main": "src/index.js",
   "types": "src/index.d.ts",
