@@ -26,7 +26,7 @@ Hospitals, banks, factories, defence — entire industries are locked out of AI 
 - **Model-agnostic** — bring your own LLM and embedder. Works with Anthropic, OpenAI, Ollama, anything.
 - **SQLite storage** — replaces flat JSON files. Concurrent writes, container isolation, timestamps, history preserved.
 - **Hybrid search** — BM25 keyword search + vector semantic search fused via RRF. Nothing falls through the cracks.
-- **Raw chunk storage** — every message stored alongside extracted facts. Details Claude might miss are still searchable.
+- **Raw chunk storage** — every message stored alongside extracted facts. Details the LLM might miss are still searchable.
 - **Container isolation** — separate memory namespaces for different users or projects.
 - **TypeScript types** — full type safety and autocomplete in your editor.
 - **CLI setup wizard** — `npx greymemory init` gets you running in 3 minutes.
@@ -34,12 +34,14 @@ Hospitals, banks, factories, defence — entire industries are locked out of AI 
 ---
 
 ## Quick start
+
 ```bash
 npm install greymemory
 npx greymemory init
 ```
 
-The CLI asks 4 questions and generates a ready-to-use config file:
+The CLI asks a few questions and generates a ready-to-use config file:
+
 ```
 ✦ greymemory — private memory for AI agents
 
@@ -53,17 +55,21 @@ The CLI asks 4 questions and generates a ready-to-use config file:
 
 ✔ greymemory.config.js created
 ✔ .env updated
-✔ @anthropic-ai/sdk installed
+  .env added to .gitignore
+✔ @anthropic-ai/sdk, dotenv installed
 
 ✦ Ready. Add to your project:
   import memory from './greymemory.config.js'
   await memory.add(messages)
   await memory.search('query')
+
+⚠ Never commit .env to git. Your API keys are inside.
 ```
 
 ---
 
 ## Usage
+
 ```javascript
 import memory from './greymemory.config.js'
 
@@ -76,8 +82,8 @@ await memory.add([
 // hybrid search — finds by meaning AND exact keywords
 const results = await memory.search('what sport does this person train')
 // [
-//   { type: 'fact',  key: 'interest', value: 'powerlifting', sources: ['bm25+vector'] },
-//   { type: 'chunk', key: 'chunk_1',  value: 'user: My name is Arun...', sources: ['vector'] }
+//   { type: 'fact',  key: 'sport',   value: 'powerlifting',          sources: ['bm25', 'vector'] },
+//   { type: 'chunk', key: 'chunk_1', value: 'user: My name is Arun...', sources: ['vector'] }
 // ]
 
 // inject into your agent
@@ -93,7 +99,13 @@ What you know about this user: ${JSON.stringify(facts)}`
 ## Manual setup (without CLI)
 
 If you prefer to wire it up yourself:
+
+```bash
+npm install greymemory dotenv
+```
+
 ```javascript
+import 'dotenv/config'
 import GreyMemory from 'greymemory'
 import Anthropic  from '@anthropic-ai/sdk'
 
@@ -129,6 +141,7 @@ Conversation: ${JSON.stringify(messages)}`
 ## API
 
 ### `new GreyMemory(options)`
+
 ```typescript
 new GreyMemory({
   extractor:  async (messages: Message[]) => Facts,  // required
@@ -141,6 +154,7 @@ new GreyMemory({
 ### `await memory.add(messages)`
 
 Extracts facts, stores raw chunks, generates embeddings. All three happen automatically.
+
 ```javascript
 await memory.add([
   { role: 'user',      content: 'I met Priya at the Bangalore AI meetup' },
@@ -151,10 +165,11 @@ await memory.add([
 ### `await memory.search(query, topN?)`
 
 Hybrid BM25 + vector search across facts and chunks. Default topN = 5.
+
 ```javascript
 const results = await memory.search('Priya hiring')
 // [
-//   { type: 'fact',  key: 'person',  value: 'Priya',            sources: ['bm25', 'vector'] },
+//   { type: 'fact',  key: 'person',  value: 'Priya',               sources: ['bm25', 'vector'] },
 //   { type: 'chunk', key: 'chunk_1', value: 'user: I met Priya...', sources: ['bm25'] }
 // ]
 ```
@@ -162,14 +177,16 @@ const results = await memory.search('Priya hiring')
 ### `memory.getFacts()`
 
 Returns all extracted facts for this container.
+
 ```javascript
 memory.getFacts()
-// { name: 'Arun', interest: 'powerlifting', location: 'Bangalore' }
+// { name: 'Arun', sport: 'powerlifting', gym_location: 'Bangalore' }
 ```
 
 ### `memory.clear()`
 
 Deletes all facts, chunks and embeddings for this container. Other containers untouched.
+
 ```javascript
 memory.clear()
 ```
@@ -179,9 +196,10 @@ memory.clear()
 ## Container isolation
 
 Use different containers to isolate memory between users or projects:
+
 ```javascript
-const userMemory    = new GreyMemory({ container: 'user-123', ...options })
-const projectMemory = new GreyMemory({ container: 'project-xyz', ...options })
+const userA = new GreyMemory({ container: 'user-123', ...options })
+const userB = new GreyMemory({ container: 'user-456', ...options })
 
 // each container has its own facts, chunks and embeddings
 // clearing one never touches the other
@@ -190,6 +208,7 @@ const projectMemory = new GreyMemory({ container: 'project-xyz', ...options })
 ---
 
 ## How it works
+
 ```
 Conversation
     ↓
@@ -211,15 +230,15 @@ Top N results returned (type: fact | chunk)
 
 ---
 
-## Supported LLM providers
+## Supported providers
 
-| Provider | Extractor | Embedder |
-|---|---|---|
-| Anthropic | ✅ Claude Haiku, Sonnet, Opus | ❌ |
-| OpenAI | ✅ GPT-4o-mini, GPT-4o | ✅ text-embedding-3-small/large |
-| Ollama | ✅ llama3, mistral, any model | ✅ mxbai-embed-large, nomic-embed-text |
-| Cohere | ❌ | ✅ embed-english-v3.0 |
-| Custom | ✅ any function | ✅ any function |
+| Provider  | Extractor                        | Embedder                              |
+|-----------|----------------------------------|---------------------------------------|
+| Anthropic | ✅ Claude Haiku, Sonnet, Opus    | ❌                                    |
+| OpenAI    | ✅ GPT-4o-mini, GPT-4o           | ✅ text-embedding-3-small/large       |
+| Ollama    | ✅ llama3, mistral, any model    | ✅ mxbai-embed-large, nomic-embed-text |
+| Cohere    | ❌                               | ✅ embed-english-v3.0                 |
+| Custom    | ✅ any function                  | ✅ any function                       |
 
 ---
 
@@ -227,6 +246,7 @@ Top N results returned (type: fact | chunk)
 
 - Node.js 18+
 - Ollama (if using local models) → [ollama.com](https://ollama.com)
+
 ```bash
 # pull embedding model if using Ollama
 ollama pull mxbai-embed-large
