@@ -1,0 +1,12 @@
+# test files
+test-*.js
+test-*.ts
+quick-test.js
+
+# generated files
+greymemory.config.js
+.greymemory*/
+.env
+
+# dev files
+tsconfig.json

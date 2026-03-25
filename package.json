@@ -6,7 +6,7 @@
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "bin": {
-    "greymemory": "./bin/init.js"
+    "greymemory": "bin/init.js"
   },
   "exports": {
     ".": {
