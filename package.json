@@ -1,6 +1,6 @@
 {
   "name": "greymemory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Self-hosted memory layer for AI agents. Local embeddings, semantic search, persistent facts. No API keys required for embeddings.",
   "type": "module",
   "main": "src/index.js",
