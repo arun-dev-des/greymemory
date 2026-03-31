@@ -1,6 +1,6 @@
 {
   "name": "greymemory",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "Private, self-hosted memory for AI agents. Bring your own LLM. Hybrid BM25 + vector search. Your data never leaves your server.",
   "type": "module",
   "main": "src/index.js",
