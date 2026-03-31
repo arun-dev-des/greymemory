@@ -13,7 +13,7 @@ export function generateConfig(answers) {
     if (!existingDbPath) return null
     return `import Database from 'better-sqlite3'
 
-  const db = new Database('${existingDbPath}')`
+const db = new Database('${existingDbPath}')`
   }
 
   const extractor    = buildExtractor(extractorProvider, extractorModel)
@@ -38,6 +38,10 @@ ${embedder}
 
 export default new GreyMemory({
 ${greyMemoryOptions}
+
+  // optional — tell greymemory what to index and who this memory belongs to
+  // filterPrompt:  'Index: decisions, preferences, goals. Skip: small talk, greetings.',
+  // entityContext: 'Memory for <name>, <role>. Focus on: <topics>.',
 })
 `
 }
@@ -51,84 +55,48 @@ function buildImports(extractorProvider, embedderProvider, existingDbPath = null
   return imports.join('\n')
 }
 
+// v0.3 — extractor receives a ready-made prompt string from greymemory
+// it just wires it to the LLM and returns the raw response string
+// greymemory handles prompt building, JSON parsing, and validation internally
 function buildExtractor(provider, model) {
   if (provider === 'Anthropic') {
     return `const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-
-const extractor = async (messages) => {
+ 
+const extractor = async (prompt) => {
   const res = await anthropic.messages.create({
     model: '${model}',
-    max_tokens: 1000,
-    messages: [{
-      role: 'user',
-      content: \`Extract facts from this conversation as a flat JSON object.
-Rules:
-- keys are short snake_case strings
-- values are strings only
-- no nested objects, no arrays
-- only factual information about the user
-- respond with JSON only, no explanation
-
-Conversation:
-\${JSON.stringify(messages)}\`
-    }]
+    max_tokens: 1024,
+    messages: [{ role: 'user', content: prompt }]
   })
-  const text = res.content[0].text.trim()
-  return JSON.parse(text.replace(/\`\`\`json|\`\`\`/g, '').trim())
+  return res.content[0].text.trim()
 }`
   }
-
+ 
   if (provider === 'OpenAI') {
     return `const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-
-const extractor = async (messages) => {
+ 
+const extractor = async (prompt) => {
   const res = await openai.chat.completions.create({
     model: '${model}',
-    messages: [{
-      role: 'user',
-      content: \`Extract facts from this conversation as a flat JSON object.
-Rules:
-- keys are short snake_case strings
-- values are strings only
-- no nested objects, no arrays
-- only factual information about the user
-- respond with JSON only, no explanation
-
-Conversation:
-\${JSON.stringify(messages)}\`
-    }]
+    messages: [{ role: 'user', content: prompt }]
   })
-  const text = res.choices[0].message.content.trim()
-  return JSON.parse(text.replace(/\`\`\`json|\`\`\`/g, '').trim())
+  return res.choices[0].message.content.trim()
 }`
   }
-
+ 
   if (provider === 'Ollama') {
-    return `const extractor = async (messages) => {
+    return `const extractor = async (prompt) => {
   const res = await fetch('http://localhost:11434/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       model: '${model}',
       stream: false,
-      messages: [{
-        role: 'user',
-        content: \`Extract facts from this conversation as a flat JSON object.
-Rules:
-- keys are short snake_case strings
-- values are strings only
-- no nested objects, no arrays
-- only factual information about the user
-- respond with JSON only, no explanation
-
-Conversation:
-\${JSON.stringify(messages)}\`
-      }]
+      messages: [{ role: 'user', content: prompt }]
     })
   })
   const data = await res.json()
-  const text = data.message.content.trim()
-  return JSON.parse(text.replace(/\`\`\`json|\`\`\`/g, '').trim())
+  return data.message.content.trim()
 }`
   }
 }

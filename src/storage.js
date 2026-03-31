@@ -142,44 +142,86 @@ export class Storage {
         this.db.exec(`ALTER TABLE facts ADD COLUMN ${col} ${def}`);
       }
     }
+
+    // backfill defaults on existing v0.2.x rows
+    this.db.exec(`
+      UPDATE facts SET
+        document_date = COALESCE(created_at, datetime('now')),
+        memory_type   = 'fact',
+        is_latest     = 1,
+        confidence    = 1.0,
+        metadata      = '{}'
+      WHERE document_date IS NULL;
+    `);
+ 
+    // performance indexes — safe to run every time, IF NOT EXISTS guards them
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_facts_latest  ON facts(container, is_latest);
+      CREATE INDEX IF NOT EXISTS idx_facts_type    ON facts(container, memory_type);
+      CREATE INDEX IF NOT EXISTS idx_facts_docdate ON facts(container, document_date);
+      CREATE INDEX IF NOT EXISTS idx_facts_expires ON facts(expires_at) WHERE expires_at IS NOT NULL;
+    `);
   }
+
+  
 
   // ── Facts ──────────────────────────────────────────
 
   loadFacts() {
-    const rows = this.db
-      .prepare(`SELECT key, value FROM facts WHERE container = ?`)
+    return this.db
+      .prepare(`
+        SELECT key, value, memory_type, confidence, event_date
+        FROM facts
+        WHERE container = ?
+          AND is_latest = 1
+          AND (expires_at IS NULL OR expires_at > datetime('now'))
+      `)
       .all(this.container);
-
-    return Object.fromEntries(rows.map((r) => [r.key, r.value]));
   }
 
-  saveFacts(facts) {
-    const upsert = this.db.prepare(`
-      INSERT INTO facts (key, value, container, previous, updated_at)
-      VALUES (@key, @value, @container, @previous, datetime('now'))
+  saveFact(key, value, opts = {}) {
+    const {
+      memory_type   = 'fact',
+      document_date = new Date().toISOString().slice(0, 10),
+      event_date    = null,
+      expires_at    = null,
+      confidence    = 1.0,
+      metadata      = '{}',
+    } = opts;
+ 
+    const existing = this.db
+      .prepare(`SELECT value FROM facts WHERE key = ? AND container = ? AND is_latest = 1`)
+      .get(key, this.container);
+ 
+    this.db.prepare(`
+      INSERT INTO facts
+        (key, value, container, previous, updated_at,
+         memory_type, document_date, event_date, expires_at, confidence, metadata)
+      VALUES
+        (@key, @value, @container, @previous, datetime('now'),
+         @memory_type, @document_date, @event_date, @expires_at, @confidence, @metadata)
       ON CONFLICT(key, container) DO UPDATE SET
-        previous   = facts.value,
-        value      = @value,
-        updated_at = datetime('now')
-    `);
-
-    const saveAll = this.db.transaction((facts) => {
-      for (const [key, value] of Object.entries(facts)) {
-        const existing = this.db
-          .prepare(`SELECT value FROM facts WHERE key = ? AND container = ?`)
-          .get(key, this.container);
-
-        upsert.run({
-          key,
-          value: typeof value === 'string' ? value : JSON.stringify(value),
-          container: this.container,
-          previous: existing?.value ?? null,
-        });
-      }
+        previous      = facts.value,
+        value         = @value,
+        updated_at    = datetime('now'),
+        memory_type   = @memory_type,
+        document_date = @document_date,
+        event_date    = @event_date,
+        expires_at    = @expires_at,
+        confidence    = @confidence,
+        metadata      = @metadata
+    `).run({
+      key,
+      value:         typeof value === 'string' ? value : JSON.stringify(value),
+      container:     this.container,
+      previous:      existing?.value ?? null,
+      memory_type,
+      document_date,
+      event_date,
+      expires_at,
+      confidence,
+      metadata:      typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     });
-
-    saveAll(facts);
   }
 
   // ── Embeddings ─────────────────────────────────────
@@ -249,30 +291,37 @@ export class Storage {
   // ── Search ─────────────────────────────────────────
 
   bm25Search(query, container, topN = 10) {
-    // transform "morning HDFC" → "morning OR HDFC"
     const ftsQuery = query
       .trim()
       .split(/\s+/)
       .join(" OR ");
-    
+ 
     const rows = this.db.prepare(`
       SELECT
         f.key,
         f.value,
+        f.memory_type,
+        f.confidence,
+        f.event_date,
         bm25(facts_fts) AS score
       FROM facts_fts
       JOIN facts f ON facts_fts.rowid = f.id
       WHERE facts_fts MATCH ?
-      AND f.container = ?
+        AND f.container = ?
+        AND f.is_latest = 1
+        AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
       ORDER BY score
       LIMIT ?
     `).all(ftsQuery, container, topN);
-
+ 
     return rows.map((r, index) => ({
-      key: r.key,
-      value: r.value,
-      rank: index + 1,
-      score: r.score
+      key:         r.key,
+      value:       r.value,
+      memory_type: r.memory_type,
+      confidence:  r.confidence,
+      event_date:  r.event_date,
+      rank:        index + 1,
+      score:       r.score,
     }));
   }
 
@@ -302,29 +351,29 @@ export class Storage {
   }
 
   vectorSearch(queryVector, container, topN = 10) {
-    const embeddings = this.db
-      .prepare(`SELECT fact_key, vector FROM embeddings WHERE container = ?`)
-      .all(container);
-
-    const facts = this.loadFacts();
-
-    const scored = embeddings
-      .map(row => {
-        const vector = JSON.parse(row.vector);
-        const score = this._cosineSimilarity(queryVector, vector);
-        return {
-          key: row.fact_key,
-          value: facts[row.fact_key] ?? "",
-          score
-        };
-      })
+    // join facts to filter is_latest and expires_at — don't rely on loadFacts()
+    const rows = this.db.prepare(`
+      SELECT e.fact_key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
+      FROM embeddings e
+      JOIN facts f ON e.fact_key = f.key AND e.container = f.container
+      WHERE e.container = ?
+        AND f.is_latest = 1
+        AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
+    `).all(container);
+ 
+    const scored = rows
+      .map(row => ({
+        key:         row.fact_key,
+        value:       row.value,
+        memory_type: row.memory_type,
+        confidence:  row.confidence,
+        event_date:  row.event_date,
+        score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
+      }))
       .sort((a, b) => b.score - a.score)
       .slice(0, topN);
-
-    return scored.map((r, index) => ({
-      ...r,
-      rank: index + 1
-    }));
+ 
+    return scored.map((r, index) => ({ ...r, rank: index + 1 }));
   }
 
   vectorSearchChunks(queryVector, container, topN = 10) {
