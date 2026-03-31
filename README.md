@@ -21,7 +21,13 @@ Hospitals, banks, factories, defence — entire industries are locked out of AI 
 
 ---
 
-## What's new in v0.2.0
+## What's new in v0.2.3
+
+- **Existing SQLite database support** — pass your own database connection. greymemory creates its tables inside your existing db. One file instead of two.
+
+---
+
+## What's in v0.2.0
 
 - **Model-agnostic** — bring your own LLM and embedder. Works with Anthropic, OpenAI, Ollama, anything.
 - **SQLite storage** — replaces flat JSON files. Concurrent writes, container isolation, timestamps, history preserved.
@@ -52,6 +58,7 @@ The CLI asks a few questions and generates a ready-to-use config file:
 ? Embedding model: mxbai-embed-large (recommended)
 ? Storage directory: .greymemory
 ? Container name: default
+? Do you want greymemory data stored in an existing SQLite database? No
 
 ✔ greymemory.config.js created
 ✔ .env updated
@@ -82,7 +89,7 @@ await memory.add([
 // hybrid search — finds by meaning AND exact keywords
 const results = await memory.search('what sport does this person train')
 // [
-//   { type: 'fact',  key: 'sport',   value: 'powerlifting',          sources: ['bm25', 'vector'] },
+//   { type: 'fact',  key: 'sport',   value: 'powerlifting',            sources: ['bm25', 'vector'] },
 //   { type: 'chunk', key: 'chunk_1', value: 'user: My name is Arun...', sources: ['vector'] }
 // ]
 
@@ -146,8 +153,9 @@ Conversation: ${JSON.stringify(messages)}`
 new GreyMemory({
   extractor:  async (messages: Message[]) => Facts,  // required
   embedder:   async (text: string) => number[],      // required
-  dir?:       string,   // storage directory, default: ".greymemory"
-  container?: string    // namespace isolation, default: "default"
+  dir?:       string,    // storage directory, default: ".greymemory"
+  container?: string,    // namespace isolation, default: "default"
+  db?:        Database   // existing better-sqlite3 connection (optional)
 })
 ```
 
@@ -193,6 +201,42 @@ memory.clear()
 
 ---
 
+## Using an existing SQLite database
+
+If your project already uses SQLite, greymemory can store its data inside your existing database file. No second file.
+
+This is useful when integrating greymemory into an existing tool — like [DevLog](https://devlog-web-black.vercel.app/), which already stores engineering journals in SQLite.
+
+### Via CLI
+
+```
+? Do you want greymemory data stored in an existing SQLite database? Yes
+? Path to existing SQLite database: /home/user/.devlog/devlog.db
+```
+
+The generated `greymemory.config.js` will include the database connection automatically.
+
+### Via code
+
+```javascript
+import Database   from 'better-sqlite3'
+import GreyMemory from 'greymemory'
+
+// your existing database
+const db = new Database('/home/user/.devlog/devlog.db')
+
+const memory = new GreyMemory({
+  extractor,
+  embedder,
+  db,                    // greymemory creates its tables inside this db
+  container: 'memory'
+})
+```
+
+greymemory creates its own tables (`facts`, `embeddings`, `chunks`, etc.) inside your existing database. Your existing tables are untouched.
+
+---
+
 ## Container isolation
 
 Use different containers to isolate memory between users or projects:
@@ -232,13 +276,13 @@ Top N results returned (type: fact | chunk)
 
 ## Supported providers
 
-| Provider  | Extractor                        | Embedder                              |
-|-----------|----------------------------------|---------------------------------------|
-| Anthropic | ✅ Claude Haiku, Sonnet, Opus    | ❌                                    |
-| OpenAI    | ✅ GPT-4o-mini, GPT-4o           | ✅ text-embedding-3-small/large       |
+| Provider  | Extractor                        | Embedder                               |
+|-----------|----------------------------------|----------------------------------------|
+| Anthropic | ✅ Claude Haiku, Sonnet, Opus    | ❌                                     |
+| OpenAI    | ✅ GPT-4o-mini, GPT-4o           | ✅ text-embedding-3-small/large        |
 | Ollama    | ✅ llama3, mistral, any model    | ✅ mxbai-embed-large, nomic-embed-text |
-| Cohere    | ❌                               | ✅ embed-english-v3.0                 |
-| Custom    | ✅ any function                  | ✅ any function                       |
+| Cohere    | ❌                               | ✅ embed-english-v3.0                  |
+| Custom    | ✅ any function                  | ✅ any function                        |
 
 ---
 
@@ -266,9 +310,10 @@ ollama pull mxbai-embed-large
 - [x] Container isolation
 - [x] TypeScript types
 - [x] CLI setup wizard
-- [ ] UPDATES relationship — temporal facts, current truth always returned
-- [ ] Entity graph — persons, companies, projects and relationships
-- [ ] Decision context — what was decided and why
+- [x] Existing SQLite database support
+- [ ] Temporal facts — current truth always returned, history preserved
+- [ ] Contradiction resolution — UPDATES, EXTENDS, DERIVES relationships
+- [ ] User profiles — static + dynamic, ready for system prompt injection
 - [ ] MCP server — works in Claude Code, Cursor, any agent tool
 - [ ] greymemory Cloud — managed hosting
 - [ ] Python SDK
