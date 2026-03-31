@@ -26,7 +26,8 @@ export class Memory {
     this.embedder  = options.embedder;
     this.storage   = new Storage(
       options.dir       ?? ".greymemory",
-      options.container ?? "default"
+      options.container ?? "default",
+      options.db        ?? null
     );
   }
 

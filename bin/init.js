@@ -125,6 +125,24 @@ const container = await input({
   default: 'default'
 })
 
+const useExistingDb = await select({
+  message: 'Do you want to use existing SQLite database?',
+  choices: [
+    { name: 'No  — create greymemory.db in storage directory (recommended)', value: false },
+    { name: 'Yes — use an existing SQLite database',                          value: true  }
+  ]
+})
+
+let existingDbPath = null
+if (useExistingDb) {
+  existingDbPath = await input({
+    message:  'Path to existing SQLite database:',
+    validate: (p) => p.trim().length > 0 || 'Path cannot be empty'
+  })
+}
+
+console.log()
+
 console.log()
 
 // ── Check Ollama ───────────────────────────────────
@@ -167,7 +185,8 @@ const config     = generateConfig({
   embedderProvider,
   embedderModel:    embedderModelFinal,
   dir,
-  container
+  container,
+  existingDbPath
 })
 
 const outputPath = path.join(process.cwd(), 'greymemory.config.js')

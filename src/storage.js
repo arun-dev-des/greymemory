@@ -3,16 +3,23 @@ import path from "path";
 import fs from "fs";
 
 export class Storage {
-  constructor(dir = ".greymemory", container = "default") {
-    this.dir = dir;
+  constructor(dir = ".greymemory", container = "default", existingDb = null) {
     this.container = container;
-    this.dbFile = path.join(dir, "greymemory.db");
 
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
+    if (existingDb) {
+      this.db = existingDb;
+      this.dir = null;
+    } else {
+      this.dir = dir;
+      this.dbFile = path.join(dir, "greymemory.db");
+      
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      this.db = new Database(this.dbFile);
     }
 
-    this.db = new Database(this.dbFile);
     this._init();
   }
 
