@@ -13,3 +13,4 @@ tsconfig.json
 test-types.ts
 greymemory.config.js
 .DS_Store
+.greymemory/

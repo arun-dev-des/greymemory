@@ -3,3 +3,4 @@ node_modules/
 .greymemory/.DS_Store
 greymemory.config.js
 test-types.ts
+.greymemory/
