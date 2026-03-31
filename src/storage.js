@@ -12,7 +12,7 @@ export class Storage {
     } else {
       this.dir = dir;
       this.dbFile = path.join(dir, "greymemory.db");
-      
+
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
       }
@@ -21,6 +21,7 @@ export class Storage {
     }
 
     this._init();
+    this._migrate(); // v0.3 — add new columns to existing facts table
   }
 
   _init() {
@@ -112,6 +113,35 @@ export class Storage {
         VALUES ('delete', old.id, old.content, old.container);
       END;
     `);
+  }
+
+  // v0.3 — safe, idempotent migration
+  // adds new columns to the facts table without touching any existing data
+  // uses PRAGMA table_info to skip columns that already exist
+  // safe to run on v0.2.x databases and on fresh installs
+  _migrate() {
+    const existing = new Set(
+      this.db.pragma('table_info(facts)').map(c => c.name)
+    );
+ 
+    const columns = [
+      ['memory_type',   "TEXT    NOT NULL DEFAULT 'fact'"],
+      ['document_date', 'TEXT'],
+      ['event_date',    'TEXT'],
+      ['expires_at',    'TEXT'],
+      ['is_latest',     'INTEGER NOT NULL DEFAULT 1'],
+      ['superseded_by', 'INTEGER'],
+      ['relation_type', 'TEXT'],
+      ['related_to',    'INTEGER'],
+      ['confidence',    'REAL    NOT NULL DEFAULT 1.0'],
+      ['metadata',      "TEXT    NOT NULL DEFAULT '{}'"],
+    ];
+ 
+    for (const [col, def] of columns) {
+      if (!existing.has(col)) {
+        this.db.exec(`ALTER TABLE facts ADD COLUMN ${col} ${def}`);
+      }
+    }
   }
 
   // ── Facts ──────────────────────────────────────────
