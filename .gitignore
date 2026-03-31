@@ -1,3 +1,5 @@
 node_modules/
 .env
-.greymemory/
+.greymemory/.DS_Store
+greymemory.config.js
+test-types.ts
