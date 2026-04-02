@@ -68,8 +68,8 @@ Rules:
 
    BAD  → "Arun is a product designer who prefers TypeScript and works in Bangalore"
    GOOD → "Arun is a product designer"
-           "Arun prefers TypeScript over JavaScript"
-           "Arun is based in Bangalore"
+          "Arun prefers TypeScript over JavaScript"
+          "Arun is based in Bangalore"
 
    Why this matters: each memory gets its own embedding. Combined facts produce
    weak embeddings that match nothing well. Atomic facts produce strong, precise

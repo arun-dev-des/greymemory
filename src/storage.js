@@ -226,16 +226,6 @@ export class Storage {
 
   // ── Embeddings ─────────────────────────────────────
 
-  loadEmbeddings() {
-    const rows = this.db
-      .prepare(`SELECT fact_key, vector FROM embeddings WHERE container = ?`)
-      .all(this.container);
-
-    return Object.fromEntries(
-      rows.map((r) => [r.fact_key, JSON.parse(r.vector)])
-    );
-  }
-
   saveEmbeddings(embeddings) {
     const upsert = this.db.prepare(`
       INSERT INTO embeddings (fact_key, container, vector)

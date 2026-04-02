@@ -40,7 +40,7 @@ export class Memory {
     const today = new Date().toISOString().slice(0, 10);
  
     // 1. load existing facts for dedup — already filtered by is_latest + expires_at
-    //    loadFacts() returns [{ key, value, memory_type, confidence, event_date }]
+    // loadFacts() returns [{ key, value, memory_type, confidence, event_date }]
     // embed the input to find relevant existing memories
     const inputText   = Array.isArray(input)
       ? input.map(m => m.content).join(' ')
@@ -85,7 +85,7 @@ export class Memory {
       // preferences — use cosine similarity to find existing ones, not key match
       // LLMs are not deterministic so the key will vary across calls
       if (memory_type === 'preference') {
-        const strengthened = this._strengthenPreference(value, embedding);
+        const strengthened = this._strengthenPreference(key, value, embedding);
         if (strengthened) continue;
       }
  
@@ -137,20 +137,8 @@ export class Memory {
       topN
     );
   }
-  
-  // ── Get facts ──────────────────────────────────────
 
-  getFacts() {
-    // loadFacts() returns full row objects internally
-    // convert back to plain { key: value } object for the public API
-    // preserves backward compatibility with v0.2 callers
-    return Object.fromEntries(
-      this.storage.loadFacts().map(r => [r.key, r.value])
-    );
-  }
-
-
-  // ── Get facts ──────────────────────────────────────
+  // ── Get Memories ──────────────────────────────────────
   // returns full row objects [{ key, value, memory_type, confidence, event_date }]
   // richer than v0.2 getFacts() — callers can filter by type, sort by confidence, etc.
   
@@ -168,9 +156,9 @@ export class Memory {
  
   // use cosine similarity to find an existing preference with similar meaning
   // key matching is unreliable — LLMs produce different keys for the same preference
-  _strengthenPreference(value, embedding) {
+  _strengthenPreference(key, value, embedding) {
     const existing = this.storage.db.prepare(`
-      SELECT f.id, f.confidence, e.vector
+      SELECT f.id, f.key, f.confidence, e.vector
       FROM facts f
       JOIN embeddings e ON e.fact_key = f.key AND e.container = f.container
       WHERE f.container = ?
@@ -180,16 +168,34 @@ export class Memory {
     `).all(this.storage.container);
  
     const THRESHOLD = 0.92;
-    const match = existing.find(row => {
-      const vec = JSON.parse(row.vector);
-      return this._cosineSimilarity(embedding, vec) > THRESHOLD;
-    });
  
-    if (!match) return false;
+    // 1. try exact key match first — cheap, no vector math
+    const keyMatch = existing.find(row => row.key === key);
+    if (keyMatch) {
+      this.storage.db.prepare(`
+        UPDATE facts SET confidence = MIN(confidence + 0.1, 2.0) WHERE id = ?
+      `).run(keyMatch.id);
+      return true;
+    }
  
-    this.storage.db.prepare(`
+    // 2. cosine similarity — strengthen ALL matches above threshold
+    // multiple preferences can mean the same thing with different wording
+    const matches = existing
+      .map(row => ({
+        ...row,
+        similarity: this._cosineSimilarity(embedding, JSON.parse(row.vector))
+      }))
+      .filter(row => row.similarity > THRESHOLD);
+ 
+    if (matches.length === 0) return false;
+ 
+    const update = this.storage.db.prepare(`
       UPDATE facts SET confidence = MIN(confidence + 0.1, 2.0) WHERE id = ?
-    `).run(match.id);
+    `);
+ 
+    for (const match of matches) {
+      update.run(match.id);
+    }
  
     return true;
   }
