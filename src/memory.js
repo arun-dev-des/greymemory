@@ -40,7 +40,6 @@ export class Memory {
     const today = new Date().toISOString().slice(0, 10);
  
     // 1. load existing facts for dedup — already filtered by is_latest + expires_at
-    // loadFacts() returns [{ key, value, memory_type, confidence, event_date }]
     // embed the input to find relevant existing memories
     const inputText   = Array.isArray(input)
       ? input.map(m => m.content).join(' ')
@@ -89,8 +88,8 @@ export class Memory {
         if (strengthened) continue;
       }
  
-      // save fact with all v0.3 columns
-      this.storage.saveFact(key, value, {
+      // save fact with all v0.3 columns — returns the inserted row's id
+      const factId = this.storage.saveFact(key, value, {
         memory_type,
         document_date: today,
         event_date,
@@ -99,9 +98,8 @@ export class Memory {
         metadata: JSON.stringify(context ? { context } : {}),
       });
  
-      // save embedding keyed by fact_key
-      // Week 2 will migrate this to fact_id once UNIQUE constraint is removed
-      this.storage.saveEmbeddings({ [key]: embedding });
+      // save embedding keyed by fact_id — each version gets its own embedding row
+      this.storage.saveEmbedding(factId, embedding);
     }
  
     // 5. save raw input as chunks with embeddings
@@ -160,7 +158,7 @@ export class Memory {
     const existing = this.storage.db.prepare(`
       SELECT f.id, f.key, f.confidence, e.vector
       FROM facts f
-      JOIN embeddings e ON e.fact_key = f.key AND e.container = f.container
+      JOIN embeddings e ON e.fact_id = f.id
       WHERE f.container = ?
         AND f.memory_type = 'preference'
         AND f.is_latest = 1

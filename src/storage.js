@@ -27,24 +27,31 @@ export class Storage {
   _init() {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS facts (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        key         TEXT NOT NULL,
-        value       TEXT NOT NULL,
-        container   TEXT NOT NULL DEFAULT 'default',
-        previous    TEXT,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-        updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(key, container)
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        key           TEXT    NOT NULL,
+        value         TEXT    NOT NULL,
+        container     TEXT    NOT NULL DEFAULT 'default',
+        created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        memory_type   TEXT    NOT NULL DEFAULT 'fact',
+        document_date TEXT,
+        event_date    TEXT,
+        expires_at    TEXT,
+        is_latest     INTEGER NOT NULL DEFAULT 1,
+        superseded_by INTEGER,
+        relation_type TEXT,
+        related_to    INTEGER,
+        confidence    REAL    NOT NULL DEFAULT 1.0,
+        metadata      TEXT    NOT NULL DEFAULT '{}'
       );
 
       CREATE TABLE IF NOT EXISTS embeddings (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        fact_key    TEXT NOT NULL,
-        container   TEXT NOT NULL DEFAULT 'default',
-        vector      TEXT NOT NULL,
-        model       TEXT NOT NULL DEFAULT 'mxbai-embed-large',
-        created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-        UNIQUE(fact_key, container)
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        fact_id    INTEGER NOT NULL REFERENCES facts(id),
+        container  TEXT    NOT NULL DEFAULT 'default',
+        vector     TEXT    NOT NULL,
+        model      TEXT    NOT NULL DEFAULT 'mxbai-embed-large',
+        created_at TEXT    NOT NULL DEFAULT (datetime('now'))
       );
 
       CREATE TABLE IF NOT EXISTS chunks (
@@ -120,6 +127,179 @@ export class Storage {
   // uses PRAGMA table_info to skip columns that already exist
   // safe to run on v0.2.x databases and on fresh installs
   _migrate() {
+    // ── Table rebuild ──────────────────────────────────────────
+    // SQLite cannot DROP constraints with ALTER TABLE.
+    // The only way is: rename → create new → copy data → drop old.
+    // Wrapped in a transaction — if anything fails, original data is untouched.
+
+    const factsDef = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='facts'`
+    ).get();
+ 
+    const needsFactsRebuild = factsDef?.sql?.includes('UNIQUE(key, container)');
+ 
+    if (needsFactsRebuild) {
+      console.log('[greymemory] migrating database to v0.3 — this runs once');
+ 
+      this.db.transaction(() => {
+        // 1. drop triggers — they point to facts, must be recreated after rename
+        this.db.exec(`
+          DROP TRIGGER IF EXISTS facts_ai;
+          DROP TRIGGER IF EXISTS facts_au;
+          DROP TRIGGER IF EXISTS facts_ad;
+        `);
+ 
+        // 2. rename old table
+        this.db.exec(`ALTER TABLE facts RENAME TO facts_old`);
+ 
+        // 3. add v0.3 columns to facts_old if they don't exist yet
+        // handles v0.2.x users who never ran Week 1 migration
+        const oldCols = new Set(
+          this.db.pragma('table_info(facts_old)').map(c => c.name)
+        );
+        const v3columns = [
+          ['memory_type',   "TEXT    NOT NULL DEFAULT 'fact'"],
+          ['document_date', 'TEXT'],
+          ['event_date',    'TEXT'],
+          ['expires_at',    'TEXT'],
+          ['is_latest',     'INTEGER NOT NULL DEFAULT 1'],
+          ['superseded_by', 'INTEGER'],
+          ['relation_type', 'TEXT'],
+          ['related_to',    'INTEGER'],
+          ['confidence',    'REAL    NOT NULL DEFAULT 1.0'],
+          ['metadata',      "TEXT    NOT NULL DEFAULT '{}'"],
+        ];
+        for (const [col, def] of v3columns) {
+          if (!oldCols.has(col)) {
+            this.db.exec(`ALTER TABLE facts_old ADD COLUMN ${col} ${def}`);
+          }
+        }
+ 
+        // 4. backfill defaults on facts_old rows that were never migrated
+        this.db.exec(`
+          UPDATE facts_old SET
+            document_date = COALESCE(created_at, datetime('now')),
+            memory_type   = 'fact',
+            is_latest     = 1,
+            confidence    = 1.0,
+            metadata      = '{}'
+          WHERE document_date IS NULL;
+        `);
+ 
+        // 5. create new facts table — no UNIQUE constraint, no previous column
+        this.db.exec(`
+          CREATE TABLE facts (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            key           TEXT    NOT NULL,
+            value         TEXT    NOT NULL,
+            container     TEXT    NOT NULL DEFAULT 'default',
+            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+            memory_type   TEXT    NOT NULL DEFAULT 'fact',
+            document_date TEXT,
+            event_date    TEXT,
+            expires_at    TEXT,
+            is_latest     INTEGER NOT NULL DEFAULT 1,
+            superseded_by INTEGER,
+            relation_type TEXT,
+            related_to    INTEGER,
+            confidence    REAL    NOT NULL DEFAULT 1.0,
+            metadata      TEXT    NOT NULL DEFAULT '{}'
+          );
+        `);
+ 
+        // 6. copy all data — explicit columns, previous intentionally excluded
+        this.db.exec(`
+          INSERT INTO facts
+            (id, key, value, container, created_at, updated_at,
+             memory_type, document_date, event_date, expires_at, is_latest,
+             superseded_by, relation_type, related_to, confidence, metadata)
+          SELECT
+            id, key, value, container, created_at, updated_at,
+            memory_type, document_date, event_date, expires_at, is_latest,
+            superseded_by, relation_type, related_to, confidence, metadata
+          FROM facts_old;
+        `);
+ 
+        // 7. drop old table
+        this.db.exec(`DROP TABLE facts_old`);
+ 
+        // 8. recreate triggers on new facts table
+        this.db.exec(`
+          CREATE TRIGGER IF NOT EXISTS facts_ai
+          AFTER INSERT ON facts BEGIN
+            INSERT INTO facts_fts(rowid, key, value, container)
+            VALUES (new.id, new.key, new.value, new.container);
+          END;
+ 
+          CREATE TRIGGER IF NOT EXISTS facts_au
+          AFTER UPDATE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, key, value, container)
+            VALUES ('delete', old.id, old.key, old.value, old.container);
+            INSERT INTO facts_fts(rowid, key, value, container)
+            VALUES (new.id, new.key, new.value, new.container);
+          END;
+ 
+          CREATE TRIGGER IF NOT EXISTS facts_ad
+          AFTER DELETE ON facts BEGIN
+            INSERT INTO facts_fts(facts_fts, rowid, key, value, container)
+            VALUES ('delete', old.id, old.key, old.value, old.container);
+          END;
+        `);
+ 
+        // 9. rebuild FTS5 index — rescans all rows in new facts table
+        this.db.exec(`INSERT INTO facts_fts(facts_fts) VALUES('rebuild')`);
+ 
+      })();
+    }
+
+    // ── embeddings table rebuild ──────────────────────────────────────────────
+    // remove UNIQUE(fact_key, container) and rename fact_key → fact_id INTEGER
+    // each fact version now has its own embedding row keyed by fact_id
+ 
+    const embeddingsDef = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='embeddings'`
+    ).get();
+ 
+    const needsEmbeddingsRebuild = embeddingsDef?.sql?.includes('UNIQUE(fact_key, container)');
+ 
+    if (needsEmbeddingsRebuild) {
+      this.db.transaction(() => {
+        // 1. rename old table
+        this.db.exec(`ALTER TABLE embeddings RENAME TO embeddings_old`);
+ 
+        // 2. create new embeddings table — fact_id INTEGER, no UNIQUE constraint
+        this.db.exec(`
+          CREATE TABLE embeddings (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            fact_id    INTEGER NOT NULL REFERENCES facts(id),
+            container  TEXT    NOT NULL DEFAULT 'default',
+            vector     TEXT    NOT NULL,
+            model      TEXT    NOT NULL DEFAULT 'mxbai-embed-large',
+            created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+          );
+        `);
+ 
+        // 3. copy existing embeddings — join on fact_key to get fact_id
+        // existing embeddings point to the current (is_latest=1) version of each fact
+        this.db.exec(`
+          INSERT INTO embeddings (fact_id, container, vector, model, created_at)
+          SELECT f.id, e.container, e.vector, e.model, e.created_at
+          FROM embeddings_old e
+          JOIN facts f ON e.fact_key = f.key AND e.container = f.container
+          WHERE f.is_latest = 1;
+        `);
+ 
+        // 4. drop old table
+        this.db.exec(`DROP TABLE embeddings_old`);
+ 
+      })();
+    }
+
+    // ── ALTER TABLE ADD COLUMN loop ───────────────────────────────────────────
+    // for fresh installs the new tables already have all columns
+    // this loop handles any edge case where rebuild was skipped
+
     const existing = new Set(
       this.db.pragma('table_info(facts)').map(c => c.name)
     );
@@ -189,32 +369,17 @@ export class Storage {
       metadata      = '{}',
     } = opts;
  
-    const existing = this.db
-      .prepare(`SELECT value FROM facts WHERE key = ? AND container = ? AND is_latest = 1`)
-      .get(key, this.container);
- 
-    this.db.prepare(`
+    const result = this.db.prepare(`
       INSERT INTO facts
-        (key, value, container, previous, updated_at,
-         memory_type, document_date, event_date, expires_at, confidence, metadata)
+        (key, value, container, memory_type, document_date, event_date,
+         expires_at, is_latest, confidence, metadata, updated_at)
       VALUES
-        (@key, @value, @container, @previous, datetime('now'),
-         @memory_type, @document_date, @event_date, @expires_at, @confidence, @metadata)
-      ON CONFLICT(key, container) DO UPDATE SET
-        previous      = facts.value,
-        value         = @value,
-        updated_at    = datetime('now'),
-        memory_type   = @memory_type,
-        document_date = @document_date,
-        event_date    = @event_date,
-        expires_at    = @expires_at,
-        confidence    = @confidence,
-        metadata      = @metadata
+        (@key, @value, @container, @memory_type, @document_date, @event_date,
+         @expires_at, 1, @confidence, @metadata, datetime('now'))
     `).run({
       key,
       value:         typeof value === 'string' ? value : JSON.stringify(value),
       container:     this.container,
-      previous:      existing?.value ?? null,
       memory_type,
       document_date,
       event_date,
@@ -222,29 +387,17 @@ export class Storage {
       confidence,
       metadata:      typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     });
+ 
+    return result.lastInsertRowid;
   }
 
   // ── Embeddings ─────────────────────────────────────
 
-  saveEmbeddings(embeddings) {
-    const upsert = this.db.prepare(`
-      INSERT INTO embeddings (fact_key, container, vector)
-      VALUES (@fact_key, @container, @vector)
-      ON CONFLICT(fact_key, container) DO UPDATE SET
-        vector = @vector
-    `);
-
-    const saveAll = this.db.transaction((embeddings) => {
-      for (const [fact_key, vector] of Object.entries(embeddings)) {
-        upsert.run({
-          fact_key,
-          container: this.container,
-          vector: JSON.stringify(vector),
-        });
-      }
-    });
-
-    saveAll(embeddings);
+  saveEmbedding(factId, vector) {
+    this.db.prepare(`
+      INSERT INTO embeddings (fact_id, container, vector)
+      VALUES (?, ?, ?)
+    `).run(factId, this.container, JSON.stringify(vector));
   }
 
   // ── Chunks ─────────────────────────────────────────
@@ -341,11 +494,11 @@ export class Storage {
   }
 
   vectorSearch(queryVector, container, topN = 10) {
-    // join facts to filter is_latest and expires_at — don't rely on loadFacts()
+    // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
-      SELECT e.fact_key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
+      SELECT f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
       FROM embeddings e
-      JOIN facts f ON e.fact_key = f.key AND e.container = f.container
+      JOIN facts f ON e.fact_id = f.id
       WHERE e.container = ?
         AND f.is_latest = 1
         AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
@@ -353,7 +506,7 @@ export class Storage {
  
     const scored = rows
       .map(row => ({
-        key:         row.fact_key,
+        key:         row.key,
         value:       row.value,
         memory_type: row.memory_type,
         confidence:  row.confidence,
