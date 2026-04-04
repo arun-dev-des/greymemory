@@ -38,7 +38,8 @@ export class Storage {
         event_date    TEXT,
         expires_at    TEXT,
         is_latest     INTEGER NOT NULL DEFAULT 1,
-        superseded_by INTEGER,
+        superseded_by   INTEGER,
+        superseded_from INTEGER,
         relation_type TEXT,
         related_to    INTEGER,
         confidence    REAL    NOT NULL DEFAULT 1.0,
@@ -189,22 +190,23 @@ export class Storage {
         // 5. create new facts table — no UNIQUE constraint, no previous column
         this.db.exec(`
           CREATE TABLE facts (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            key           TEXT    NOT NULL,
-            value         TEXT    NOT NULL,
-            container     TEXT    NOT NULL DEFAULT 'default',
-            created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-            updated_at    TEXT    NOT NULL DEFAULT (datetime('now')),
-            memory_type   TEXT    NOT NULL DEFAULT 'fact',
-            document_date TEXT,
-            event_date    TEXT,
-            expires_at    TEXT,
-            is_latest     INTEGER NOT NULL DEFAULT 1,
-            superseded_by INTEGER,
-            relation_type TEXT,
-            related_to    INTEGER,
-            confidence    REAL    NOT NULL DEFAULT 1.0,
-            metadata      TEXT    NOT NULL DEFAULT '{}'
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            key             TEXT    NOT NULL,
+            value           TEXT    NOT NULL,
+            container       TEXT    NOT NULL DEFAULT 'default',
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            memory_type     TEXT    NOT NULL DEFAULT 'fact',
+            document_date   TEXT,
+            event_date      TEXT,
+            expires_at      TEXT,
+            is_latest       INTEGER NOT NULL DEFAULT 1,
+            superseded_by   INTEGER,
+            superseded_from INTEGER,
+            relation_type   TEXT,
+            related_to      INTEGER,
+            confidence      REAL    NOT NULL DEFAULT 1.0,
+            metadata        TEXT    NOT NULL DEFAULT '{}'
           );
         `);
  
@@ -213,11 +215,11 @@ export class Storage {
           INSERT INTO facts
             (id, key, value, container, created_at, updated_at,
              memory_type, document_date, event_date, expires_at, is_latest,
-             superseded_by, relation_type, related_to, confidence, metadata)
+             superseded_by, superseded_from, relation_type, related_to, confidence, metadata)
           SELECT
             id, key, value, container, created_at, updated_at,
             memory_type, document_date, event_date, expires_at, is_latest,
-            superseded_by, relation_type, related_to, confidence, metadata
+            superseded_by, superseded_from, relation_type, related_to, confidence, metadata
           FROM facts_old;
         `);
  
@@ -305,16 +307,17 @@ export class Storage {
     );
  
     const columns = [
-      ['memory_type',   "TEXT    NOT NULL DEFAULT 'fact'"],
-      ['document_date', 'TEXT'],
-      ['event_date',    'TEXT'],
-      ['expires_at',    'TEXT'],
-      ['is_latest',     'INTEGER NOT NULL DEFAULT 1'],
-      ['superseded_by', 'INTEGER'],
-      ['relation_type', 'TEXT'],
-      ['related_to',    'INTEGER'],
-      ['confidence',    'REAL    NOT NULL DEFAULT 1.0'],
-      ['metadata',      "TEXT    NOT NULL DEFAULT '{}'"],
+      ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
+      ['document_date',   'TEXT'],
+      ['event_date',      'TEXT'],
+      ['expires_at',      'TEXT'],
+      ['is_latest',       'INTEGER NOT NULL DEFAULT 1'],
+      ['superseded_by',   'INTEGER'],
+      ['superseded_from', 'INTEGER'],
+      ['relation_type',   'TEXT'],
+      ['related_to',      'INTEGER'],
+      ['confidence',      'REAL    NOT NULL DEFAULT 1.0'],
+      ['metadata',        "TEXT    NOT NULL DEFAULT '{}'"],
     ];
  
     for (const [col, def] of columns) {
@@ -343,8 +346,6 @@ export class Storage {
     `);
   }
 
-  
-
   // ── Facts ──────────────────────────────────────────
 
   loadFacts() {
@@ -359,33 +360,47 @@ export class Storage {
       .all(this.container);
   }
 
+  supersedeFact(oldId, newId) {
+    this.db.prepare(`
+      UPDATE facts SET is_latest = 0, superseded_by = ? WHERE id = ?
+    `).run(newId, oldId);
+  }
+
   saveFact(key, value, opts = {}) {
     const {
-      memory_type   = 'fact',
-      document_date = new Date().toISOString().slice(0, 10),
-      event_date    = null,
-      expires_at    = null,
-      confidence    = 1.0,
-      metadata      = '{}',
+      memory_type     = 'fact',
+      document_date   = new Date().toISOString().slice(0, 10),
+      event_date      = null,
+      expires_at      = null,
+      confidence      = 1.0,
+      relation_type   = null,
+      related_to      = null,
+      superseded_from = null,
+      metadata        = '{}',
     } = opts;
  
     const result = this.db.prepare(`
       INSERT INTO facts
         (key, value, container, memory_type, document_date, event_date,
-         expires_at, is_latest, confidence, metadata, updated_at)
+         expires_at, is_latest, confidence, relation_type, related_to,
+         superseded_from, metadata, updated_at)
       VALUES
         (@key, @value, @container, @memory_type, @document_date, @event_date,
-         @expires_at, 1, @confidence, @metadata, datetime('now'))
+         @expires_at, 1, @confidence, @relation_type, @related_to,
+         @superseded_from, @metadata, datetime('now'))
     `).run({
       key,
-      value:         typeof value === 'string' ? value : JSON.stringify(value),
-      container:     this.container,
+      value:           typeof value === 'string' ? value : JSON.stringify(value),
+      container:       this.container,
       memory_type,
       document_date,
       event_date,
       expires_at,
       confidence,
-      metadata:      typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
+      relation_type,
+      related_to,
+      superseded_from,
+      metadata:        typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     });
  
     return result.lastInsertRowid;
@@ -496,7 +511,7 @@ export class Storage {
   vectorSearch(queryVector, container, topN = 10) {
     // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
-      SELECT f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
+      SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
       WHERE e.container = ?
@@ -506,6 +521,7 @@ export class Storage {
  
     const scored = rows
       .map(row => ({
+        id:          row.fact_id,
         key:         row.key,
         value:       row.value,
         memory_type: row.memory_type,
@@ -518,6 +534,7 @@ export class Storage {
  
     return scored.map((r, index) => ({ ...r, rank: index + 1 }));
   }
+ 
 
   vectorSearchChunks(queryVector, container, topN = 10) {
     const rows = this.db.prepare(`

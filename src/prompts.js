@@ -68,8 +68,8 @@ Rules:
 
    BAD  → "Arun is a product designer who prefers TypeScript and works in Bangalore"
    GOOD → "Arun is a product designer"
-          "Arun prefers TypeScript over JavaScript"
-          "Arun is based in Bangalore"
+           "Arun prefers TypeScript over JavaScript"
+           "Arun is based in Bangalore"
 
    Why this matters: each memory gets its own embedding. Combined facts produce
    weak embeddings that match nothing well. Atomic facts produce strong, precise
@@ -90,10 +90,19 @@ For every memory:
 STEP 4 — RETURN JSON ARRAY
 
 Return ONLY a valid JSON array. No markdown. No preamble.
+Do NOT include derived or inferred memories — the system generates those automatically.
+
+KEY NAMING RULES — the key is a short generic concept identifier, not a description:
+  GOOD: "employer", "location", "role", "language_preference", "meeting_tomorrow"
+  BAD:  "alex_current_employer", "alex_works_at_stripe", "user_city", "arun_preference"
+  - Never include the entity name in the key
+  - Never include the value in the key
+  - Use the same key for the same concept across sessions ("employer" always means employer)
+  - Short snake_case — 1-3 words maximum
 
 [
   {
-    "key":         "snake_case_identifier",
+    "key":         "employer",
     "value":       "atomic memory as a complete self-contained sentence",
     "memory_type": "fact | preference | episode",
     "event_date":  "YYYY-MM-DD or null",
@@ -105,7 +114,17 @@ Return ONLY a valid JSON array. No markdown. No preamble.
 ${inputLabel}:
 ${inputBody}
 ${existingFacts.length > 0 ? `
-Existing memories (do not duplicate):
+Existing memories — skip ONLY if content is identical or near-identical.
+
+Always extract if the new content:
+  - Contradicts an existing memory ("now works at Stripe" vs "works at Google") → extract it, system will resolve the contradiction
+  - Adds new detail to an existing memory ("PM at Stripe" vs "works at Stripe") → extract it, system will link it
+  - Is completely new information with no relation to existing memories → extract it
+
+Do NOT extract:
+  - Exact or near-exact duplicates of memories listed below
+  - Logical inferences or second-order conclusions — the system derives these automatically
+
 ${existingFacts.slice(0, 20).map(f => `- [${f.memory_type}] ${f.value}`).join('\n')}
 ` : ''}`
 }

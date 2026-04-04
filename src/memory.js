@@ -41,12 +41,11 @@ export class Memory {
  
     // 1. load existing facts for dedup — already filtered by is_latest + expires_at
     // embed the input to find relevant existing memories
+    // only pass facts and episodes — not preferences. preferences are handled by _strengthenPreference separately
     const inputText   = Array.isArray(input)
       ? input.map(m => m.content).join(' ')
       : input
     const inputVector   = await this.embedder(inputText)
-    // only pass facts and episodes — not preferences
-    // preferences are handled by _strengthenPreference separately
     const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10)
       .filter(f => f.memory_type !== 'preference')
  
@@ -88,15 +87,30 @@ export class Memory {
         if (strengthened) continue;
       }
  
+      // detect relationship to existing memories before inserting
+      // facts and episodes can contradict, extend, or derive from existing memories
+      // preferences are always inserted as new — strengthening handled above
+      const relationship = (memory_type === 'fact' || memory_type === 'episode')
+        ? await this._detectRelationship(mem, embedding)
+        : { type: 'NEW', relatedTo: null };
+ 
       // save fact with all v0.3 columns — returns the inserted row's id
       const factId = this.storage.saveFact(key, value, {
         memory_type,
-        document_date: today,
+        document_date:   today,
         event_date,
         expires_at,
-        confidence: 1.0,
-        metadata: JSON.stringify(context ? { context } : {}),
+        confidence:      1.0,
+        relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
+        related_to:      relationship.relatedTo,
+        superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
+        metadata:        JSON.stringify(context ? { context } : {}),
       });
+ 
+      // if UPDATES — mark old fact as superseded now that we have the new id
+      if (relationship.type === 'UPDATES' && relationship.relatedTo) {
+        this.storage.supersedeFact(relationship.relatedTo, factId);
+      }
  
       // save embedding keyed by fact_id — each version gets its own embedding row
       this.storage.saveEmbedding(factId, embedding);
@@ -142,6 +156,63 @@ export class Memory {
   
   getMemories() {
     return this.storage.loadFacts();
+  }
+
+  // ── getCurrent ─────────────────────────────────────
+ 
+  // returns the current (is_latest=1) version of a fact
+  // always uses semantic search — keys are internal, not public API
+  // use natural language: getCurrent('where does Alex work')
+  async getCurrent(query) {
+    const embedding = await this.embedder(query);
+    const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
+    return results[0] ?? null;
+  }
+ 
+  // ── getHistory ─────────────────────────────────────
+ 
+  // returns full version chain for a fact, oldest → newest
+  // always uses semantic search to find starting point — keys are internal
+  // walks backward via superseded_from regardless of key differences
+  // use natural language: getHistory('what jobs has Alex had')
+  async getHistory(query) {
+    // 1. find current version via semantic search
+    const embedding = await this.embedder(query);
+    const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
+ 
+    if (!results[0]) return [];
+ 
+    // fetch full row — vectorSearch returns simplified shape without superseded_from
+    let current = this.storage.db.prepare(`
+      SELECT * FROM facts WHERE id = ?
+    `).get(results[0].id);
+ 
+    if (!current) return [];
+ 
+    // 2. walk backward via superseded_from to build full chain
+    const chain = [current];
+    let node = current;
+ 
+    while (node.superseded_from) {
+      node = this.storage.db.prepare(`
+        SELECT * FROM facts WHERE id = ?
+      `).get(node.superseded_from);
+      if (!node) break;
+      chain.push(node);
+    }
+ 
+    // 3. reverse to return oldest → newest
+    return chain.reverse().map(f => ({
+      id:            f.id,
+      key:           f.key,
+      value:         f.value,
+      memory_type:   f.memory_type,
+      document_date: f.document_date,
+      event_date:    f.event_date,
+      is_latest:     f.is_latest === 1,
+      superseded_by: f.superseded_by,
+      relation_type: f.relation_type,
+    }));
   }
 
   // ── Clear ──────────────────────────────────────────
@@ -196,6 +267,92 @@ export class Memory {
     }
  
     return true;
+  }
+
+  // detect relationship between a new memory and existing ones
+  // step 1: find candidates via same-key lookup + vector similarity
+  // step 2: LLM classifies the relationship
+  // returns { type: 'UPDATES'|'EXTENDS'|'DERIVES'|'NEW', relatedTo: id|null }
+  async _detectRelationship(mem, embedding) {
+    const { key, value, memory_type, document_date, event_date } = mem;
+    const today = new Date().toISOString().slice(0, 10);
+ 
+    // step 1a — same key facts (strong signal regardless of embedding similarity)
+    const sameKeyFacts = this.storage.db.prepare(`
+      SELECT id, key, value, memory_type, document_date, event_date
+      FROM facts
+      WHERE key = ? AND container = ? AND is_latest = 1
+        AND (expires_at IS NULL OR expires_at > datetime('now'))
+    `).all(key, this.storage.container);
+ 
+    // step 1b — semantically similar facts via vector search
+    const similarFacts = this.storage.vectorSearch(embedding, this.storage.container, 5);
+ 
+    // step 1c — combine and dedup by id
+    const seen = new Set();
+    const candidates = [];
+    for (const f of [...sameKeyFacts, ...similarFacts]) {
+      if (!seen.has(f.id)) {
+        seen.add(f.id);
+        candidates.push(f);
+      }
+    }
+ 
+    // no candidates — this is a brand new memory
+    if (candidates.length === 0) return { type: 'NEW', relatedTo: null };
+ 
+    // step 2 — LLM classifies the relationship
+    const prompt = `You are a memory relationship classifier.
+ 
+New memory: "${value}" [${memory_type}] [recorded: ${document_date ?? today}]${event_date ? ` [event: ${event_date}]` : ''}
+ 
+Existing memories:
+${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}" [${f.memory_type}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`).join('\n')}
+ 
+Classify the relationship between the new memory and the MOST RELEVANT existing memory.
+Priority order: UPDATES > EXTENDS > DERIVES > NEW
+ 
+UPDATES — new memory contradicts and replaces an existing one:
+  CRITICAL: These attributes are SINGULAR — a person can only have ONE value at a time.
+  When the value changes, it is ALWAYS UPDATES, never EXTENDS:
+  - Employer:  "works at Stripe" UPDATES "works at Google"
+  - Location:  "lives in Mumbai" UPDATES "lives in Bangalore"
+  - Role/Title: "is a PM" UPDATES "is a software engineer"
+  - Relationship status, education, any other singular attribute
+ 
+  Even if the wording is different, if it describes the SAME attribute with a DIFFERENT value → UPDATES.
+  "Alex recently joined Stripe as PM" UPDATES "Alex works at Google as engineer"
+ 
+EXTENDS — new memory adds detail WITHOUT replacing an existing one:
+  - "Alex is a PM at Stripe focusing on payments" EXTENDS "Alex is a PM at Stripe"
+  - "Alex lives in Koramangala, Bangalore" EXTENDS "Alex lives in Bangalore"
+  Only use EXTENDS if the existing memory is still 100% true after the new one is added.
+ 
+DERIVES — logical inference from combining multiple existing memories:
+  - Only use when the new memory is an inference, not directly stated
+  - Use rarely — most memories are UPDATES or EXTENDS
+ 
+NEW — no meaningful relationship to any existing memory.
+ 
+Return ONLY valid JSON, no explanation:
+{"type": "UPDATES|EXTENDS|DERIVES|NEW", "relatedTo": <id of most related existing memory, or null if NEW>}`;
+ 
+    try {
+      const raw    = await this.extractor(prompt);
+      const text   = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+      const result = JSON.parse(text);
+ 
+      // validate — ensure relatedTo points to a real candidate
+      const validId = candidates.find(c => c.id === result.relatedTo)?.id ?? null;
+ 
+      return {
+        type:      ['UPDATES', 'EXTENDS', 'DERIVES', 'NEW'].includes(result.type) ? result.type : 'NEW',
+        relatedTo: result.type !== 'NEW' ? validId : null,
+      };
+    } catch {
+      // if LLM fails or returns invalid JSON — treat as NEW, never block ingestion
+      return { type: 'NEW', relatedTo: null };
+    }
   }
  
   // parse raw extractor string → array of memory objects
