@@ -214,7 +214,7 @@ export class Memory {
  
   // ── getHistory ─────────────────────────────────────
  
-  // returns full version chain for a fact, oldest → newest
+  // returns full version chain for a fact, newest → oldest
   // always uses semantic search to find starting point — keys are internal
   // walks backward via superseded_from regardless of key differences
   // use natural language: getHistory('what jobs has Alex had')
@@ -256,6 +256,108 @@ export class Memory {
       superseded_by: f.superseded_by,
       relation_type: f.relation_type,
     }));
+  }
+
+  // ── runDerivations ─────────────────────────────────
+ 
+  // infers second-order conclusions by combining recent memories with similar existing ones
+  // call manually after add(), on a schedule, or before important queries
+  // never called inside add() — derivation is a separate concern from ingestion
+  //
+  // options:
+  //   sinceDays: look at facts added in last N days (default 7)
+  //   topK:      number of similar facts to combine with each recent fact (default 10)
+  async runDerivations({ sinceDays = 7, topK = 10 } = {}) {
+    // get recently added facts — focused window, not entire memory graph
+    const recentFacts = this.storage.db.prepare(`
+      SELECT id, key, value, memory_type, document_date
+      FROM facts
+      WHERE container = ?
+        AND memory_type = 'fact'
+        AND is_latest = 1
+        AND relation_type != 'DERIVES'
+        AND (expires_at IS NULL OR expires_at > datetime('now'))
+        AND document_date >= date('now', '-' || ? || ' days')
+      ORDER BY created_at DESC
+      LIMIT 20
+    `).all(this.storage.container, sinceDays);
+ 
+    if (recentFacts.length === 0) return [];
+ 
+    const derived = [];
+ 
+    for (const recentFact of recentFacts) {
+      // find top K semantically similar existing facts — focused candidates
+      const embedding  = await this.embedder(recentFact.value);
+      const candidates = this.storage.vectorSearch(embedding, this.storage.container, topK)
+        .filter(f => f.id !== recentFact.id && f.memory_type === 'fact');
+ 
+      if (candidates.length === 0) continue;
+ 
+      // small focused prompt — one recent fact + top K candidates
+      const prompt = `You are a memory inference engine.
+ 
+New memory: [ID:${recentFact.id}] "${recentFact.value}"
+ 
+Related existing memories:
+${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}"`).join('\n')}
+ 
+Can you infer a NEW factual conclusion by combining the new memory with one or more related memories?
+ 
+Rules:
+- The conclusion must NOT be explicitly stated in any memory above
+- It must be a confident logical inference, not speculation
+- If no confident inference is possible, return null
+ 
+Example:
+  "Alex is a PM at Stripe" + "Stripe is a payments company"
+  → "Alex likely works on payments products"
+ 
+Return ONLY valid JSON, no explanation:
+{"derives": "the inferred conclusion as a complete sentence", "fromIds": [id1, id2]}
+or null if no confident inference exists.`;
+ 
+      try {
+        const raw  = await this.extractor(prompt);
+        const text = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+ 
+        if (text === 'null' || !text) continue;
+ 
+        const result = JSON.parse(text);
+ 
+        if (!result?.derives || !Array.isArray(result.fromIds) || result.fromIds.length < 2) continue;
+ 
+        // validate fromIds point to real facts
+        const allFacts = [recentFact, ...candidates];
+        const validIds = result.fromIds.filter(id => allFacts.find(f => f.id === id));
+        if (validIds.length < 2) continue;
+ 
+        // check this inference doesn't already exist
+        const deriveEmbedding = await this.embedder(result.derives);
+        const existing        = this.storage.vectorSearch(deriveEmbedding, this.storage.container, 1);
+        if (existing[0]?.score > 0.95) continue;
+ 
+        // save the derived fact
+        const today  = new Date().toISOString().slice(0, 10);
+        const key    = `derived_${Date.now()}`;
+        const factId = this.storage.saveFact(key, result.derives, {
+          memory_type:   'fact',
+          document_date: today,
+          relation_type: 'DERIVES',
+          related_to:    validIds[0], // primary source — v0.4 stores all via fact_relations
+          confidence:    0.8,         // inferred facts start lower than stated facts
+          metadata:      JSON.stringify({ fromIds: validIds }),
+        });
+ 
+        this.storage.saveEmbedding(factId, deriveEmbedding);
+        derived.push({ id: factId, value: result.derives, fromIds: validIds });
+ 
+      } catch {
+        continue; // never block on derivation errors
+      }
+    }
+ 
+    return derived;
   }
 
   // ── Clear ──────────────────────────────────────────
@@ -353,7 +455,7 @@ Existing memories:
 ${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}" [${f.memory_type}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`).join('\n')}
  
 Classify the relationship between the new memory and the MOST RELEVANT existing memory.
-Priority order: UPDATES > EXTENDS > DERIVES > NEW
+Priority order: UPDATES > EXTENDS > NEW
  
 UPDATES — new memory contradicts and replaces an existing one:
   CRITICAL: These attributes are SINGULAR — a person can only have ONE value at a time.
@@ -371,14 +473,10 @@ EXTENDS — new memory adds detail WITHOUT replacing an existing one:
   - "Alex lives in Koramangala, Bangalore" EXTENDS "Alex lives in Bangalore"
   Only use EXTENDS if the existing memory is still 100% true after the new one is added.
  
-DERIVES — logical inference from combining multiple existing memories:
-  - Only use when the new memory is an inference, not directly stated
-  - Use rarely — most memories are UPDATES or EXTENDS
- 
 NEW — no meaningful relationship to any existing memory.
  
 Return ONLY valid JSON, no explanation:
-{"type": "UPDATES|EXTENDS|DERIVES|NEW", "relatedTo": <id of most related existing memory, or null if NEW>}`;
+{"type": "UPDATES|EXTENDS|NEW", "relatedTo": <id of most related existing memory, or null if NEW>}`;
  
     try {
       const raw    = await this.extractor(prompt);
@@ -389,7 +487,7 @@ Return ONLY valid JSON, no explanation:
       const validId = candidates.find(c => c.id === result.relatedTo)?.id ?? null;
  
       return {
-        type:      ['UPDATES', 'EXTENDS', 'DERIVES', 'NEW'].includes(result.type) ? result.type : 'NEW',
+        type:      ['UPDATES', 'EXTENDS', 'NEW'].includes(result.type) ? result.type : 'NEW',
         relatedTo: result.type !== 'NEW' ? validId : null,
       };
     } catch {
