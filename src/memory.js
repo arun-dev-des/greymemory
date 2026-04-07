@@ -39,9 +39,7 @@ export class Memory {
   async add(input) {
     const today = new Date().toISOString().slice(0, 10);
  
-    // 1. load existing facts for dedup — already filtered by is_latest + expires_at
-    // embed the input to find relevant existing memories
-    // only pass facts and episodes — not preferences. preferences are handled by _strengthenPreference separately
+    // 1. find relevant existing memories for dedup via semantic search
     const inputText   = Array.isArray(input)
       ? input.map(m => m.content).join(' ')
       : input
@@ -63,8 +61,33 @@ export class Memory {
     const memories = this._parseExtraction(raw);
  
     if (memories.length === 0) return;
+
+    // 4. save raw input as chunks first — get anchor chunk_id for fact provenance
+    const messages = Array.isArray(input)
+      ? input
+      : [{ role: 'document', content: input }];
  
-    // 4. process each memory
+    let anchorChunkId = null;
+ 
+    for (const message of messages) {
+      if (!message.content?.trim()) continue;
+ 
+      const chunkContent = Array.isArray(input)
+        ? `${message.role}: ${message.content}`
+        : message.content;
+ 
+      this.storage.saveChunk(chunkContent);
+ 
+      const chunkId = this.storage.getLastChunkId();
+      if (chunkId) {
+        // first chunk of this add() call is the session anchor
+        if (anchorChunkId === null) anchorChunkId = chunkId;
+        const vector = await this.embedder(chunkContent);
+        this.storage.saveChunkEmbedding(chunkId, vector);
+      }
+    }
+ 
+    // 5. process each memory
     for (const mem of memories) {
       const {
         key,
@@ -104,6 +127,7 @@ export class Memory {
         relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
         related_to:      relationship.relatedTo,
         superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
+        chunk_id:        anchorChunkId,
         metadata:        JSON.stringify(context ? { context } : {}),
       });
  
@@ -115,39 +139,58 @@ export class Memory {
       // save embedding keyed by fact_id — each version gets its own embedding row
       this.storage.saveEmbedding(factId, embedding);
     }
- 
-    // 5. save raw input as chunks with embeddings
-    const messages = Array.isArray(input)
-      ? input
-      : [{ role: 'document', content: input }];
- 
-    for (const message of messages) {
-      if (!message.content?.trim()) continue;
- 
-      const chunkContent = Array.isArray(input)
-        ? `${message.role}: ${message.content}`
-        : message.content;
- 
-      this.storage.saveChunk(chunkContent);
- 
-      const chunkId = this.storage.getLastChunkId();
-      if (chunkId) {
-        const vector = await this.embedder(chunkContent);
-        this.storage.saveChunkEmbedding(chunkId, vector);
-      }
-    }
   }
 
   // ── Search ─────────────────────────────────────────
 
-  async search(query, topN = 5) {
+  async search(query, options = {}) {
+    const {
+      topN           = 5,
+      memoryTypes    = null,   // ['fact', 'preference', 'episode'] — null means all
+      afterDate      = null,   // filter by event_date >= afterDate
+      beforeDate     = null,   // filter by event_date <= beforeDate
+      includeHistory = false,  // include superseded facts (is_latest=0)
+      includeExpired = false,  // include expired episodes
+    } = typeof options === 'number' ? { topN: options } : options;
+ 
     const queryVector = await this.embedder(query);
-    return this.storage.hybridSearch(
+    const results     = this.storage.hybridSearch(
       query,
       queryVector,
       this.storage.container,
-      topN
+      topN * 3, // fetch more candidates — filters may reduce count
     );
+ 
+    // apply filters
+    let filtered = results;
+ 
+    if (memoryTypes) {
+      filtered = filtered.filter(r => memoryTypes.includes(r.memory_type));
+    }
+    if (!includeHistory) {
+      filtered = filtered.filter(r => r.is_latest !== 0);
+    }
+    if (!includeExpired) {
+      const now = new Date().toISOString().slice(0, 10);
+      filtered = filtered.filter(r => !r.expires_at || r.expires_at > now);
+    }
+    if (afterDate) {
+      filtered = filtered.filter(r => r.event_date && r.event_date >= afterDate);
+    }
+    if (beforeDate) {
+      filtered = filtered.filter(r => r.event_date && r.event_date <= beforeDate);
+    }
+ 
+    // pair each fact with its source chunk — Supermemory's dual retrieval pattern
+    return filtered.slice(0, topN).map(fact => ({
+      memory:        fact.value,
+      chunk:         this.storage.getChunk(fact.chunk_id),
+      memory_type:   fact.memory_type,
+      confidence:    fact.confidence,
+      document_date: fact.document_date,
+      event_date:    fact.event_date,
+      relation_type: fact.relation_type,
+    }));
   }
 
   // ── Get Memories ──────────────────────────────────────

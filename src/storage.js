@@ -42,6 +42,7 @@ export class Storage {
         superseded_from INTEGER,
         relation_type TEXT,
         related_to    INTEGER,
+        chunk_id      INTEGER,
         confidence    REAL    NOT NULL DEFAULT 1.0,
         metadata      TEXT    NOT NULL DEFAULT '{}'
       );
@@ -65,7 +66,7 @@ export class Storage {
 
       CREATE TABLE IF NOT EXISTS chunk_embeddings (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        chunk_id    INTEGER NOT NULL,
+        chunk_id    INTEGER NOT NULL REFERENCES chunks(id),
         container   TEXT NOT NULL DEFAULT 'default',
         vector      TEXT NOT NULL,
         created_at  TEXT NOT NULL DEFAULT (datetime('now')),
@@ -159,16 +160,18 @@ export class Storage {
           this.db.pragma('table_info(facts_old)').map(c => c.name)
         );
         const v3columns = [
-          ['memory_type',   "TEXT    NOT NULL DEFAULT 'fact'"],
-          ['document_date', 'TEXT'],
-          ['event_date',    'TEXT'],
-          ['expires_at',    'TEXT'],
-          ['is_latest',     'INTEGER NOT NULL DEFAULT 1'],
-          ['superseded_by', 'INTEGER'],
-          ['relation_type', 'TEXT'],
-          ['related_to',    'INTEGER'],
-          ['confidence',    'REAL    NOT NULL DEFAULT 1.0'],
-          ['metadata',      "TEXT    NOT NULL DEFAULT '{}'"],
+          ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
+          ['document_date',   'TEXT'],
+          ['event_date',      'TEXT'],
+          ['expires_at',      'TEXT'],
+          ['is_latest',       'INTEGER NOT NULL DEFAULT 1'],
+          ['superseded_by',   'INTEGER'],
+          ['superseded_from', 'INTEGER'],
+          ['relation_type',   'TEXT'],
+          ['related_to',      'INTEGER'],
+          ['chunk_id',        'INTEGER'],
+          ['confidence',      'REAL    NOT NULL DEFAULT 1.0'],
+          ['metadata',        "TEXT    NOT NULL DEFAULT '{}'"],
         ];
         for (const [col, def] of v3columns) {
           if (!oldCols.has(col)) {
@@ -205,6 +208,7 @@ export class Storage {
             superseded_from INTEGER,
             relation_type   TEXT,
             related_to      INTEGER,
+            chunk_id        INTEGER,
             confidence      REAL    NOT NULL DEFAULT 1.0,
             metadata        TEXT    NOT NULL DEFAULT '{}'
           );
@@ -215,11 +219,13 @@ export class Storage {
           INSERT INTO facts
             (id, key, value, container, created_at, updated_at,
              memory_type, document_date, event_date, expires_at, is_latest,
-             superseded_by, superseded_from, relation_type, related_to, confidence, metadata)
+             superseded_by, superseded_from, relation_type, related_to,
+             chunk_id, confidence, metadata)
           SELECT
             id, key, value, container, created_at, updated_at,
             memory_type, document_date, event_date, expires_at, is_latest,
-            superseded_by, superseded_from, relation_type, related_to, confidence, metadata
+            superseded_by, superseded_from, relation_type, related_to,
+            chunk_id, confidence, metadata
           FROM facts_old;
         `);
  
@@ -307,7 +313,7 @@ export class Storage {
     );
  
     const columns = [
-      ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
+       ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
       ['document_date',   'TEXT'],
       ['event_date',      'TEXT'],
       ['expires_at',      'TEXT'],
@@ -316,6 +322,7 @@ export class Storage {
       ['superseded_from', 'INTEGER'],
       ['relation_type',   'TEXT'],
       ['related_to',      'INTEGER'],
+      ['chunk_id',        'INTEGER'],
       ['confidence',      'REAL    NOT NULL DEFAULT 1.0'],
       ['metadata',        "TEXT    NOT NULL DEFAULT '{}'"],
     ];
@@ -344,6 +351,33 @@ export class Storage {
       CREATE INDEX IF NOT EXISTS idx_facts_docdate ON facts(container, document_date);
       CREATE INDEX IF NOT EXISTS idx_facts_expires ON facts(expires_at) WHERE expires_at IS NOT NULL;
     `);
+
+    // ── chunk_embeddings rebuild ──────────────────────────────────────────────
+    // add REFERENCES chunks(id) — missing from original v0.2 definition
+    // chunk_embeddings data is regenerated on every add() — safe to drop and recreate
+ 
+    const chunkEmbDef = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='chunk_embeddings'`
+    ).get();
+ 
+    const needsChunkEmbRebuild = chunkEmbDef?.sql &&
+      !chunkEmbDef.sql.includes('REFERENCES chunks(id)');
+ 
+    if (needsChunkEmbRebuild) {
+      this.db.transaction(() => {
+        this.db.exec(`DROP TABLE chunk_embeddings`);
+        this.db.exec(`
+          CREATE TABLE chunk_embeddings (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id    INTEGER NOT NULL REFERENCES chunks(id),
+            container   TEXT NOT NULL DEFAULT 'default',
+            vector      TEXT NOT NULL,
+            created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(chunk_id)
+          );
+        `);
+      })();
+    }
   }
 
   // ── Facts ──────────────────────────────────────────
@@ -351,12 +385,12 @@ export class Storage {
   loadFacts() {
     return this.db
       .prepare(`
-        SELECT 
+        SELECT
           id, key, value, container,
           memory_type, confidence,
           document_date, event_date, expires_at,
           is_latest, superseded_by, superseded_from,
-          relation_type, related_to,
+          relation_type, related_to, chunk_id,
           metadata, created_at, updated_at
         FROM facts
         WHERE container = ?
@@ -383,6 +417,7 @@ export class Storage {
       relation_type   = null,
       related_to      = null,
       superseded_from = null,
+      chunk_id        = null,
       metadata        = '{}',
     } = opts;
  
@@ -390,11 +425,11 @@ export class Storage {
       INSERT INTO facts
         (key, value, container, memory_type, document_date, event_date,
          expires_at, is_latest, confidence, relation_type, related_to,
-         superseded_from, metadata, updated_at)
+         superseded_from, chunk_id, metadata, updated_at)
       VALUES
         (@key, @value, @container, @memory_type, @document_date, @event_date,
          @expires_at, 1, @confidence, @relation_type, @related_to,
-         @superseded_from, @metadata, datetime('now'))
+         @superseded_from, @chunk_id, @metadata, datetime('now'))
     `).run({
       key,
       value:           typeof value === 'string' ? value : JSON.stringify(value),
@@ -407,6 +442,7 @@ export class Storage {
       relation_type,
       related_to,
       superseded_from,
+      chunk_id,
       metadata:        typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     });
  
@@ -463,11 +499,13 @@ export class Storage {
  
     const rows = this.db.prepare(`
       SELECT
+        f.id,
         f.key,
         f.value,
         f.memory_type,
         f.confidence,
         f.event_date,
+        f.chunk_id,
         bm25(facts_fts) AS score
       FROM facts_fts
       JOIN facts f ON facts_fts.rowid = f.id
@@ -480,45 +518,22 @@ export class Storage {
     `).all(ftsQuery, container, topN);
  
     return rows.map((r, index) => ({
+      id:          r.id,
       key:         r.key,
       value:       r.value,
       memory_type: r.memory_type,
       confidence:  r.confidence,
       event_date:  r.event_date,
+      chunk_id:    r.chunk_id,
       rank:        index + 1,
       score:       r.score,
-    }));
-  }
-
-  bm25SearchChunks(query, container, topN = 10) {
-    const ftsQuery = query.trim().split(/\s+/).join(" OR ");
-
-    const rows = this.db.prepare(`
-      SELECT
-        c.id,
-        c.content,
-        bm25(chunks_fts) AS score
-      FROM chunks_fts
-      JOIN chunks c ON chunks_fts.rowid = c.id
-      WHERE chunks_fts MATCH ?
-      AND c.container = ?
-      ORDER BY score
-      LIMIT ?
-    `).all(ftsQuery, container, topN);
-
-    return rows.map((r, index) => ({
-      key: `chunk_${r.id}`,
-      value: r.content,
-      rank: index + 1,
-      score: r.score,
-      type: "chunk",
     }));
   }
 
   vectorSearch(queryVector, container, topN = 10) {
     // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
-      SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date
+      SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date, f.chunk_id
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
       WHERE e.container = ?
@@ -534,6 +549,7 @@ export class Storage {
         memory_type: row.memory_type,
         confidence:  row.confidence,
         event_date:  row.event_date,
+        chunk_id:    row.chunk_id,
         score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)
@@ -541,64 +557,44 @@ export class Storage {
  
     return scored.map((r, index) => ({ ...r, rank: index + 1 }));
   }
- 
 
-  vectorSearchChunks(queryVector, container, topN = 10) {
-    const rows = this.db.prepare(`
-      SELECT c.id, c.content, ce.vector
-      FROM chunks c
-      JOIN chunk_embeddings ce ON c.id = ce.chunk_id
-      WHERE c.container = ?
-    `).all(container);
-
-    const scored = rows
-      .map((row) => ({
-        key: `chunk_${row.id}`,
-        value: row.content,
-        score: this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
-        type: "chunk",
-      }))
-      .sort((a, b) => b.score - a.score)
-      .slice(0, topN);
-
-    return scored.map((r, index) => ({ ...r, rank: index + 1 }));
+  getChunk(chunkId) {
+    if (!chunkId) return null;
+    const row = this.db.prepare(`
+      SELECT content FROM chunks WHERE id = ?
+    `).get(chunkId);
+    return row?.content ?? null;
   }
 
   //RRF fusion method
   hybridSearch(query, queryVector, container, topN = 5) {
-    const k = 60; // RRF constant — industry standard
-
-    // run all 4 searches
-    let bm25FactResults = [];
+    const k = 60;
+ 
+    // search facts only — chunks are attached at retrieval, not ranked separately
+    let bm25Results = [];
     try {
-      bm25FactResults = this.bm25Search(query, container, topN * 2);
-    } catch (e) {
-      // query might have special chars — fallback to vector only
-    }
-
-    let bm25ChunkResults = [];
-    try {
-      bm25ChunkResults = this.bm25SearchChunks(query, container, topN * 2);
+      bm25Results = this.bm25Search(query, container, topN * 2);
     } catch (e) {}
-
-    const vectorFactResults = this.vectorSearch(queryVector, container, topN * 2);
-    const vectorChunkResults = this.vectorSearchChunks(queryVector, container, topN * 2);
-
-    // build RRF score map
+ 
+    const vectorResults = this.vectorSearch(queryVector, container, topN * 2);
+ 
+    // RRF fusion — keyed by fact id to preserve full fact data
     const scores = {};
-    
-    const addScore = (key, value, rank, source, type) => {
-      if (!scores[key]) scores[key] = { key, value, rrf: 0, sources: [], type };
-      scores[key].rrf += 1 / (k + rank);
+ 
+    const addScore = (fact, rank, source) => {
+      const key = fact.id;
+      if (!scores[key]) {
+        scores[key] = { ...fact, rrf: 0, sources: [] };
+      }
+      // confidence weighting for preferences — higher confidence = higher score
+      const weight = fact.memory_type === 'preference' ? (fact.confidence ?? 1.0) : 1.0;
+      scores[key].rrf += (1 / (k + rank)) * weight;
       scores[key].sources.push(source);
     };
-
-    bm25FactResults.forEach((r) => addScore(r.key, r.value, r.rank, "bm25", "fact"));
-    vectorFactResults.forEach((r) => addScore(r.key, r.value, r.rank, "vector", "fact"));
-    bm25ChunkResults.forEach((r) => addScore(r.key, r.value, r.rank, "bm25", "chunk"));
-    vectorChunkResults.forEach((r) => addScore(r.key, r.value, r.rank, "vector", "chunk"));
-
-    // sort by RRF score, return top N
+ 
+    bm25Results.forEach(r  => addScore(r, r.rank, 'bm25'));
+    vectorResults.forEach(r => addScore(r, r.rank, 'vector'));
+ 
     return Object.values(scores)
       .sort((a, b) => b.rrf - a.rrf)
       .slice(0, topN);
