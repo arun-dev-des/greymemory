@@ -15,8 +15,8 @@ export function buildExtractorPrompt({
   input,
   existingFacts = [],
   today,
-  filterPrompt = '',
-  entityContext = '',
+  filterPrompt = '', // org-level noise filter
+  entityContext = '', //per-container extraction guide
 }) {
   const isConversation = Array.isArray(input)
   const inputLabel     = isConversation ? 'CONVERSATION' : 'DOCUMENT'

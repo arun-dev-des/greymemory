@@ -202,7 +202,7 @@ export class Memory {
     }
  
     // 3. reverse to return oldest → newest
-    return chain.reverse().map(f => ({
+    return chain.map(f => ({
       id:            f.id,
       key:           f.key,
       value:         f.value,

@@ -351,11 +351,18 @@ export class Storage {
   loadFacts() {
     return this.db
       .prepare(`
-        SELECT key, value, memory_type, confidence, event_date
+        SELECT 
+          id, key, value, container,
+          memory_type, confidence,
+          document_date, event_date, expires_at,
+          is_latest, superseded_by, superseded_from,
+          relation_type, related_to,
+          metadata, created_at, updated_at
         FROM facts
         WHERE container = ?
           AND is_latest = 1
           AND (expires_at IS NULL OR expires_at > datetime('now'))
+        ORDER BY created_at ASC
       `)
       .all(this.container);
   }
