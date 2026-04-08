@@ -201,6 +201,83 @@ export class Memory {
     return this.storage.loadFacts();
   }
 
+  // ── getProfile ─────────────────────────────────────
+ 
+  // returns static/dynamic profile split — injection-ready for system prompts
+  // matches Supermemory's profile API shape: { profile: { static: [], dynamic: [] } }
+  //
+  // static:  preferences (always) + facts older than 7 days
+  // dynamic: facts from last 7 days + current episodes
+  //
+  // optional q — also runs search() and returns results alongside profile
+  async getProfile({ q = null, topN = 5 } = {}) {
+    const now     = new Date();
+    const today   = now.toISOString().slice(0, 10);
+    const cutoff  = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+ 
+    const allFacts = this.storage.loadFacts();
+ 
+    const staticFacts  = [];
+    const dynamicFacts = [];
+ 
+    for (const fact of allFacts) {
+      // expired episodes — excluded entirely
+      if (fact.expires_at && fact.expires_at < today) continue;
+ 
+      if (fact.memory_type === 'preference') {
+        // preferences always go to static — behavioral traits don't expire
+        staticFacts.push(fact.value);
+ 
+      } else if (fact.memory_type === 'episode') {
+        // current episodes go to dynamic
+        dynamicFacts.push(fact.value);
+ 
+      } else {
+        // facts — split by recency
+        if (fact.document_date && fact.document_date > cutoff) {
+          dynamicFacts.push(fact.value);
+        } else {
+          staticFacts.push(fact.value);
+        }
+      }
+    }
+ 
+    const profile = {
+      static:  staticFacts,
+      dynamic: dynamicFacts,
+    };
+ 
+    // optional: profile + search in one call (Supermemory pattern)
+    if (q) {
+      const results = await this.search(q, { topN });
+      return { profile, results };
+    }
+ 
+    return { profile };
+  }
+
+  // ── forget ─────────────────────────────────────────
+ 
+  // soft delete — expires a fact immediately via semantic search
+  // sets expires_at to yesterday so it's excluded from all filters immediately
+  // never hard deletes — data is preserved in database for audit
+  // returns the value of what was forgotten, or null if nothing found
+  async forget(query) {
+    const embedding = await this.embedder(query);
+    const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
+ 
+    if (!results[0]) return null;
+ 
+    // set to yesterday — expires_at < today means immediately excluded
+    const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+ 
+    this.storage.db.prepare(`
+      UPDATE facts SET expires_at = ? WHERE id = ?
+    `).run(yesterday, results[0].id);
+ 
+    return results[0].value;
+  }
+
   // ── getCurrent ─────────────────────────────────────
  
   // returns the current (is_latest=1) version of a fact
