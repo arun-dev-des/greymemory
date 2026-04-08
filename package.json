@@ -1,16 +1,17 @@
 {
   "name": "greymemory",
-  "version": "0.2.3",
-  "description": "Private, self-hosted memory for AI agents. Bring your own LLM. Hybrid BM25 + vector search. Your data never leaves your server.",
+  "version": "0.3.0",
+  "description": "Self-hosted memory for AI agents. Extracts facts, detects contradictions, builds user profiles. Bring your own LLM. Your data never leaves your server.",
   "type": "module",
   "main": "src/index.js",
   "types": "src/index.d.ts",
   "bin": {
-    "greymemory": "bin/init.js"
+    "greymemory": "bin/init.js",
+    "greymemory-migrate": "bin/migrate.js"
   },
   "exports": {
     ".": {
-      "types": "./src/index.d.ts",
+      "types":   "./src/index.d.ts",
       "default": "./src/index.js"
     }
   },
@@ -37,16 +38,14 @@
   },
   "dependencies": {
     "@inquirer/prompts": "^8.3.2",
-    "better-sqlite3": "^12.8.0",
-    "chalk": "^5.6.2",
-    "dotenv": "^17.3.1",
-    "ora": "^9.3.0"
+    "better-sqlite3":    "^12.8.0",
+    "chalk":             "^5.6.2",
+    "ora":               "^9.3.0"
   },
   "engines": {
     "node": ">=18.0.0"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.81.0",
     "typescript": "^6.0.2"
   }
 }
