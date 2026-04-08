@@ -201,6 +201,11 @@ export class Memory {
     return this.storage.loadFacts();
   }
 
+  // ── getFacts — v0.2.x backward compatibility alias ─────────
+  getFacts() {
+    return this.getMemories();
+  }
+
   // ── getProfile ─────────────────────────────────────
  
   // returns static/dynamic profile split — injection-ready for system prompts
@@ -409,10 +414,23 @@ or null if no confident inference exists.`;
         const validIds = result.fromIds.filter(id => allFacts.find(f => f.id === id));
         if (validIds.length < 2) continue;
  
-        // check this inference doesn't already exist
+        // check this inference doesn't already exist — check all facts including DERIVES
         const deriveEmbedding = await this.embedder(result.derives);
-        const existing        = this.storage.vectorSearch(deriveEmbedding, this.storage.container, 1);
-        if (existing[0]?.score > 0.95) continue;
+        const allCurrent      = this.storage.db.prepare(`
+          SELECT id, value FROM facts
+          WHERE container = ? AND is_latest = 1
+            AND (expires_at IS NULL OR expires_at > datetime('now'))
+        `).all(this.storage.container);
+ 
+        const tooSimilar = allCurrent.some(f => {
+          const vec = this.storage.db.prepare(
+            `SELECT vector FROM embeddings WHERE fact_id = ? LIMIT 1`
+          ).get(f.id);
+          if (!vec) return false;
+          return this._cosineSimilarity(deriveEmbedding, JSON.parse(vec.vector)) > 0.88;
+        });
+ 
+        if (tooSimilar) continue;
  
         // save the derived fact
         const today  = new Date().toISOString().slice(0, 10);

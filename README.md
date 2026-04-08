@@ -21,21 +21,17 @@ Hospitals, banks, factories, defence — entire industries are locked out of AI 
 
 ---
 
-## What's new in v0.2.3
+## What's new in v0.3
 
-- **Existing SQLite database support** — pass your own database connection. greymemory creates its tables inside your existing db. One file instead of two.
-
----
-
-## What's in v0.2.0
-
-- **Model-agnostic** — bring your own LLM and embedder. Works with Anthropic, OpenAI, Ollama, anything.
-- **SQLite storage** — replaces flat JSON files. Concurrent writes, container isolation, timestamps, history preserved.
-- **Hybrid search** — BM25 keyword search + vector semantic search fused via RRF. Nothing falls through the cracks.
-- **Raw chunk storage** — every message stored alongside extracted facts. Details the LLM might miss are still searchable.
-- **Container isolation** — separate memory namespaces for different users or projects.
-- **TypeScript types** — full type safety and autocomplete in your editor.
-- **CLI setup wizard** — `npx greymemory init` gets you running in 3 minutes.
+- **Memory types** — facts, preferences, episodes. Each with its own lifecycle. Episodes expire automatically. Preferences strengthen with repetition.
+- **Relationship detection** — UPDATES, EXTENDS, DERIVES. Contradictions are resolved. History is preserved, never overwritten.
+- **Knowledge graph** — every fact knows what it superseded and what superseded it. `getCurrent()` always returns current truth. `getHistory()` walks the full version chain.
+- **Dual retrieval** — search returns atomic memories paired with their source chunks. The LLM gets signal and context together.
+- **User profiles** — `getProfile()` splits memory into static (permanent traits) and dynamic (recent context). Injection-ready for system prompts. Matches Supermemory's profile API.
+- **Temporal grounding** — every memory has a `document_date` (when recorded) and `event_date` (when it actually happened). Date filtering on search.
+- **Forget** — soft delete via `forget()`. Memory disappears from queries immediately but is preserved in the database for audit.
+- **DERIVES inference** — `runDerivations()` combines existing memories to generate second-order conclusions.
+- **filterPrompt + entityContext** — tell greymemory what to index and who it belongs to. Per-organisation and per-container customisation.
 
 ---
 
@@ -58,7 +54,6 @@ The CLI asks a few questions and generates a ready-to-use config file:
 ? Embedding model: mxbai-embed-large (recommended)
 ? Storage directory: .greymemory
 ? Container name: default
-? Do you want greymemory data stored in an existing SQLite database? No
 
 ✔ greymemory.config.js created
 ✔ .env updated
@@ -69,8 +64,6 @@ The CLI asks a few questions and generates a ready-to-use config file:
   import memory from './greymemory.config.js'
   await memory.add(messages)
   await memory.search('query')
-
-⚠ Never commit .env to git. Your API keys are inside.
 ```
 
 ---
@@ -80,32 +73,40 @@ The CLI asks a few questions and generates a ready-to-use config file:
 ```javascript
 import memory from './greymemory.config.js'
 
-// add a conversation — facts extracted + chunks stored automatically
+// add a conversation — facts extracted, chunks stored, relationships detected
 await memory.add([
-  { role: 'user',      content: 'My name is Arun and I train powerlifting' },
-  { role: 'assistant', content: 'Got it.' }
+  { role: 'user',      content: 'My name is Arun. I work at Barbell Cartel as a product designer in Bangalore.' },
+  { role: 'assistant', content: 'Got it!' }
 ])
 
-// hybrid search — finds by meaning AND exact keywords
-const results = await memory.search('what sport does this person train')
+// search — returns memory + source chunk paired together
+const results = await memory.search('where does Arun work')
 // [
-//   { type: 'fact',  key: 'sport',   value: 'powerlifting',            sources: ['bm25', 'vector'] },
-//   { type: 'chunk', key: 'chunk_1', value: 'user: My name is Arun...', sources: ['vector'] }
+//   {
+//     memory:        'Arun works at Barbell Cartel as a product designer',
+//     chunk:         'user: My name is Arun. I work at Barbell Cartel...',
+//     memory_type:   'fact',
+//     confidence:    1.0,
+//     document_date: '2026-04-08',
+//     event_date:    null,
+//     relation_type: null
+//   }
 // ]
 
-// inject into your agent
-const facts   = memory.getFacts()
-const context = results.map(r => r.value).join('\n')
-
+// inject into your agent via profile
+const { profile } = await memory.getProfile()
 const systemPrompt = `You are a helpful assistant.
-What you know about this user: ${JSON.stringify(facts)}`
+
+About this user:
+${profile.static.join('\n')}
+
+Current context:
+${profile.dynamic.join('\n')}`
 ```
 
 ---
 
 ## Manual setup (without CLI)
-
-If you prefer to wire it up yourself:
 
 ```bash
 npm install greymemory dotenv
@@ -119,27 +120,29 @@ import Anthropic  from '@anthropic-ai/sdk'
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
 
 const memory = new GreyMemory({
-  extractor: async (messages) => {
+  // extractor receives a built prompt string, returns raw string
+  extractor: async (prompt) => {
     const res = await anthropic.messages.create({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 1000,
-      messages: [{
-        role: 'user',
-        content: `Extract facts as flat JSON. Keys: snake_case strings. Values: strings only.
-Conversation: ${JSON.stringify(messages)}`
-      }]
+      model:      'claude-haiku-4-5-20251001',
+      max_tokens: 1024,
+      messages:   [{ role: 'user', content: prompt }]
     })
-    return JSON.parse(res.content[0].text.trim())
+    return res.content[0].text
   },
 
+  // embedder converts text to a vector
   embedder: async (text) => {
     const res = await fetch('http://localhost:11434/api/embeddings', {
-      method: 'POST',
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: 'mxbai-embed-large', prompt: text })
+      body:    JSON.stringify({ model: 'mxbai-embed-large', prompt: text })
     })
     return (await res.json()).embedding
-  }
+  },
+
+  // tell greymemory what to index and who this memory belongs to
+  filterPrompt:  'Index: decisions, preferences, projects. Skip: small talk.',
+  entityContext: 'Memory for Arun, a product designer based in Bangalore.',
 })
 ```
 
@@ -151,103 +154,205 @@ Conversation: ${JSON.stringify(messages)}`
 
 ```typescript
 new GreyMemory({
-  extractor:  async (messages: Message[]) => Facts,  // required
-  embedder:   async (text: string) => number[],      // required
-  dir?:       string,    // storage directory, default: ".greymemory"
-  container?: string,    // namespace isolation, default: "default"
-  db?:        Database   // existing better-sqlite3 connection (optional)
+  extractor:     async (prompt: string) => string,   // required
+  embedder:      async (text: string)   => number[], // required
+  dir?:          string,   // storage directory, default: ".greymemory"
+  container?:    string,   // namespace isolation, default: "default"
+  filterPrompt?: string,   // what to index and skip (org-level)
+  entityContext?: string,  // who this memory belongs to (per-container)
+  db?:           Database  // existing better-sqlite3 connection
 })
 ```
 
-### `await memory.add(messages)`
+---
 
-Extracts facts, stores raw chunks, generates embeddings. All three happen automatically.
+### `await memory.add(input)`
+
+Extracts memories, detects relationships, stores chunks with provenance.
 
 ```javascript
+// conversation
 await memory.add([
-  { role: 'user',      content: 'I met Priya at the Bangalore AI meetup' },
-  { role: 'assistant', content: 'Got it.' }
+  { role: 'user',      content: 'I now work at Stripe as a PM' },
+  { role: 'assistant', content: 'Congratulations!' }
 ])
+
+// plain text
+await memory.add('Arun is building greymemory, an open source memory library.')
 ```
 
-### `await memory.search(query, topN?)`
+---
 
-Hybrid BM25 + vector search across facts and chunks. Default topN = 5.
+### `await memory.search(query, options?)`
+
+Hybrid BM25 + vector search. Returns atomic memories paired with source chunks.
 
 ```javascript
-const results = await memory.search('Priya hiring')
+// basic
+const results = await memory.search('where does Arun work')
+
+// with options
+const results = await memory.search('investor meeting', {
+  topN:        3,
+  memoryTypes: ['episode'],
+  afterDate:   '2026-04-01',
+  beforeDate:  '2026-04-30',
+})
+```
+
+**Search options:**
+
+| Option           | Type       | Default | Description |
+|------------------|------------|---------|-------------|
+| `topN`           | `number`   | `5`     | Number of results |
+| `memoryTypes`    | `string[]` | `null`  | Filter by type: `fact`, `preference`, `episode` |
+| `afterDate`      | `string`   | `null`  | Filter by event_date >= date (YYYY-MM-DD) |
+| `beforeDate`     | `string`   | `null`  | Filter by event_date <= date (YYYY-MM-DD) |
+| `includeHistory` | `boolean`  | `false` | Include superseded facts |
+| `includeExpired` | `boolean`  | `false` | Include expired episodes |
+
+---
+
+### `await memory.getProfile(options?)`
+
+Returns static/dynamic user profile for system prompt injection.
+
+```javascript
+// profile only
+const { profile } = await memory.getProfile()
+// profile.static  → ['Arun prefers TypeScript', 'Arun works at Barbell Cartel']
+// profile.dynamic → ['Arun is building greymemory v0.3']
+
+// profile + search in one call
+const { profile, results } = await memory.getProfile({ q: 'current project' })
+
+// inject into system prompt
+const systemPrompt = `You are a helpful assistant.
+
+About this user:
+${profile.static.join('\n')}
+
+Current context:
+${profile.dynamic.join('\n')}`
+```
+
+**Classification:**
+- `static` — preferences (always) + facts older than 7 days
+- `dynamic` — facts from the last 7 days + current episodes
+
+---
+
+### `await memory.getCurrent(query)`
+
+Returns the current version of a fact via semantic search.
+
+```javascript
+const current = await memory.getCurrent('where does Arun work')
+// { id: 3, value: 'Arun works at Stripe', memory_type: 'fact', ... }
+```
+
+---
+
+### `await memory.getHistory(query)`
+
+Returns the full version chain for a fact, newest first.
+
+```javascript
+const history = await memory.getHistory('where has Arun worked')
 // [
-//   { type: 'fact',  key: 'person',  value: 'Priya',               sources: ['bm25', 'vector'] },
-//   { type: 'chunk', key: 'chunk_1', value: 'user: I met Priya...', sources: ['bm25'] }
+//   { value: 'Arun works at Stripe', is_latest: true  },
+//   { value: 'Arun worked at Google', is_latest: false }
 // ]
 ```
 
-### `memory.getFacts()`
+---
 
-Returns all extracted facts for this container.
+### `await memory.forget(query)`
+
+Soft-delete a memory via semantic search. Disappears immediately from all queries. Preserved in database.
 
 ```javascript
-memory.getFacts()
-// { name: 'Arun', sport: 'powerlifting', gym_location: 'Bangalore' }
+const forgotten = await memory.forget('investor demo')
+// → 'Arun has an investor demo on Friday April 10th at 3pm'
 ```
+
+---
+
+### `await memory.runDerivations(options?)`
+
+Infers second-order conclusions by combining existing memories. Call after `add()`, on a schedule, or before important queries.
+
+```javascript
+await memory.add(messages)
+await memory.runDerivations()                            // last 7 days
+await memory.runDerivations({ sinceDays: 1, topK: 5 })  // just today
+```
+
+---
+
+### `memory.getMemories()`
+
+Returns all current memories as full row objects.
+
+```javascript
+const memories = memory.getMemories()
+// [{ id, key, value, memory_type, confidence, document_date, ... }]
+```
+
+---
+
+### `memory.getFacts()`
+
+Alias for `getMemories()`. Kept for v0.2.x backward compatibility.
+
+---
 
 ### `memory.clear()`
 
-Deletes all facts, chunks and embeddings for this container. Other containers untouched.
-
-```javascript
-memory.clear()
-```
+Deletes all facts, chunks, and embeddings for this container. Other containers untouched.
 
 ---
 
 ## Using an existing SQLite database
 
-If your project already uses SQLite, greymemory can store its data inside your existing database file. No second file.
-
-This is useful when integrating greymemory into an existing tool — like [DevLog](https://devlog-web-black.vercel.app/), which already stores engineering journals in SQLite.
-
-### Via CLI
-
-```
-? Do you want greymemory data stored in an existing SQLite database? Yes
-? Path to existing SQLite database: /home/user/.devlog/devlog.db
-```
-
-The generated `greymemory.config.js` will include the database connection automatically.
-
-### Via code
-
 ```javascript
 import Database   from 'better-sqlite3'
 import GreyMemory from 'greymemory'
 
-// your existing database
 const db = new Database('/home/user/.devlog/devlog.db')
 
-const memory = new GreyMemory({
-  extractor,
-  embedder,
-  db,                    // greymemory creates its tables inside this db
-  container: 'memory'
-})
+const memory = new GreyMemory({ extractor, embedder, db, container: 'memory' })
 ```
 
-greymemory creates its own tables (`facts`, `embeddings`, `chunks`, etc.) inside your existing database. Your existing tables are untouched.
+greymemory creates its own tables inside your existing database. Your existing tables are untouched.
 
 ---
 
 ## Container isolation
 
-Use different containers to isolate memory between users or projects:
-
 ```javascript
 const userA = new GreyMemory({ container: 'user-123', ...options })
 const userB = new GreyMemory({ container: 'user-456', ...options })
-
-// each container has its own facts, chunks and embeddings
-// clearing one never touches the other
 ```
+
+---
+
+## Migrating from v0.2.x
+
+greymemory v0.3 migrates your existing database automatically on first use. No action needed.
+
+If you prefer to migrate manually before upgrading your code:
+
+```bash
+npx greymemory migrate
+npx greymemory migrate --dir /custom/path
+```
+
+**Breaking changes from v0.2.x:**
+
+- `extractor` signature changed — now receives a `prompt: string` and returns a `string`, not `Message[] → Facts`. Update your extractor function.
+- `search()` result shape changed — results now have `memory` and `chunk` instead of `key`, `value`, and `type`.
+- `getFacts()` still works but returns the richer v0.3 shape — use `getMemories()` for new code.
 
 ---
 
@@ -256,20 +361,26 @@ const userB = new GreyMemory({ container: 'user-456', ...options })
 ```
 Conversation
     ↓
-extractor()          → extracts facts → saved to SQLite facts table
+Save chunks first — one per message, with embeddings
     ↓
-Each message         → saved to SQLite chunks table
+extractor()
+  Resolves ambiguity → classifies memory type → extracts atomic memories
     ↓
-embedder()           → embeds facts and chunks → saved to SQLite
+For each memory:
+  _detectRelationship()    → UPDATES | EXTENDS | NEW
+  saveFact()               → stored with chunk_id, relation_type, superseded_from
+  supersedeFact()          → if UPDATES, marks old fact is_latest=0
+  saveEmbedding()          → each fact version gets its own embedding
+    ↓
+Optional: runDerivations() → second-order inferences stored as DERIVES
 
 Query
     ↓
-BM25 search          → exact keyword match on facts + chunks
-Vector search        → semantic similarity on facts + chunks
+BM25 search + vector search on facts only
+RRF fusion with confidence weighting for preferences
+For each result: fetch source chunk via chunk_id
     ↓
-RRF fusion           → combines both rankings
-    ↓
-Top N results returned (type: fact | chunk)
+{ memory, chunk, memory_type, confidence, ... }
 ```
 
 ---
@@ -292,10 +403,7 @@ Top N results returned (type: fact | chunk)
 - Ollama (if using local models) → [ollama.com](https://ollama.com)
 
 ```bash
-# install Ollama on Mac
 brew install ollama
-
-# pull embedding model
 ollama pull mxbai-embed-large
 ```
 
@@ -305,17 +413,23 @@ ollama pull mxbai-embed-large
 
 - [x] SQLite storage
 - [x] Hybrid BM25 + vector search
-- [x] Raw chunk storage
+- [x] Raw chunk storage + dual retrieval
 - [x] Model-agnostic LLM interface
 - [x] Container isolation
 - [x] TypeScript types
 - [x] CLI setup wizard
 - [x] Existing SQLite database support
-- [ ] Temporal facts — current truth always returned, history preserved
-- [ ] Contradiction resolution — UPDATES, EXTENDS, DERIVES relationships
-- [ ] User profiles — static + dynamic, ready for system prompt injection
-- [ ] MCP server — works in Claude Code, Cursor, any agent tool
-- [ ] greymemory Cloud — managed hosting
+- [x] Memory types — fact, preference, episode
+- [x] Relationship detection — UPDATES, EXTENDS, DERIVES
+- [x] Knowledge graph — getCurrent(), getHistory()
+- [x] User profiles — getProfile()
+- [x] Soft delete — forget()
+- [x] filterPrompt + entityContext
+- [ ] Reranking — optional cross-encoder for +67% retrieval accuracy
+- [ ] Deep EXTENDS traversal — multi-hop graph at retrieval
+- [ ] getTimeline() — temporal history with valid_from/valid_to
+- [ ] MCP server — npx greymemory mcp
+- [ ] greymemory Cloud
 - [ ] Python SDK
 
 ---
