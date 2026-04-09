@@ -1,6 +1,6 @@
 {
   "name": "greymemory",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Self-hosted memory for AI agents. Extracts facts, detects contradictions, builds user profiles. Bring your own LLM. Your data never leaves your server.",
   "type": "module",
   "main": "src/index.js",
@@ -11,7 +11,7 @@
   },
   "exports": {
     ".": {
-      "types":   "./src/index.d.ts",
+      "types": "./src/index.d.ts",
       "default": "./src/index.js"
     }
   },
@@ -38,9 +38,9 @@
   },
   "dependencies": {
     "@inquirer/prompts": "^8.3.2",
-    "better-sqlite3":    "^12.8.0",
-    "chalk":             "^5.6.2",
-    "ora":               "^9.3.0"
+    "better-sqlite3": "^12.8.0",
+    "chalk": "^5.6.2",
+    "ora": "^9.3.0"
   },
   "engines": {
     "node": ">=18.0.0"
