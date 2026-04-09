@@ -1,6 +1,6 @@
 # greymemory 🧠
 
-> Private, self-hosted memory for AI agents. Bring your own LLM. Your data never leaves your server.
+> Self-hosted memory for AI agents. Extracts facts, detects contradictions, builds user profiles. Bring your own LLM. Your data never leaves your server.
 
 **Why the name?** Named after Grey Matter from Ben 10 — the tiniest alien in the universe, but the smartest being in existence. Also a nod to grey matter in the brain, where intelligence actually lives. Small footprint. Quietly powerful.
 
