@@ -14,7 +14,7 @@
 export function buildExtractorPrompt({
   input,
   existingFacts = [],
-  today,
+  documentDate,
   filterPrompt = '',
   entityContext = '',
 }) {
@@ -25,7 +25,7 @@ export function buildExtractorPrompt({
     : input
 
   return `You are a memory extraction system for an AI agent.
-Today's date: ${today}
+Session date: ${documentDate}
 ${filterPrompt ? `
 --- FILTER INSTRUCTIONS ---
 ${filterPrompt}
@@ -42,33 +42,59 @@ STEP 1 — RESOLVE ALL AMBIGUITY
 Before extracting anything, read the entire conversation and resolve every vague reference.
 
 SELF-CONTAINMENT TEST: Every memory must pass this test —
-"Could a complete stranger understand this sentence with zero prior context?"
-If the answer is no — resolve it before extracting.
+"Could a complete stranger who has never seen this conversation understand this sentence with zero prior context?"
 
-Resolve all of the following:
+Apply the stranger test to every memory before extracting it:
+
+  BAD:  "Alex works as a PM"  ← if the conversation mentions Stripe
+        Stranger asks: PM where? FAILS — company is knowable but missing.
+  GOOD: "Alex works as a PM at Stripe"
+        Company resolved from conversation. PASSES.
+
+  NOTE: If the company is not mentioned anywhere in the conversation,
+        "Alex works as a PM" is acceptable — do not invent what isn't there.
+
+  BAD:  "She moved there last month"
+        Stranger asks: Who is she? Where is there? FAILS.
+  GOOD: "Sarah moved to San Francisco last month"
+        PASSES.
+
+  BAD:  "He joined them in February"
+        Stranger asks: Who? Joined what? FAILS.
+  GOOD: "Alex joined Stripe in February 2026"
+        PASSES.
+
+  BAD:  "User moved there for the job"
+        Stranger asks: Moved where? What job? FAILS.
+  GOOD: "Alex moved to San Francisco for his PM role at Stripe"
+        PASSES.
+
+  BAD:  "Switched to TypeScript last year"
+        Stranger asks: Who switched? FAILS.
+  GOOD: "Arun switched from JavaScript to TypeScript in 2025"
+        PASSES.
+
+  BAD:  "Leads a small team"
+        Stranger asks: Who leads? What team? FAILS.
+  GOOD: "Alex leads a team of 8 engineers at Stripe"
+        PASSES.
+
+  BAD:  "She works at the office downtown"
+        Stranger asks: Who? Which office? FAILS.
+  GOOD: "Sarah works at the Stripe office in San Francisco"
+        PASSES.
+
+  BAD:  "Alex started last month"
+        Stranger asks: Started what? When exactly? FAILS.
+  GOOD: "Alex started at Stripe in March 2026"
+        PASSES.
+
+Resolve all of the following before extracting:
 - Pronouns → actual names
-    BAD:  "He joined them in February"
-    GOOD: "Alex joined Stripe in February 2026"
-
-- Vague references → specific names
-    BAD:  "User moved there for the job"
-    GOOD: "Alex moved to San Francisco for his PM role at Stripe"
-
-- Relative locations → explicit places
-    BAD:  "She works at the office downtown"
-    GOOD: "Sarah works at the Stripe office in San Francisco"
-
-- Relative dates → approximate real dates (today is ${today})
-    BAD:  "Alex started last month"
-    GOOD: "Alex started at Stripe in March 2026"
-
+- Vague references → specific names and places
+- Relative dates → approximate real dates (session date is ${documentDate})
 - Implicit subjects → explicit
-    BAD:  "Switched to TypeScript last year"
-    GOOD: "Arun switched from JavaScript to TypeScript in 2025"
-
-- Vague quantities → specific where possible
-    BAD:  "Leads a small team"
-    GOOD: "Alex leads a team of 8 engineers"
+- Incomplete descriptions → add missing context from the conversation
 
 Never use: he, she, they, it, there, here, that, this, the company, the team, the project
 Always use: the actual name, place, or thing being referred to.
@@ -101,17 +127,44 @@ Rules:
    weak embeddings that match nothing well. Atomic facts produce strong, precise
    embeddings that surface exactly when needed.
 
-2. Each memory must be completely self-contained
+2. Each memory must be completely self-contained — apply the stranger test
 3. Include WHO, WHAT, WHEN where available
 4. Be specific not vague
 5. Apply filter instructions strictly
 
 STEP 3 — TEMPORAL GROUNDING
 
-For every memory:
-- document_date: always ${today}
-- event_date: when the event actually occurred or will occur (YYYY-MM-DD or null)
-- expires_at: only for episodes — when the episode becomes irrelevant (YYYY-MM-DD or null)
+Session date: ${documentDate}
+
+For every memory set these three fields:
+
+document_date: always ${documentDate} — when this conversation happened
+
+event_date: when the event actually occurred or will occur — NOT the session date
+  This is the most important field for temporal reasoning. Extract it carefully.
+
+  How to calculate event_date:
+  - Explicit date → use it directly
+      "I started at Stripe on February 1st 2023" → event_date: "2023-02-01"
+  - Month + year → use the month
+      "I joined in February 2023" → event_date: "2023-02"
+  - Relative to session date → calculate from ${documentDate}
+      "I started last month" (session: 2023-05-20) → event_date: "2023-04"
+      "I joined two years ago" (session: 2023-05-20) → event_date: "2021-05"
+      "I started last Monday" (session: 2023-05-20) → event_date: "2023-05-15"
+  - Future event → calculate forward from session date
+      "I have a meeting next Friday" (session: 2023-05-20) → event_date: "2023-05-26"
+  - Vague past with no anchor → null
+      "I used to live in London" with no time reference → event_date: null
+  - Ongoing state with no start → null
+      "Alex works at Stripe" with no start date mentioned → event_date: null
+
+  Only store what is actually known. Never invent precision that wasn't in the conversation.
+
+expires_at: only for episodes — when the episode becomes irrelevant
+  - "exam tomorrow" (session: 2023-05-20) → expires_at: "2023-05-21"
+  - "meeting at 3pm today" (session: 2023-05-20) → expires_at: "2023-05-20"
+  - null for all facts and preferences
 
 STEP 4 — RETURN JSON ARRAY
 

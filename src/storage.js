@@ -410,7 +410,7 @@ export class Storage {
   saveFact(key, value, opts = {}) {
     const {
       memory_type     = 'fact',
-      document_date   = new Date().toISOString().slice(0, 10),
+      document_date   = null,
       event_date      = null,
       expires_at      = null,
       confidence      = 1.0,

@@ -37,8 +37,10 @@ export class Memory {
 
   // ── Add ────────────────────────────────────────────
  
-  async add(input) {
-    const today = new Date().toISOString().slice(0, 10);
+  async add(input, opts = {}) {
+    // normalize the session date — preserve only what's actually known
+    // supports: LongMemEval format, ISO, slash/dot dates, natural language, Date object, Unix ms
+    const documentDate = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
  
     // 1. embed input to find relevant existing memories for dedup
     //    vectorSearch returns top 10 most similar — not all facts
@@ -54,7 +56,7 @@ export class Memory {
     const prompt = buildExtractorPrompt({
       input,
       existingFacts,
-      today,
+      documentDate,
       filterPrompt:  this.filterPrompt,
       entityContext: this.entityContext,
     });
@@ -103,6 +105,11 @@ export class Memory {
     }
  
     // 5. process each memory
+
+    // savedThisBatch tracks embeddings saved in this add() call for within-batch dedup
+    const savedThisBatch = [];
+    const DEDUP_THRESHOLD = 0.92;
+
     for (const mem of memories) {
       const {
         key,
@@ -117,6 +124,12 @@ export class Memory {
  
       // embed value only — not `${key}: ${value}`, key adds noise
       const embedding = await this.embedder(value);
+
+      // within-batch dedup — skip if too similar to something already saved this call
+      const isDuplicate = savedThisBatch.some(
+        saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
+      );
+      if (isDuplicate) continue;
  
       // preferences — use cosine similarity to find existing ones, not key match
       // LLMs are not deterministic so the key will vary across calls
@@ -129,13 +142,13 @@ export class Memory {
       // facts and episodes can contradict, extend, or derive from existing memories
       // preferences are always inserted as new — strengthening handled above
       const relationship = (memory_type === 'fact' || memory_type === 'episode')
-        ? await this._detectRelationship(mem, embedding)
+        ? await this._detectRelationship(mem, embedding, documentDate)
         : { type: 'NEW', relatedTo: null };
  
-      // save fact with all v0.3 columns — returns the inserted row's id
+      // save fact — chunk_id links to the source session anchor
       const factId = this.storage.saveFact(key, value, {
         memory_type,
-        document_date:   today,
+        document_date:   documentDate,
         event_date,
         expires_at,
         confidence:      1.0,
@@ -153,6 +166,9 @@ export class Memory {
  
       // save embedding keyed by fact_id — each version gets its own embedding row
       this.storage.saveEmbedding(factId, embedding);
+
+      // track this embedding for within-batch dedup
+      savedThisBatch.push(embedding);
     }
   }
 
@@ -311,48 +327,54 @@ export class Memory {
  
   // ── getHistory ─────────────────────────────────────
  
-  // returns full version chain for a fact, newest → oldest
-  // always uses semantic search to find starting point — keys are internal
-  // walks backward via superseded_from regardless of key differences
-  // use natural language: getHistory('what jobs has Alex had')
-  async getHistory(query) {
-    // 1. find current version via semantic search
+  // returns top 3 semantic matches, each with their full version chain
+  // newest first within each chain — current version at index 0
+  // let the answering prompt reason about which chain is relevant
+  async getHistory(query, topN = 3) {
     const embedding = await this.embedder(query);
-    const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
+    const results   = this.storage.vectorSearch(embedding, this.storage.container, topN);
  
-    if (!results[0]) return [];
+    if (!results.length) return [];
  
-    // fetch full row — vectorSearch returns simplified shape without superseded_from
-    let current = this.storage.db.prepare(`
-      SELECT * FROM facts WHERE id = ?
-    `).get(results[0].id);
+    const chains = [];
  
-    if (!current) return [];
- 
-    // 2. walk backward via superseded_from to build full chain
-    const chain = [current];
-    let node = current;
- 
-    while (node.superseded_from) {
-      node = this.storage.db.prepare(`
+    for (const result of results) {
+      // fetch full row — vectorSearch returns simplified shape without superseded_from
+      let current = this.storage.db.prepare(`
         SELECT * FROM facts WHERE id = ?
-      `).get(node.superseded_from);
-      if (!node) break;
-      chain.push(node);
+      `).get(result.id);
+ 
+      if (!current) continue;
+ 
+      // walk backward via superseded_from to build full chain
+      const chain = [current];
+      let node = current;
+ 
+      while (node.superseded_from) {
+        node = this.storage.db.prepare(`
+          SELECT * FROM facts WHERE id = ?
+        `).get(node.superseded_from);
+        if (!node) break;
+        chain.push(node);
+      }
+ 
+      chains.push({
+        current: chain[0].value,
+        chain: chain.map(f => ({
+          id:            f.id,
+          key:           f.key,
+          value:         f.value,
+          memory_type:   f.memory_type,
+          document_date: f.document_date,
+          event_date:    f.event_date,
+          is_latest:     f.is_latest === 1,
+          superseded_by: f.superseded_by,
+          relation_type: f.relation_type,
+        }))
+      });
     }
  
-    // 3. reverse to return oldest → newest
-    return chain.map(f => ({
-      id:            f.id,
-      key:           f.key,
-      value:         f.value,
-      memory_type:   f.memory_type,
-      document_date: f.document_date,
-      event_date:    f.event_date,
-      is_latest:     f.is_latest === 1,
-      superseded_by: f.superseded_by,
-      relation_type: f.relation_type,
-    }));
+    return chains;
   }
 
   // ── runDerivations ─────────────────────────────────
@@ -551,10 +573,10 @@ Give a short succinct context (1-2 sentences) to situate this message within the
   // detect relationship between a new memory and existing ones
   // step 1: find candidates via same-key lookup + vector similarity
   // step 2: LLM classifies the relationship
-  // returns { type: 'UPDATES'|'EXTENDS'|'DERIVES'|'NEW', relatedTo: id|null }
-  async _detectRelationship(mem, embedding) {
-    const { key, value, memory_type, document_date, event_date } = mem;
-    const today = new Date().toISOString().slice(0, 10);
+  // returns { type: 'UPDATES'|'EXTENDS'|'NEW', relatedTo: id|null }
+  // DERIVES is handled separately by runDerivations() — not classified here
+  async _detectRelationship(mem, embedding, documentDate) {
+    const { key, value, memory_type, event_date } = mem;
  
     // step 1a — same key facts (strong signal regardless of embedding similarity)
     const sameKeyFacts = this.storage.db.prepare(`
@@ -583,7 +605,7 @@ Give a short succinct context (1-2 sentences) to situate this message within the
     // step 2 — LLM classifies the relationship
     const prompt = `You are a memory relationship classifier.
  
-New memory: "${value}" [${memory_type}] [recorded: ${document_date ?? today}]${event_date ? ` [event: ${event_date}]` : ''}
+New memory: "${value}" [${memory_type}] [recorded: ${documentDate ?? 'unknown'}]${event_date ? ` [event: ${event_date}]` : ''}
  
 Existing memories:
 ${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}" [${f.memory_type}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`).join('\n')}
@@ -646,6 +668,57 @@ Return ONLY valid JSON, no explanation:
       console.warn('[greymemory] extractor returned invalid JSON:', text.slice(0, 200));
       return [];
     }
+  }
+
+  // normalize a date input to an ISO string — preserving only absolute truths
+  // strips day names in parens (derivable), keeps time only if present in input
+  // returns null when input is missing or unparseable — never invents data
+  _normalizeDate(input) {
+    if (input === null || input === undefined || input === '') return null
+    if (input instanceof Date) {
+      if (isNaN(input.getTime())) return null
+      return input.toISOString().replace('Z', '').replace(/\.\d{3}$/, '')
+    }
+    if (typeof input === 'number') {
+      const d = new Date(input)
+      if (isNaN(d.getTime())) return null
+      return d.toISOString().replace('Z', '').replace(/\.\d{3}$/, '')
+    }
+ 
+    // strip day names in parens — (Sat), (Tue) etc — derivable from date, not new info
+    const cleaned = String(input).trim().replace(/\([^)]*\)/g, '').trim()
+ 
+    // match from most to least specific — only capture what's actually present
+ 
+    // YYYY/MM/DD HH:MM:SS or YYYY-MM-DD HH:MM:SS
+    let m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T ](\d{2}):(\d{2}):(\d{2})/)
+    if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`
+ 
+    // YYYY/MM/DD HH:MM or ISO YYYY-MM-DDTHH:MM
+    m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T ](\d{2}):(\d{2})$/)
+    if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}`
+ 
+    // YYYY/MM/DD or YYYY-MM-DD or YYYY.MM.DD
+    m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})$/)
+    if (m) return `${m[1]}-${m[2]}-${m[3]}`
+ 
+    // YYYY/MM or YYYY-MM
+    m = cleaned.match(/^(\d{4})[\/\-](\d{2})$/)
+    if (m) return `${m[1]}-${m[2]}`
+ 
+    // YYYY only
+    m = cleaned.match(/^(\d{4})$/)
+    if (m) return m[1]
+ 
+    // natural language — try Date constructor as last resort
+    const parsed = new Date(cleaned)
+    if (!isNaN(parsed.getTime())) {
+      const hasTime = /\d{1,2}:\d{2}/.test(cleaned)
+      if (hasTime) return parsed.toISOString().slice(0, 16).replace('T', 'T')
+      return parsed.toISOString().slice(0, 10)
+    }
+ 
+    return null
   }
  
   _cosineSimilarity(a, b) {

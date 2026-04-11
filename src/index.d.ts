@@ -61,8 +61,14 @@ export interface SearchResult {
 }
 
 /**
- * A version in a fact's history chain — returned by getHistory()
+ * A chain of versions for a fact — returned by getHistory()
  */
+export interface HistoryChain {
+  /** value of the current (latest) version */
+  current: string;
+  /** full version chain, newest first */
+  chain: HistoryEntry[];
+}
 export interface HistoryEntry {
   id:            number;
   key:           string;
@@ -228,8 +234,22 @@ export interface GreyMemoryOptions {
 }
 
 /**
- * Options for search()
+ * Options for add()
  */
+export interface AddOptions {
+  /**
+   * The date this session occurred.
+   * Accepts any reasonable format — LongMemEval, ISO, slash dates, natural language, Date object, Unix ms.
+   * Only absolute truths preserved — time kept only if present in input.
+   * Defaults to current date if not provided.
+   *
+   * @example
+   * { date: "2023/05/20 (Sat) 02:21" }  // LongMemEval format
+   * { date: "2023-05-20" }               // ISO date
+   * { date: new Date() }                 // Date object
+   */
+  date?: string | number | Date | null;
+}
 export interface SearchOptions {
   /** Number of results to return. @default 5 */
   topN?: number;
@@ -294,12 +314,12 @@ export default class GreyMemory {
    * await memory.add([
    *   { role: 'user',      content: 'I work at Stripe as a PM' },
    *   { role: 'assistant', content: 'Great!' }
-   * ])
+   * ], { date: '2023-05-20' })
    *
    * @example Plain text
-   * await memory.add('Arun is building greymemory in Bangalore.')
+   * await memory.add('Arun is building greymemory.', { date: new Date() })
    */
-  add(input: Message[] | string): Promise<void>;
+  add(input: Message[] | string, options?: AddOptions): Promise<void>;
 
   /**
    * Search memory using hybrid BM25 + vector search with RRF fusion.
@@ -340,14 +360,16 @@ export default class GreyMemory {
   getCurrent(query: string): Promise<SearchResult | null>;
 
   /**
-   * Get full version chain for a fact, newest first.
-   * Walks backward via superseded_from pointers.
+   * Returns top N semantic matches, each with their full version chain.
+   * Newest first within each chain. Let the answering prompt reason about
+   * which chain is relevant.
    *
    * @example
-   * const history = await memory.getHistory('where has Arun worked')
-   * // → [{ value: 'Arun works at Stripe', is_latest: true }, { value: 'Arun worked at Google', is_latest: false }]
+   * const chains = await memory.getHistory('where has Arun worked')
+   * // chains[0].current → most recent employer
+   * // chains[0].chain   → full version history
    */
-  getHistory(query: string): Promise<HistoryEntry[]>;
+  getHistory(query: string, topN?: number): Promise<HistoryChain[]>;
 
   /**
    * Get static/dynamic user profile — injection-ready for system prompts.
@@ -398,3 +420,42 @@ export default class GreyMemory {
    */
   clear(): void;
 }
+
+// ── Answering ──────────────────────────────────────────────────────────────
+
+/**
+ * Options for buildAnsweringPrompt()
+ */
+export interface AnsweringOptions {
+  /** The question to answer */
+  question: string;
+  /** When the question was asked — ISO date or datetime */
+  questionDate: string;
+  /** Search results from memory.search() */
+  results: SearchResult[];
+  /** Optional profile from memory.getProfile() */
+  profile?: Profile | null;
+  /** Max results to include in prompt. @default 10 */
+  topN?: number;
+}
+
+/**
+ * Builds the answering prompt for a question using retrieved memories.
+ * Handles temporal reasoning, knowledge updates, abstention, and DERIVES inference.
+ *
+ * @example
+ * import GreyMemory, { buildAnsweringPrompt } from 'greymemory'
+ *
+ * const results = await memory.search(question, { topN: 10 })
+ * const { profile } = await memory.getProfile()
+ *
+ * const prompt = buildAnsweringPrompt({
+ *   question,
+ *   questionDate: '2023-05-30',
+ *   results,
+ *   profile,
+ * })
+ *
+ * const answer = await extractor(prompt)
+ */
+export function buildAnsweringPrompt(options: AnsweringOptions): string;
