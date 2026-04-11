@@ -27,6 +27,7 @@ export class Memory {
     this.embedder      = options.embedder;
     this.filterPrompt  = options.filterPrompt  ?? '';   // v0.3
     this.entityContext = options.entityContext ?? '';   // v0.3
+    this.contextualRetrieval = options.contextualRetrieval ?? false;
     this.storage       = new Storage(
       options.dir       ?? ".greymemory",
       options.container ?? "default",
@@ -39,7 +40,9 @@ export class Memory {
   async add(input) {
     const today = new Date().toISOString().slice(0, 10);
  
-    // 1. find relevant existing memories for dedup via semantic search
+    // 1. embed input to find relevant existing memories for dedup
+    //    vectorSearch returns top 10 most similar — not all facts
+    //    preferences excluded — handled separately by _strengthenPreference()
     const inputText   = Array.isArray(input)
       ? input.map(m => m.content).join(' ')
       : input
@@ -62,19 +65,31 @@ export class Memory {
  
     if (memories.length === 0) return;
 
-    // 4. save raw input as chunks first — get anchor chunk_id for fact provenance
+    // 4. save chunks first — contextualize each chunk before saving
+    // contextual retrieval: prepend session context to each chunk before embedding + BM25 indexing
+    // this makes retrieval accurate months later — no vague pronouns or references in the index
     const messages = Array.isArray(input)
       ? input
       : [{ role: 'document', content: input }];
+ 
+    // full conversation string — passed to _contextualizeChunk() as the whole document
+    const fullConversation = messages
+      .map(m => `${m.role}: ${m.content}`)
+      .join('\n');
  
     let anchorChunkId = null;
  
     for (const message of messages) {
       if (!message.content?.trim()) continue;
  
-      const chunkContent = Array.isArray(input)
+      const rawChunk = Array.isArray(input)
         ? `${message.role}: ${message.content}`
         : message.content;
+ 
+      // contextualize chunk if enabled — one LLM call per chunk
+      const chunkContent = this.contextualRetrieval
+        ? await this._contextualizeChunk(rawChunk, fullConversation)
+        : rawChunk;
  
       this.storage.saveChunk(chunkContent);
  
@@ -462,6 +477,30 @@ or null if no confident inference exists.`;
   }
 
   // ── Private ────────────────────────────────────────
+  
+  // contextualizes a chunk using the full conversation as context
+  // Anthropic's Contextual Retrieval technique — prepend context before embedding + BM25 indexing
+  // makes retrieval accurate months later — no vague pronouns or references in the index
+  // one LLM call per chunk — only runs if contextualRetrieval: true
+  async _contextualizeChunk(chunk, fullConversation) {
+    const prompt = `<conversation>
+${fullConversation}
+</conversation>
+Here is the message we want to situate within the whole conversation:
+<chunk>
+${chunk}
+</chunk>
+Give a short succinct context (1-2 sentences) to situate this message within the overall conversation for improving search retrieval. Resolve all pronouns and vague references to specific names and places. Answer only with the context and nothing else.`;
+ 
+    try {
+      const context = await this.extractor(prompt);
+      // prepend context to chunk — both are stored, embedded, and BM25 indexed together
+      return `${context.trim()}\n${chunk}`;
+    } catch {
+      // if contextualization fails — fall back to raw chunk, never block ingestion
+      return chunk;
+    }
+  }
  
   // use cosine similarity to find an existing preference with similar meaning
   // key matching is unreliable — LLMs produce different keys for the same preference

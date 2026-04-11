@@ -212,6 +212,15 @@ export interface GreyMemoryOptions {
   entityContext?: string;
 
   /**
+   * Enable Contextual Retrieval — prepends chunk-specific context before
+   * embedding and BM25 indexing. Improves retrieval accuracy significantly
+   * but adds one LLM call per chunk at ingestion time.
+   * Based on Anthropic's Contextual Retrieval technique.
+   * @default false
+   */
+  contextualRetrieval?: boolean;
+
+  /**
    * Pass an existing better-sqlite3 Database instance.
    * Use when you want to manage the database lifecycle yourself.
    */

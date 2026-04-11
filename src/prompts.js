@@ -15,8 +15,8 @@ export function buildExtractorPrompt({
   input,
   existingFacts = [],
   today,
-  filterPrompt = '', // org-level noise filter
-  entityContext = '', //per-container extraction guide
+  filterPrompt = '',
+  entityContext = '',
 }) {
   const isConversation = Array.isArray(input)
   const inputLabel     = isConversation ? 'CONVERSATION' : 'DOCUMENT'
@@ -39,13 +39,39 @@ Use this to resolve ambiguous references and focus extraction.
 
 STEP 1 — RESOLVE ALL AMBIGUITY
 
-Before extracting anything, resolve all vague references:
-- Pronouns → actual names ("he said" → "Alex said")
-- Vague references → specific names ("that framework" → "React")
-- Relative dates → approximate real dates ("last Tuesday" → "${today}")
-- Implicit subjects → explicit ("switched jobs" → "Alex switched jobs")
+Before extracting anything, read the entire conversation and resolve every vague reference.
 
-Every extracted memory must be self-contained and unambiguous.
+SELF-CONTAINMENT TEST: Every memory must pass this test —
+"Could a complete stranger understand this sentence with zero prior context?"
+If the answer is no — resolve it before extracting.
+
+Resolve all of the following:
+- Pronouns → actual names
+    BAD:  "He joined them in February"
+    GOOD: "Alex joined Stripe in February 2026"
+
+- Vague references → specific names
+    BAD:  "User moved there for the job"
+    GOOD: "Alex moved to San Francisco for his PM role at Stripe"
+
+- Relative locations → explicit places
+    BAD:  "She works at the office downtown"
+    GOOD: "Sarah works at the Stripe office in San Francisco"
+
+- Relative dates → approximate real dates (today is ${today})
+    BAD:  "Alex started last month"
+    GOOD: "Alex started at Stripe in March 2026"
+
+- Implicit subjects → explicit
+    BAD:  "Switched to TypeScript last year"
+    GOOD: "Arun switched from JavaScript to TypeScript in 2025"
+
+- Vague quantities → specific where possible
+    BAD:  "Leads a small team"
+    GOOD: "Alex leads a team of 8 engineers"
+
+Never use: he, she, they, it, there, here, that, this, the company, the team, the project
+Always use: the actual name, place, or thing being referred to.
 
 STEP 2 — CLASSIFY AND EXTRACT ATOMIC MEMORIES
 
