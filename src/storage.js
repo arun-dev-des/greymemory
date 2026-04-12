@@ -491,12 +491,25 @@ export class Storage {
 
   // ── Search ─────────────────────────────────────────
 
-  bm25Search(query, container, topN = 10) {
+  bm25Search(query, container, topN = 10, asOf = null) {
     const ftsQuery = query
       .trim()
       .split(/\s+/)
       .join(" OR ");
- 
+
+    // asOf time-travel: replace is_latest=1 with the "current at asOf" predicate
+    const versionClause = asOf
+      ? `AND f.document_date <= @asOf
+         AND (
+           f.superseded_by IS NULL
+           OR EXISTS (
+             SELECT 1 FROM facts s
+             WHERE s.id = f.superseded_by
+               AND s.document_date > @asOf
+           )
+         )`
+      : `AND f.is_latest = 1`;
+
     const rows = this.db.prepare(`
       SELECT
         f.id,
@@ -504,57 +517,77 @@ export class Storage {
         f.value,
         f.memory_type,
         f.confidence,
+        f.document_date,
         f.event_date,
+        f.relation_type,
         f.chunk_id,
         bm25(facts_fts) AS score
       FROM facts_fts
       JOIN facts f ON facts_fts.rowid = f.id
-      WHERE facts_fts MATCH ?
-        AND f.container = ?
-        AND f.is_latest = 1
+      WHERE facts_fts MATCH @query
+        AND f.container = @container
+        ${versionClause}
         AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
       ORDER BY score
-      LIMIT ?
-    `).all(ftsQuery, container, topN);
- 
+      LIMIT @topN
+    `).all({ query: ftsQuery, container, topN, asOf });
+
     return rows.map((r, index) => ({
-      id:          r.id,
-      key:         r.key,
-      value:       r.value,
-      memory_type: r.memory_type,
-      confidence:  r.confidence,
-      event_date:  r.event_date,
-      chunk_id:    r.chunk_id,
-      rank:        index + 1,
-      score:       r.score,
+      id:            r.id,
+      key:           r.key,
+      value:         r.value,
+      memory_type:   r.memory_type,
+      confidence:    r.confidence,
+      document_date: r.document_date,
+      event_date:    r.event_date,
+      relation_type: r.relation_type,
+      chunk_id:      r.chunk_id,
+      rank:          index + 1,
+      score:         r.score,
     }));
   }
 
-  vectorSearch(queryVector, container, topN = 10) {
+  vectorSearch(queryVector, container, topN = 10, asOf = null) {
+    // asOf time-travel: replace is_latest=1 with the "current at asOf" predicate
+    const versionClause = asOf
+      ? `AND f.document_date <= @asOf
+         AND (
+           f.superseded_by IS NULL
+           OR EXISTS (
+             SELECT 1 FROM facts s
+             WHERE s.id = f.superseded_by
+               AND s.document_date > @asOf
+           )
+         )`
+      : `AND f.is_latest = 1`;
+
     // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
-      SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence, f.event_date, f.chunk_id
+      SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence,
+             f.document_date, f.event_date, f.relation_type, f.chunk_id
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
-      WHERE e.container = ?
-        AND f.is_latest = 1
+      WHERE e.container = @container
+        ${versionClause}
         AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
-    `).all(container);
- 
+    `).all({ container, asOf });
+
     const scored = rows
       .map(row => ({
-        id:          row.fact_id,
-        key:         row.key,
-        value:       row.value,
-        memory_type: row.memory_type,
-        confidence:  row.confidence,
-        event_date:  row.event_date,
-        chunk_id:    row.chunk_id,
-        score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
+        id:            row.fact_id,
+        key:           row.key,
+        value:         row.value,
+        memory_type:   row.memory_type,
+        confidence:    row.confidence,
+        document_date: row.document_date,
+        event_date:    row.event_date,
+        relation_type: row.relation_type,
+        chunk_id:      row.chunk_id,
+        score:         this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)
       .slice(0, topN);
- 
+
     return scored.map((r, index) => ({ ...r, rank: index + 1 }));
   }
 
@@ -567,16 +600,16 @@ export class Storage {
   }
 
   //RRF fusion method
-  hybridSearch(query, queryVector, container, topN = 5) {
+  hybridSearch(query, queryVector, container, topN = 5, asOf = null) {
     const k = 60;
- 
+
     // search facts only — chunks are attached at retrieval, not ranked separately
     let bm25Results = [];
     try {
-      bm25Results = this.bm25Search(query, container, topN * 2);
+      bm25Results = this.bm25Search(query, container, topN * 2, asOf);
     } catch (e) {}
- 
-    const vectorResults = this.vectorSearch(queryVector, container, topN * 2);
+
+    const vectorResults = this.vectorSearch(queryVector, container, topN * 2, asOf);
  
     // RRF fusion — keyed by fact id to preserve full fact data
     const scores = {};
@@ -612,9 +645,11 @@ export class Storage {
   // ── Clear ──────────────────────────────────────────
 
   clear() {
-    this.db.prepare(`DELETE FROM facts WHERE container = ?`).run(this.container);
+    // delete child rows before parents — embeddings/chunk_embeddings have FK
+    // references to facts/chunks, and better-sqlite3 enforces foreign keys
     this.db.prepare(`DELETE FROM embeddings WHERE container = ?`).run(this.container);
-    this.db.prepare(`DELETE FROM chunks WHERE container = ?`).run(this.container);
     this.db.prepare(`DELETE FROM chunk_embeddings WHERE container = ?`).run(this.container);
+    this.db.prepare(`DELETE FROM facts WHERE container = ?`).run(this.container);
+    this.db.prepare(`DELETE FROM chunks WHERE container = ?`).run(this.container);
   }
 }

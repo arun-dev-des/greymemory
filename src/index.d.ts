@@ -210,7 +210,9 @@ export interface GreyMemoryOptions {
 
   /**
    * Per-container context about who this memory belongs to.
-   * Used to resolve ambiguous references during extraction.
+   * Used as the seed for reference resolution during extraction.
+   * Automatically enriched after each add() call from the accumulated profile.
+   * By session 3+, the extractor knows: employer, location, preferences etc.
    *
    * @example
    * entityContext: 'Memory for Arun, a product designer based in Bangalore.'
@@ -249,6 +251,18 @@ export interface AddOptions {
    * { date: new Date() }                 // Date object
    */
   date?: string | number | Date | null;
+
+  /**
+   * Per-session entity context — overrides the constructor entityContext for this call.
+   * Use to pass evolving user context that updates after each session.
+   *
+   * @example
+   * // update context from profile after each session
+   * const { profile } = await memory.getProfile()
+   * const entityContext = `Known facts: ${[...profile.static, ...profile.dynamic].join('. ')}`
+   * await memory.add(nextSession, { date, entityContext })
+   */
+  entityContext?: string;
 }
 export interface SearchOptions {
   /** Number of results to return. @default 5 */
@@ -263,6 +277,13 @@ export interface SearchOptions {
   includeHistory?: boolean;
   /** Include expired episodes. @default false */
   includeExpired?: boolean;
+  /**
+   * Return facts that were current at this point in time, not just is_latest=1.
+   * ISO date string: "2023-03-10" or "2023-03-10T14:30".
+   * Date-only values are treated as end-of-day.
+   * Critical for temporal queries — "where did the user work in March 2023?"
+   */
+  asOf?: string | null;
 }
 
 /**
@@ -309,6 +330,8 @@ export default class GreyMemory {
   /**
    * Add a conversation or document to memory.
    * Saves chunks first, then extracts and stores memories with provenance.
+   * After each call, entityContext is automatically updated from the accumulated profile —
+   * reference resolution improves with every session.
    *
    * @example Conversation
    * await memory.add([

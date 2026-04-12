@@ -25,8 +25,8 @@ export class Memory {
 
     this.extractor     = options.extractor;
     this.embedder      = options.embedder;
-    this.filterPrompt  = options.filterPrompt  ?? '';   // v0.3
-    this.entityContext = options.entityContext ?? '';   // v0.3
+    this.filterPrompt        = options.filterPrompt       ?? '';
+    this.entityContext       = options.entityContext       ?? '';
     this.contextualRetrieval = options.contextualRetrieval ?? false;
     this.storage       = new Storage(
       options.dir       ?? ".greymemory",
@@ -41,7 +41,10 @@ export class Memory {
     // normalize the session date — preserve only what's actually known
     // supports: LongMemEval format, ISO, slash/dot dates, natural language, Date object, Unix ms
     const documentDate = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
- 
+    
+    // entityContext can evolve per session — per-call override takes precedence over constructor default
+    const entityContext = opts.entityContext ?? this.entityContext;
+
     // 1. embed input to find relevant existing memories for dedup
     //    vectorSearch returns top 10 most similar — not all facts
     //    preferences excluded — handled separately by _strengthenPreference()
@@ -58,7 +61,7 @@ export class Memory {
       existingFacts,
       documentDate,
       filterPrompt:  this.filterPrompt,
-      entityContext: this.entityContext,
+      entityContext,
     });
  
     // 3. call extractor — returns raw string
@@ -80,25 +83,30 @@ export class Memory {
       .join('\n');
  
     let anchorChunkId = null;
- 
-    for (const message of messages) {
+    // per-message chunk id map — resolves fact.source_message_index → chunk_id
+    // so each fact links to the message it came from, not the session anchor
+    const messageIndexToChunkId = {};
+
+    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
+      const message = messages[messageIndex];
       if (!message.content?.trim()) continue;
- 
+
       const rawChunk = Array.isArray(input)
         ? `${message.role}: ${message.content}`
         : message.content;
- 
+
       // contextualize chunk if enabled — one LLM call per chunk
       const chunkContent = this.contextualRetrieval
         ? await this._contextualizeChunk(rawChunk, fullConversation)
         : rawChunk;
- 
+
       this.storage.saveChunk(chunkContent);
- 
+
       const chunkId = this.storage.getLastChunkId();
       if (chunkId) {
         // first chunk of this add() call is the session anchor
         if (anchorChunkId === null) anchorChunkId = chunkId;
+        messageIndexToChunkId[messageIndex] = chunkId;
         const vector = await this.embedder(chunkContent);
         this.storage.saveChunkEmbedding(chunkId, vector);
       }
@@ -118,9 +126,19 @@ export class Memory {
         event_date  = null,
         expires_at  = null,
         context     = null,
+        source_message_index = null,
       } = mem;
- 
+
       if (!key || !value) continue;
+
+      // resolve chunk_id from extractor-provided source_message_index
+      // untrusted — validate index is present in the map, else fall back to anchor
+      const resolvedChunkId = (
+        Number.isInteger(source_message_index) &&
+        messageIndexToChunkId[source_message_index] != null
+      )
+        ? messageIndexToChunkId[source_message_index]
+        : anchorChunkId;
  
       // embed value only — not `${key}: ${value}`, key adds noise
       const embedding = await this.embedder(value);
@@ -155,7 +173,7 @@ export class Memory {
         relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
         related_to:      relationship.relatedTo,
         superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
-        chunk_id:        anchorChunkId,
+        chunk_id:        resolvedChunkId,
         metadata:        JSON.stringify(context ? { context } : {}),
       });
  
@@ -170,6 +188,22 @@ export class Memory {
       // track this embedding for within-batch dedup
       savedThisBatch.push(embedding);
     }
+
+    // auto-evolve entityContext from accumulated profile
+    // next add() call will have richer context for resolving references
+    // constructor entityContext is the seed — library enriches it as sessions are ingested
+    // per-call entityContext override is never auto-updated — only this.entityContext evolves
+    const { profile } = await this.getProfile();
+    
+    const MIN_FACTS = 3  // enough to resolve most references
+
+    const known = profile.static.length >= MIN_FACTS
+      ? profile.static
+      : profile.dynamic.slice(0, 10)
+ 
+    if (known.length > 0) {
+      this.entityContext = `Known facts about this user: ${known.slice(0, 20).join('. ')}.`;
+    }
   }
 
   // ── Search ─────────────────────────────────────────
@@ -182,14 +216,24 @@ export class Memory {
       beforeDate     = null,   // filter by event_date <= beforeDate
       includeHistory = false,  // include superseded facts (is_latest=0)
       includeExpired = false,  // include expired episodes
+      asOf           = null,   // time-travel: return facts current at this point in time
     } = typeof options === 'number' ? { topN: options } : options;
- 
+
+    // normalize asOf — accept ISO date or datetime; date-only → end of that day
+    // so a fact recorded at "2023-03-10T14:00" is still considered current on asOf "2023-03-10"
+    let asOfNorm = null;
+    if (asOf) {
+      const normalized = this._normalizeDate(asOf) ?? asOf;
+      asOfNorm = normalized.includes('T') ? normalized : `${normalized}T23:59:59`;
+    }
+
     const queryVector = await this.embedder(query);
     const results     = this.storage.hybridSearch(
       query,
       queryVector,
       this.storage.container,
       topN * 3, // fetch more candidates — filters may reduce count
+      asOfNorm,
     );
  
     // apply filters
@@ -655,19 +699,38 @@ Return ONLY valid JSON, no explanation:
   // parse raw extractor string → array of memory objects
   // handles accidental markdown fences, invalid JSON, object instead of array
   _parseExtraction(raw) {
-    const text = raw
-      .trim()
-      .replace(/^```json\s*/i, '')
-      .replace(/```\s*$/, '')
-      .trim();
+    let text = raw.trim()
  
+    // strip markdown fences
+    text = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
+ 
+    // try direct parse first
     try {
-      const parsed = JSON.parse(text);
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      console.warn('[greymemory] extractor returned invalid JSON:', text.slice(0, 200));
-      return [];
+      const parsed = JSON.parse(text)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {}
+ 
+    // try extracting just the JSON array — LLM sometimes adds reasoning before/after
+    const arrayMatch = text.match(/\[[\s\S]*\]/)
+    if (arrayMatch) {
+      try {
+        const parsed = JSON.parse(arrayMatch[0])
+        return Array.isArray(parsed) ? parsed : []
+      } catch {}
     }
+ 
+    // suppress warning for intentional empty responses
+    const looksIntentional =
+      text.length === 0 ||
+      /nothing to extract|no personal|no facts|no memories|empty|n\/a/i.test(text) ||
+      /reasoning|filter|skip|conversation (contains|is|has)|no information/i.test(text) ||
+      text.startsWith('**') ||
+      text.startsWith('#')
+ 
+    if (!looksIntentional) {
+      console.warn('[greymemory] extractor returned invalid JSON:', text.slice(0, 200))
+    }
+    return []
   }
 
   // normalize a date input to an ISO string — preserving only absolute truths

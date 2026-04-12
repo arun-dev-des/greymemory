@@ -131,6 +131,10 @@ Rules:
 3. Include WHO, WHAT, WHEN where available
 4. Be specific not vague
 5. Apply filter instructions strictly
+6. source_message_index: 0-based index of the message this fact was extracted from.
+   Use the index of the MOST SPECIFIC message that contains this information.
+   If derived from multiple messages: use the message that contains the key evidence.
+   If input is a plain DOCUMENT (not a conversation array), or if uncertain: null
 
 STEP 3 — TEMPORAL GROUNDING
 
@@ -186,7 +190,8 @@ KEY NAMING RULES — the key is a short generic concept identifier, not a descri
     "memory_type": "fact | preference | episode",
     "event_date":  "YYYY-MM-DD or null",
     "expires_at":  "YYYY-MM-DD or null (episodes only)",
-    "context":     "one sentence explaining why this is worth remembering"
+    "context":     "one sentence explaining why this is worth remembering",
+    "source_message_index": "0-based index of the source message in a conversation, or null"
   }
 ]
 
