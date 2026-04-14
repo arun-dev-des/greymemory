@@ -382,7 +382,17 @@ export class Storage {
 
   // ── Facts ──────────────────────────────────────────
 
-  loadFacts() {
+  loadFacts(asOf = null) {
+    // expires check relative to asOf when time-travelling, today otherwise
+    // ensures episodes valid at asOf are included even if expired today
+    const expiresCheck = asOf
+      ? `AND (expires_at IS NULL OR expires_at > ?)`
+      : `AND (expires_at IS NULL OR expires_at > datetime('now'))`
+
+    const params = asOf
+      ? [this.container, asOf]
+      : [this.container]
+
     return this.db
       .prepare(`
         SELECT
@@ -395,10 +405,10 @@ export class Storage {
         FROM facts
         WHERE container = ?
           AND is_latest = 1
-          AND (expires_at IS NULL OR expires_at > datetime('now'))
+          ${expiresCheck}
         ORDER BY created_at ASC
       `)
-      .all(this.container);
+      .all(...params);
   }
 
   supersedeFact(oldId, newId) {
@@ -510,6 +520,12 @@ export class Storage {
          )`
       : `AND f.is_latest = 1`;
 
+    // expires check: compare against asOf when time-travelling, today otherwise
+    // an episode expiring 2023-01-16 was still valid on asOf 2023-01-15
+    const expiresClause = asOf
+      ? `AND (f.expires_at IS NULL OR f.expires_at > @asOf)`
+      : `AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))`;  
+
     const rows = this.db.prepare(`
       SELECT
         f.id,
@@ -527,7 +543,7 @@ export class Storage {
       WHERE facts_fts MATCH @query
         AND f.container = @container
         ${versionClause}
-        AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
+        ${expiresClause}
       ORDER BY score
       LIMIT @topN
     `).all({ query: ftsQuery, container, topN, asOf });
@@ -551,25 +567,31 @@ export class Storage {
     // asOf time-travel: replace is_latest=1 with the "current at asOf" predicate
     const versionClause = asOf
       ? `AND f.document_date <= @asOf
-         AND (
-           f.superseded_by IS NULL
-           OR EXISTS (
-             SELECT 1 FROM facts s
-             WHERE s.id = f.superseded_by
-               AND s.document_date > @asOf
-           )
-         )`
+        AND (
+          f.superseded_by IS NULL
+          OR EXISTS (
+            SELECT 1 FROM facts s
+            WHERE s.id = f.superseded_by
+              AND s.document_date > @asOf
+          )
+        )`
       : `AND f.is_latest = 1`;
+
+    // expires check: compare against asOf when time-travelling, today otherwise
+    // an episode expiring 2023-01-16 was still valid on asOf 2023-01-15
+    const expiresClause = asOf
+      ? `AND (f.expires_at IS NULL OR f.expires_at > @asOf)`
+      : `AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))`;
 
     // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
       SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence,
-             f.document_date, f.event_date, f.relation_type, f.chunk_id
+            f.document_date, f.event_date, f.relation_type, f.chunk_id
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
       WHERE e.container = @container
         ${versionClause}
-        AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
+        ${expiresClause}
     `).all({ container, asOf });
 
     const scored = rows
@@ -589,14 +611,6 @@ export class Storage {
       .slice(0, topN);
 
     return scored.map((r, index) => ({ ...r, rank: index + 1 }));
-  }
-
-  getChunk(chunkId) {
-    if (!chunkId) return null;
-    const row = this.db.prepare(`
-      SELECT content FROM chunks WHERE id = ?
-    `).get(chunkId);
-    return row?.content ?? null;
   }
 
   //RRF fusion method
@@ -631,6 +645,15 @@ export class Storage {
     return Object.values(scores)
       .sort((a, b) => b.rrf - a.rrf)
       .slice(0, topN);
+  }
+
+  // get chunk using id
+  getChunk(chunkId) {
+    if (!chunkId) return null;
+    const row = this.db.prepare(`
+      SELECT content FROM chunks WHERE id = ?
+    `).get(chunkId);
+    return row?.content ?? null;
   }
 
   _cosineSimilarity(a, b) {

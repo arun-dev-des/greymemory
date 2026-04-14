@@ -52,7 +52,7 @@ export class Memory {
       ? input.map(m => m.content).join(' ')
       : input
     const inputVector   = await this.embedder(inputText)
-    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10)
+    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
       .filter(f => f.memory_type !== 'preference')
  
     // 2. build prompt — single string with everything the LLM needs
@@ -152,7 +152,7 @@ export class Memory {
       // preferences — use cosine similarity to find existing ones, not key match
       // LLMs are not deterministic so the key will vary across calls
       if (memory_type === 'preference') {
-        const strengthened = this._strengthenPreference(key, value, embedding);
+        const strengthened = this._strengthenPreference(key, value, embedding, documentDate);
         if (strengthened) continue;
       }
  
@@ -190,19 +190,17 @@ export class Memory {
     }
 
     // auto-evolve entityContext from accumulated profile
-    // next add() call will have richer context for resolving references
-    // constructor entityContext is the seed — library enriches it as sessions are ingested
-    // per-call entityContext override is never auto-updated — only this.entityContext evolves
-    const { profile } = await this.getProfile();
-    
-    const MIN_FACTS = 3  // enough to resolve most references
+    // pass documentDate as asOf — profile computed relative to session date, not today
+    // ensures episodes and recent facts are correctly classified for this session
+    const { profile } = await this.getProfile({ asOf: documentDate });
 
-    const known = profile.static.length >= MIN_FACTS
-      ? profile.static
-      : profile.dynamic.slice(0, 10)
- 
+    const known = [
+      ...profile.static,   // preferences + facts older than 7 days relative to session
+      ...profile.dynamic,  // recent facts + current episodes relative to session
+    ].slice(0, 20)
+
     if (known.length > 0) {
-      this.entityContext = `Known facts about this user: ${known.slice(0, 20).join('. ')}.`;
+      this.entityContext = `Known facts about this user: ${known.join('. ')}.`
     }
   }
 
@@ -242,12 +240,14 @@ export class Memory {
     if (memoryTypes) {
       filtered = filtered.filter(r => memoryTypes.includes(r.memory_type));
     }
-    if (!includeHistory) {
-      filtered = filtered.filter(r => r.is_latest !== 0);
+    if (!includeHistory && !asOfNorm) {
+      filtered = filtered.filter(r => r.is_latest !== 0)
     }
     if (!includeExpired) {
-      const now = new Date().toISOString().slice(0, 10);
-      filtered = filtered.filter(r => !r.expires_at || r.expires_at > now);
+      const expiryCutoff = asOfNorm
+        ? asOfNorm.slice(0, 10)
+        : new Date().toISOString().slice(0, 10);
+      filtered = filtered.filter(r => !r.expires_at || r.expires_at > expiryCutoff);
     }
     if (afterDate) {
       filtered = filtered.filter(r => r.event_date && r.event_date >= afterDate);
@@ -290,30 +290,33 @@ export class Memory {
   // dynamic: facts from last 7 days + current episodes
   //
   // optional q — also runs search() and returns results alongside profile
-  async getProfile({ q = null, topN = 5 } = {}) {
-    const now     = new Date();
-    const today   = now.toISOString().slice(0, 10);
-    const cutoff  = new Date(now - 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
- 
-    const allFacts = this.storage.loadFacts();
- 
+  async getProfile({ q = null, topN = 5, asOf = null } = {}) {
+    // use asOf if provided — critical for historical session ingestion
+    // ensures episode expiry and static/dynamic split are relative to session date, not today
+    const referenceDate = asOf
+      ? (this._normalizeDate(asOf) ?? new Date().toISOString().slice(0, 10))
+      : new Date().toISOString().slice(0, 10)
+
+    const cutoff = new Date(new Date(referenceDate) - 7 * 24 * 60 * 60 * 1000)
+      .toISOString().slice(0, 10)
+
+    const allFacts = this.storage.loadFacts(referenceDate);
+
     const staticFacts  = [];
     const dynamicFacts = [];
- 
+
     for (const fact of allFacts) {
-      // expired episodes — excluded entirely
-      if (fact.expires_at && fact.expires_at < today) continue;
- 
+      // expired episodes — excluded relative to referenceDate, not today
+      if (fact.expires_at && fact.expires_at < referenceDate) continue;
+
       if (fact.memory_type === 'preference') {
-        // preferences always go to static — behavioral traits don't expire
         staticFacts.push(fact.value);
- 
+
       } else if (fact.memory_type === 'episode') {
-        // current episodes go to dynamic
         dynamicFacts.push(fact.value);
- 
+
       } else {
-        // facts — split by recency
+        // facts — split by recency relative to referenceDate
         if (fact.document_date && fact.document_date > cutoff) {
           dynamicFacts.push(fact.value);
         } else {
@@ -321,18 +324,17 @@ export class Memory {
         }
       }
     }
- 
+
     const profile = {
       static:  staticFacts,
       dynamic: dynamicFacts,
     };
- 
-    // optional: profile + search in one call (Supermemory pattern)
+
     if (q) {
       const results = await this.search(q, { topN });
       return { profile, results };
     }
- 
+
     return { profile };
   }
 
@@ -422,119 +424,126 @@ export class Memory {
   }
 
   // ── runDerivations ─────────────────────────────────
- 
-  // infers second-order conclusions by combining recent memories with similar existing ones
-  // call manually after add(), on a schedule, or before important queries
-  // never called inside add() — derivation is a separate concern from ingestion
-  //
-  // options:
-  //   sinceDays: look at facts added in last N days (default 7)
-  //   topK:      number of similar facts to combine with each recent fact (default 10)
-  async runDerivations({ sinceDays = 7, topK = 10 } = {}) {
-    // get recently added facts — focused window, not entire memory graph
-    const recentFacts = this.storage.db.prepare(`
-      SELECT id, key, value, memory_type, document_date
-      FROM facts
-      WHERE container = ?
-        AND memory_type = 'fact'
-        AND is_latest = 1
-        AND relation_type != 'DERIVES'
-        AND (expires_at IS NULL OR expires_at > datetime('now'))
-        AND document_date >= date('now', '-' || ? || ' days')
-      ORDER BY created_at DESC
-      LIMIT 20
-    `).all(this.storage.container, sinceDays);
- 
-    if (recentFacts.length === 0) return [];
- 
-    const derived = [];
- 
-    for (const recentFact of recentFacts) {
-      // find top K semantically similar existing facts — focused candidates
-      const embedding  = await this.embedder(recentFact.value);
-      const candidates = this.storage.vectorSearch(embedding, this.storage.container, topK)
-        .filter(f => f.id !== recentFact.id && f.memory_type === 'fact');
- 
-      if (candidates.length === 0) continue;
- 
-      // small focused prompt — one recent fact + top K candidates
-      const prompt = `You are a memory inference engine.
- 
+
+// infers second-order conclusions by combining recent memories with similar existing ones
+// call manually after add(), on a schedule, or before important queries
+// never called inside add() — derivation is a separate concern from ingestion
+//
+// options:
+//   sinceDays: look at facts added in last N days (default 7)
+//   topK:      number of similar facts to combine with each recent fact (default 10)
+async runDerivations({ sinceDays = 7, topK = 10 } = {}) {
+  // use most recent document_date as reference — works correctly for historical ingestion
+  // prevents date('now') from excluding all facts when sessions are in the past
+  const latestRow = this.storage.db.prepare(`
+    SELECT MAX(document_date) as latest FROM facts
+    WHERE container = ? AND is_latest = 1
+  `).get(this.storage.container)
+
+  const referenceDate = latestRow?.latest ?? new Date().toISOString().slice(0, 10)
+
+  const recentFacts = this.storage.db.prepare(`
+    SELECT id, key, value, memory_type, document_date
+    FROM facts
+    WHERE container = ?
+      AND memory_type = 'fact'
+      AND is_latest = 1
+      AND relation_type != 'DERIVES'
+      AND (expires_at IS NULL OR expires_at > ?)
+      AND document_date >= date(?, '-' || ? || ' days')
+    ORDER BY created_at DESC
+    LIMIT 20
+  `).all(this.storage.container, referenceDate, referenceDate, sinceDays);
+
+  if (recentFacts.length === 0) return [];
+
+  const derived = [];
+
+  for (const recentFact of recentFacts) {
+    // find top K semantically similar existing facts — anchored to referenceDate
+    const embedding  = await this.embedder(recentFact.value);
+    const candidates = this.storage.vectorSearch(embedding, this.storage.container, topK, referenceDate)
+      .filter(f => f.id !== recentFact.id && f.memory_type === 'fact');
+
+    if (candidates.length === 0) continue;
+
+    // small focused prompt — one recent fact + top K candidates
+    const prompt = `You are a memory inference engine.
+
 New memory: [ID:${recentFact.id}] "${recentFact.value}"
- 
+
 Related existing memories:
 ${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}"`).join('\n')}
- 
+
 Can you infer a NEW factual conclusion by combining the new memory with one or more related memories?
- 
+
 Rules:
 - The conclusion must NOT be explicitly stated in any memory above
 - It must be a confident logical inference, not speculation
 - If no confident inference is possible, return null
- 
+
 Example:
   "Alex is a PM at Stripe" + "Stripe is a payments company"
   → "Alex likely works on payments products"
- 
+
 Return ONLY valid JSON, no explanation:
 {"derives": "the inferred conclusion as a complete sentence", "fromIds": [id1, id2]}
 or null if no confident inference exists.`;
- 
-      try {
-        const raw  = await this.extractor(prompt);
-        const text = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
- 
-        if (text === 'null' || !text) continue;
- 
-        const result = JSON.parse(text);
- 
-        if (!result?.derives || !Array.isArray(result.fromIds) || result.fromIds.length < 2) continue;
- 
-        // validate fromIds point to real facts
-        const allFacts = [recentFact, ...candidates];
-        const validIds = result.fromIds.filter(id => allFacts.find(f => f.id === id));
-        if (validIds.length < 2) continue;
- 
-        // check this inference doesn't already exist — check all facts including DERIVES
-        const deriveEmbedding = await this.embedder(result.derives);
-        const allCurrent      = this.storage.db.prepare(`
-          SELECT id, value FROM facts
-          WHERE container = ? AND is_latest = 1
-            AND (expires_at IS NULL OR expires_at > datetime('now'))
-        `).all(this.storage.container);
- 
-        const tooSimilar = allCurrent.some(f => {
-          const vec = this.storage.db.prepare(
-            `SELECT vector FROM embeddings WHERE fact_id = ? LIMIT 1`
-          ).get(f.id);
-          if (!vec) return false;
-          return this._cosineSimilarity(deriveEmbedding, JSON.parse(vec.vector)) > 0.88;
-        });
- 
-        if (tooSimilar) continue;
- 
-        // save the derived fact
-        const today  = new Date().toISOString().slice(0, 10);
-        const key    = `derived_${Date.now()}`;
-        const factId = this.storage.saveFact(key, result.derives, {
-          memory_type:   'fact',
-          document_date: today,
-          relation_type: 'DERIVES',
-          related_to:    validIds[0], // primary source — v0.4 stores all via fact_relations
-          confidence:    0.8,         // inferred facts start lower than stated facts
-          metadata:      JSON.stringify({ fromIds: validIds }),
-        });
- 
-        this.storage.saveEmbedding(factId, deriveEmbedding);
-        derived.push({ id: factId, value: result.derives, fromIds: validIds });
- 
-      } catch {
-        continue; // never block on derivation errors
-      }
+
+    try {
+      const raw  = await this.extractor(prompt);
+      const text = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+
+      if (text === 'null' || !text) continue;
+
+      const result = JSON.parse(text);
+
+      if (!result?.derives || !Array.isArray(result.fromIds) || result.fromIds.length < 2) continue;
+
+      // validate fromIds point to real facts
+      const allFacts = [recentFact, ...candidates];
+      const validIds = result.fromIds.filter(id => allFacts.find(f => f.id === id));
+      if (validIds.length < 2) continue;
+
+      // check this inference doesn't already exist — anchored to referenceDate
+      const deriveEmbedding = await this.embedder(result.derives);
+      const allCurrent      = this.storage.db.prepare(`
+        SELECT id, value FROM facts
+        WHERE container = ? AND is_latest = 1
+          AND (expires_at IS NULL OR expires_at > ?)
+      `).all(this.storage.container, referenceDate);
+
+      const tooSimilar = allCurrent.some(f => {
+        const vec = this.storage.db.prepare(
+          `SELECT vector FROM embeddings WHERE fact_id = ? LIMIT 1`
+        ).get(f.id);
+        if (!vec) return false;
+        return this._cosineSimilarity(deriveEmbedding, JSON.parse(vec.vector)) > 0.88;
+      });
+
+      if (tooSimilar) continue;
+
+      // save derived fact — use referenceDate not today
+      const key    = `derived_${Date.now()}`;
+      const factId = this.storage.saveFact(key, result.derives, {
+        memory_type:   'fact',
+        document_date: referenceDate,
+        relation_type: 'DERIVES',
+        related_to:    validIds[0],
+        confidence:    0.8,
+        metadata:      JSON.stringify({ fromIds: validIds }),
+      });
+
+      this.storage.saveEmbedding(factId, deriveEmbedding);
+      derived.push({ id: factId, value: result.derives, fromIds: validIds });
+
+    } catch {
+      continue; // never block on derivation errors
     }
- 
-    return derived;
   }
+
+  return derived;
+}
 
   // ── Clear ──────────────────────────────────────────
 
@@ -570,7 +579,7 @@ Give a short succinct context (1-2 sentences) to situate this message within the
  
   // use cosine similarity to find an existing preference with similar meaning
   // key matching is unreliable — LLMs produce different keys for the same preference
-  _strengthenPreference(key, value, embedding) {
+  _strengthenPreference(key, value, embedding, documentDate) {
     const existing = this.storage.db.prepare(`
       SELECT f.id, f.key, f.confidence, e.vector
       FROM facts f
@@ -578,8 +587,8 @@ Give a short succinct context (1-2 sentences) to situate this message within the
       WHERE f.container = ?
         AND f.memory_type = 'preference'
         AND f.is_latest = 1
-        AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))
-    `).all(this.storage.container);
+        AND (f.expires_at IS NULL OR f.expires_at > ?)
+    `).all(this.storage.container, documentDate);
  
     const THRESHOLD = 0.92;
  
@@ -627,11 +636,11 @@ Give a short succinct context (1-2 sentences) to situate this message within the
       SELECT id, key, value, memory_type, document_date, event_date
       FROM facts
       WHERE key = ? AND container = ? AND is_latest = 1
-        AND (expires_at IS NULL OR expires_at > datetime('now'))
-    `).all(key, this.storage.container);
+        AND (expires_at IS NULL OR expires_at > ?)
+    `).all(key, this.storage.container, documentDate);
  
     // step 1b — semantically similar facts via vector search
-    const similarFacts = this.storage.vectorSearch(embedding, this.storage.container, 5);
+    const similarFacts = this.storage.vectorSearch(embedding, this.storage.container, 5, documentDate);
  
     // step 1c — combine and dedup by id
     const seen = new Set();
