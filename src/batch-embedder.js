@@ -5,6 +5,9 @@
  * Collects individual embed() calls within a time window and sends them
  * as one batched API request — transparently to the caller.
  *
+ * If the batch request fails, each item is retried individually so a
+ * single API error never silently drops an entire batch.
+ *
  * @param {Function} batchFn  async (texts: string[]) => number[][]
  * @param {object}   opts
  * @param {number}   opts.windowMs   how long to collect requests (default: 20ms)
@@ -30,8 +33,8 @@ export function createBatchEmbedder(batchFn, opts = {}) {
   const windowMs = opts.windowMs ?? 20
   const maxBatch = opts.maxBatch ?? 128
 
-  let queue    = []   // { text, resolve, reject }
-  let timer    = null
+  let queue = []   // { text, resolve, reject }
+  let timer = null
 
   async function flush() {
     timer = null
@@ -39,23 +42,35 @@ export function createBatchEmbedder(batchFn, opts = {}) {
 
     // take current queue — more may arrive while we await
     const batch = queue.splice(0, maxBatch)
-
     const texts = batch.map(item => item.text)
 
     try {
       const embeddings = await batchFn(texts)
 
-      // resolve each promise with its corresponding embedding
       batch.forEach((item, i) => {
         if (embeddings[i]) {
           item.resolve(embeddings[i])
         } else {
-          item.reject(new Error(`batch embedder: no embedding returned for index ${i}`))
+          item.reject(new Error(`[batch-embedder] no embedding returned for index ${i}`))
         }
       })
     } catch (err) {
-      // reject all in this batch
-      batch.forEach(item => item.reject(err))
+      // batch failed — retry each item individually so one error doesn't drop the whole batch
+      // slower but safe — a transient API error won't silently lose memories
+      console.warn(`[batch-embedder] batch of ${batch.length} failed, retrying individually: ${err.message}`)
+
+      for (const item of batch) {
+        try {
+          const result = await batchFn([item.text])
+          if (result[0]) {
+            item.resolve(result[0])
+          } else {
+            item.reject(new Error(`[batch-embedder] individual retry returned no embedding`))
+          }
+        } catch (retryErr) {
+          item.reject(retryErr)
+        }
+      }
     }
 
     // if more arrived while we were awaiting — flush again immediately

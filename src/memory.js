@@ -38,132 +38,91 @@ export class Memory {
   // ── Add ────────────────────────────────────────────
  
   async add(input, opts = {}) {
-    // normalize the session date — preserve only what's actually known
-    // supports: LongMemEval format, ISO, slash/dot dates, natural language, Date object, Unix ms
-    const documentDate = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
-    
-    // entityContext can evolve per session — per-call override takes precedence over constructor default
+    const documentDate  = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
     const entityContext = opts.entityContext ?? this.entityContext;
 
-    // 1. embed input to find relevant existing memories for dedup
-    //    vectorSearch returns top 10 most similar — not all facts
-    //    preferences excluded — handled separately by _strengthenPreference()
-    const inputText   = Array.isArray(input)
-      ? input.map(m => m.content).join(' ')
-      : input
-    const inputVector   = await this.embedder(inputText)
+    const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
+    const inputVector = await this.embedder(inputText)
     const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
       .filter(f => f.memory_type !== 'preference')
- 
-    // 2. build prompt — single string with everything the LLM needs
-    const prompt = buildExtractorPrompt({
-      input,
-      existingFacts,
-      documentDate,
-      filterPrompt:  this.filterPrompt,
-      entityContext,
-    });
- 
-    // 3. call extractor — returns raw string
-    const raw      = await this.extractor(prompt);
-    const memories = this._parseExtraction(raw);
- 
+
+    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
+    const raw      = await this.extractor(prompt)
+    const memories = this._parseExtraction(raw)
+
     if (memories.length === 0) return;
 
-    // 4. save chunks first — contextualize each chunk before saving
-    // contextual retrieval: prepend session context to each chunk before embedding + BM25 indexing
-    // this makes retrieval accurate months later — no vague pronouns or references in the index
     const messages = Array.isArray(input)
       ? input
-      : [{ role: 'document', content: input }];
- 
-    // full conversation string — passed to _contextualizeChunk() as the whole document
-    const fullConversation = messages
-      .map(m => `${m.role}: ${m.content}`)
-      .join('\n');
- 
-    let anchorChunkId = null;
-    // per-message chunk id map — resolves fact.source_message_index → chunk_id
-    // so each fact links to the message it came from, not the session anchor
-    const messageIndexToChunkId = {};
+      : [{ role: 'document', content: input }]
+
+    const fullConversation = messages.map(m => `${m.role}: ${m.content}`).join('\n')
+
+    let anchorChunkId = null
+    const messageIndexToChunkId = {}
 
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
-      const message = messages[messageIndex];
-      if (!message.content?.trim()) continue;
+      const message = messages[messageIndex]
+      if (!message.content?.trim()) continue
 
       const rawChunk = Array.isArray(input)
         ? `${message.role}: ${message.content}`
-        : message.content;
+        : message.content
 
-      // contextualize chunk if enabled — one LLM call per chunk
       const chunkContent = this.contextualRetrieval
         ? await this._contextualizeChunk(rawChunk, fullConversation)
-        : rawChunk;
+        : rawChunk
 
-      this.storage.saveChunk(chunkContent);
+      this.storage.saveChunk(chunkContent)
+      const chunkId = this.storage.getLastChunkId()
 
-      const chunkId = this.storage.getLastChunkId();
       if (chunkId) {
-        // first chunk of this add() call is the session anchor
-        if (anchorChunkId === null) anchorChunkId = chunkId;
-        messageIndexToChunkId[messageIndex] = chunkId;
-        const vector = await this.embedder(chunkContent);
-        this.storage.saveChunkEmbedding(chunkId, vector);
+        if (anchorChunkId === null) anchorChunkId = chunkId
+        messageIndexToChunkId[messageIndex] = chunkId
+        const vector = await this.embedder(chunkContent)
+        this.storage.saveChunkEmbedding(chunkId, vector)
       }
     }
- 
-    // 5. process each memory
 
-    // savedThisBatch tracks embeddings saved in this add() call for within-batch dedup
-    const savedThisBatch = [];
-    const DEDUP_THRESHOLD = 0.92;
+    const savedThisBatch = []
+    const DEDUP_THRESHOLD = 0.92
 
     for (const mem of memories) {
       const {
         key,
         value,
-        memory_type = 'fact',
-        event_date  = null,
-        expires_at  = null,
-        context     = null,
+        memory_type          = 'fact',
+        event_date           = null,
+        expires_at           = null,
+        context              = null,
         source_message_index = null,
-      } = mem;
+      } = mem
 
-      if (!key || !value) continue;
+      if (!key || !value) continue
 
-      // resolve chunk_id from extractor-provided source_message_index
-      // untrusted — validate index is present in the map, else fall back to anchor
       const resolvedChunkId = (
         Number.isInteger(source_message_index) &&
         messageIndexToChunkId[source_message_index] != null
       )
         ? messageIndexToChunkId[source_message_index]
-        : anchorChunkId;
- 
-      // embed value only — not `${key}: ${value}`, key adds noise
-      const embedding = await this.embedder(value);
+        : anchorChunkId
 
-      // within-batch dedup — skip if too similar to something already saved this call
+      const embedding = await this.embedder(value)
+
       const isDuplicate = savedThisBatch.some(
         saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
-      );
-      if (isDuplicate) continue;
- 
-      // preferences — use cosine similarity to find existing ones, not key match
-      // LLMs are not deterministic so the key will vary across calls
+      )
+      if (isDuplicate) continue
+
       if (memory_type === 'preference') {
-        const strengthened = this._strengthenPreference(key, value, embedding, documentDate);
-        if (strengthened) continue;
+        const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
+        if (strengthened) continue
       }
- 
-      // detect relationship to existing memories before inserting
-      // facts and episodes can contradict, extend, or derive from existing memories
-      // preferences are always inserted as new — strengthening handled above
+
       const relationship = (memory_type === 'fact' || memory_type === 'episode')
         ? await this._detectRelationship(mem, embedding, documentDate)
-        : { type: 'NEW', relatedTo: null };
- 
-      // save fact — chunk_id links to the source session anchor
+        : { type: 'NEW', relatedTo: null }
+
       const factId = this.storage.saveFact(key, value, {
         memory_type,
         document_date:   documentDate,
@@ -175,30 +134,18 @@ export class Memory {
         superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
         chunk_id:        resolvedChunkId,
         metadata:        JSON.stringify(context ? { context } : {}),
-      });
- 
-      // if UPDATES — mark old fact as superseded now that we have the new id
-      if (relationship.type === 'UPDATES' && relationship.relatedTo) {
-        this.storage.supersedeFact(relationship.relatedTo, factId);
-      }
- 
-      // save embedding keyed by fact_id — each version gets its own embedding row
-      this.storage.saveEmbedding(factId, embedding);
+      })
 
-      // track this embedding for within-batch dedup
-      savedThisBatch.push(embedding);
+      if (relationship.type === 'UPDATES' && relationship.relatedTo) {
+        this.storage.supersedeFact(relationship.relatedTo, factId)
+      }
+
+      this.storage.saveEmbedding(factId, embedding)
+      savedThisBatch.push(embedding)
     }
 
-    // auto-evolve entityContext from accumulated profile
-    // pass documentDate as asOf — profile computed relative to session date, not today
-    // ensures episodes and recent facts are correctly classified for this session
-    const { profile } = await this.getProfile({ asOf: documentDate });
-
-    const known = [
-      ...profile.static,   // preferences + facts older than 7 days relative to session
-      ...profile.dynamic,  // recent facts + current episodes relative to session
-    ].slice(0, 20)
-
+    const { profile } = await this.getProfile({ asOf: documentDate })
+    const known = [...profile.static, ...profile.dynamic].slice(0, 20)
     if (known.length > 0) {
       this.entityContext = `Known facts about this user: ${known.join('. ')}.`
     }
