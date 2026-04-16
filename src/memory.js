@@ -41,29 +41,22 @@ export class Memory {
     const documentDate  = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
     const entityContext = opts.entityContext ?? this.entityContext;
 
-    const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
-    const inputVector = await this.embedder(inputText)
-    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
-      .filter(f => f.memory_type !== 'preference')
-
-    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
-    const raw      = await this.extractor(prompt)
-    const memories = this._parseExtraction(raw)
-
-    if (memories.length === 0) return;
-
+    // 1. Normalize input into messages array
     const messages = Array.isArray(input)
       ? input
       : [{ role: 'document', content: input }]
 
     const fullConversation = messages.map(m => `${m.role}: ${m.content}`).join('\n')
 
+    // 2. ALWAYS save chunks first — they are the raw record, independent of extraction
     let anchorChunkId = null
     const messageIndexToChunkId = {}
+    const messageIndexToRole = {}
 
     for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
       const message = messages[messageIndex]
       if (!message.content?.trim()) continue
+      messageIndexToRole[messageIndex] = message.role  // 'user' or 'assistant'
 
       const rawChunk = Array.isArray(input)
         ? `${message.role}: ${message.content}`
@@ -73,7 +66,7 @@ export class Memory {
         ? await this._contextualizeChunk(rawChunk, fullConversation)
         : rawChunk
 
-      this.storage.saveChunk(chunkContent)
+      this.storage.saveChunk(chunkContent, null, message.role)
       const chunkId = this.storage.getLastChunkId()
 
       if (chunkId) {
@@ -84,6 +77,26 @@ export class Memory {
       }
     }
 
+    // 3. Now run extraction — if it returns empty, chunks are already safe
+    const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
+    const inputVector = await this.embedder(inputText)
+    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
+      .filter(f => f.memory_type !== 'preference')
+
+    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
+    const raw      = await this.extractor(prompt)
+    const memories = this._parseExtraction(raw)
+
+    if (memories.length === 0) {
+      const inputPreview = (Array.isArray(input)
+        ? input.map(m => m.content).join(' ')
+        : input
+      ).slice(0, 300)
+      console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${inputPreview}`)
+      return { chunksStored: Object.keys(messageIndexToChunkId).length, factsStored: 0 }
+    }
+
+    // 4. Save facts (existing logic, unchanged)
     const savedThisBatch = []
     const DEDUP_THRESHOLD = 0.92
 
@@ -99,6 +112,14 @@ export class Memory {
       } = mem
 
       if (!key || !value) continue
+
+      // derive source_role from message index — deterministic, no LLM needed
+      const source_role = (
+        Number.isInteger(source_message_index) &&
+        messageIndexToRole[source_message_index] != null
+      )
+        ? messageIndexToRole[source_message_index]
+        : null
 
       const resolvedChunkId = (
         Number.isInteger(source_message_index) &&
@@ -133,6 +154,7 @@ export class Memory {
         related_to:      relationship.relatedTo,
         superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
         chunk_id:        resolvedChunkId,
+        source_role,
         metadata:        JSON.stringify(context ? { context } : {}),
       })
 
@@ -147,8 +169,10 @@ export class Memory {
     const { profile } = await this.getProfile({ asOf: documentDate })
     const known = [...profile.static, ...profile.dynamic].slice(0, 20)
     if (known.length > 0) {
-      this.entityContext = `Known facts about this user: ${known.join('. ')}.`
+      this.entityContext = `Prior context: ${known.join('. ')}.`
     }
+
+    return { chunksStored: Object.keys(messageIndexToChunkId).length, factsStored: savedThisBatch.length }
   }
 
   // ── Search ─────────────────────────────────────────
@@ -212,6 +236,7 @@ export class Memory {
       document_date: fact.document_date,
       event_date:    fact.event_date,
       relation_type: fact.relation_type,
+      source_role:   fact.source_role,
     }));
   }
 
@@ -576,7 +601,7 @@ Give a short succinct context (1-2 sentences) to situate this message within the
   // returns { type: 'UPDATES'|'EXTENDS'|'NEW', relatedTo: id|null }
   // DERIVES is handled separately by runDerivations() — not classified here
   async _detectRelationship(mem, embedding, documentDate) {
-    const { key, value, memory_type, event_date } = mem;
+    const { key, value, memory_type, event_date, source_role } = mem;
  
     // step 1a — same key facts (strong signal regardless of embedding similarity)
     const sameKeyFacts = this.storage.db.prepare(`
@@ -605,23 +630,35 @@ Give a short succinct context (1-2 sentences) to situate this message within the
     // step 2 — LLM classifies the relationship
     const prompt = `You are a memory relationship classifier.
  
-New memory: "${value}" [${memory_type}] [recorded: ${documentDate ?? 'unknown'}]${event_date ? ` [event: ${event_date}]` : ''}
+New memory: "${value}" [${memory_type}] [source: ${source_role ?? 'user'}] [recorded: ${documentDate ?? 'unknown'}]${event_date ? ` [event: ${event_date}]` : ''}
  
 Existing memories:
-${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}" [${f.memory_type}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`).join('\n')}
+${candidates.map((f, i) => `${i + 1}. [ID:${f.id}] "${f.value}" [${f.memory_type}] [source: ${f.source_role ?? 'user'}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`).join('\n')}
  
 Classify the relationship between the new memory and the MOST RELEVANT existing memory.
 Priority order: UPDATES > EXTENDS > NEW
  
 UPDATES — new memory contradicts and replaces an existing one:
-  CRITICAL: These attributes are SINGULAR — a person can only have ONE value at a time.
-  When the value changes, it is ALWAYS UPDATES, never EXTENDS:
+  CRITICAL: Only apply UPDATES to SINGULAR attributes — concepts where a person
+  can only have ONE value at a time:
   - Employer:  "works at Stripe" UPDATES "works at Google"
   - Location:  "lives in Mumbai" UPDATES "lives in Bangalore"
   - Role/Title: "is a PM" UPDATES "is a software engineer"
-  - Relationship status, education, any other singular attribute
- 
-  Even if the wording is different, if it describes the SAME attribute with a DIFFERENT value → UPDATES.
+  - Relationship status, education level, any other singular attribute
+
+  Do NOT use UPDATES for list-like or additive concepts:
+  - Recommendations: a second restaurant recommendation does not replace the first
+  - Suggestions, options, alternatives: each is independent
+  - Steps, instructions, checklist items: each is additive
+  - Assistant-provided examples: each example is a separate fact
+
+  For assistant facts (source_role=assistant): default to EXTENDS or NEW
+  unless the same specific item is explicitly contradicted.
+  "The assistant recommended Armando" does NOT update "The assistant recommended Roscioli"
+  — these are two separate recommendations.
+
+  Even if the wording is different, if it describes the SAME attribute with a
+  DIFFERENT value AND the attribute is singular → UPDATES.
   "Alex recently joined Stripe as PM" UPDATES "Alex works at Google as engineer"
  
 EXTENDS — new memory adds detail WITHOUT replacing an existing one:

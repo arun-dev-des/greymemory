@@ -44,7 +44,8 @@ export class Storage {
         related_to    INTEGER,
         chunk_id      INTEGER,
         confidence    REAL    NOT NULL DEFAULT 1.0,
-        metadata      TEXT    NOT NULL DEFAULT '{}'
+        metadata      TEXT    NOT NULL DEFAULT '{}',
+        source_role   TEXT
       );
 
       CREATE TABLE IF NOT EXISTS embeddings (
@@ -61,6 +62,7 @@ export class Storage {
         content     TEXT NOT NULL,
         container   TEXT NOT NULL DEFAULT 'default',
         session_id  TEXT,
+        source_role TEXT,
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
@@ -313,7 +315,7 @@ export class Storage {
     );
  
     const columns = [
-       ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
+      ['memory_type',     "TEXT    NOT NULL DEFAULT 'fact'"],
       ['document_date',   'TEXT'],
       ['event_date',      'TEXT'],
       ['expires_at',      'TEXT'],
@@ -325,12 +327,21 @@ export class Storage {
       ['chunk_id',        'INTEGER'],
       ['confidence',      'REAL    NOT NULL DEFAULT 1.0'],
       ['metadata',        "TEXT    NOT NULL DEFAULT '{}'"],
+      ['source_role',     'TEXT'],
     ];
  
     for (const [col, def] of columns) {
       if (!existing.has(col)) {
         this.db.exec(`ALTER TABLE facts ADD COLUMN ${col} ${def}`);
       }
+    }
+
+    // add source_role to chunks if missing
+    const chunkCols = new Set(
+      this.db.pragma('table_info(chunks)').map(c => c.name)
+    )
+    if (!chunkCols.has('source_role')) {
+      this.db.exec(`ALTER TABLE chunks ADD COLUMN source_role TEXT`)
     }
 
     // backfill defaults on existing v0.2.x rows
@@ -400,7 +411,7 @@ export class Storage {
           memory_type, confidence,
           document_date, event_date, expires_at,
           is_latest, superseded_by, superseded_from,
-          relation_type, related_to, chunk_id,
+          relation_type, related_to, chunk_id, source_role,
           metadata, created_at, updated_at
         FROM facts
         WHERE container = ?
@@ -428,6 +439,7 @@ export class Storage {
       related_to      = null,
       superseded_from = null,
       chunk_id        = null,
+      source_role     = null,
       metadata        = '{}',
     } = opts;
  
@@ -435,11 +447,11 @@ export class Storage {
       INSERT INTO facts
         (key, value, container, memory_type, document_date, event_date,
          expires_at, is_latest, confidence, relation_type, related_to,
-         superseded_from, chunk_id, metadata, updated_at)
+         superseded_from, chunk_id, source_role, metadata, updated_at)
       VALUES
         (@key, @value, @container, @memory_type, @document_date, @event_date,
          @expires_at, 1, @confidence, @relation_type, @related_to,
-         @superseded_from, @chunk_id, @metadata, datetime('now'))
+         @superseded_from, @chunk_id, @source_role, @metadata, datetime('now'))
     `).run({
       key,
       value:           typeof value === 'string' ? value : JSON.stringify(value),
@@ -453,6 +465,7 @@ export class Storage {
       related_to,
       superseded_from,
       chunk_id,
+      source_role,
       metadata:        typeof metadata === 'string' ? metadata : JSON.stringify(metadata),
     });
  
@@ -470,11 +483,11 @@ export class Storage {
 
   // ── Chunks ─────────────────────────────────────────
 
-  saveChunk(content, sessionId = null) {
+  saveChunk(content, sessionId = null, sourceRole = null) {
     this.db.prepare(`
-      INSERT INTO chunks (content, container, session_id)
-      VALUES (?, ?, ?)
-    `).run(content, this.container, sessionId);
+      INSERT INTO chunks (content, container, session_id, source_role)
+      VALUES (?, ?, ?, ?)
+    `).run(content, this.container, sessionId, sourceRole);
   }
 
   getLastChunkId() {
@@ -537,6 +550,7 @@ export class Storage {
         f.event_date,
         f.relation_type,
         f.chunk_id,
+        f.source_role,
         bm25(facts_fts) AS score
       FROM facts_fts
       JOIN facts f ON facts_fts.rowid = f.id
@@ -558,6 +572,7 @@ export class Storage {
       event_date:    r.event_date,
       relation_type: r.relation_type,
       chunk_id:      r.chunk_id,
+      source_role: r.source_role,
       rank:          index + 1,
       score:         r.score,
     }));
@@ -586,7 +601,8 @@ export class Storage {
     // join on fact_id — each embedding row points to a specific fact version
     const rows = this.db.prepare(`
       SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence,
-            f.document_date, f.event_date, f.relation_type, f.chunk_id
+            f.document_date, f.event_date, f.relation_type, f.chunk_id,
+            f.source_role
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
       WHERE e.container = @container
@@ -605,6 +621,7 @@ export class Storage {
         event_date:    row.event_date,
         relation_type: row.relation_type,
         chunk_id:      row.chunk_id,
+        source_role: row.source_role,
         score:         this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)
@@ -616,6 +633,9 @@ export class Storage {
   //RRF fusion method
   hybridSearch(query, queryVector, container, topN = 5, asOf = null) {
     const k = 60;
+
+    // detect if query is asking about something the assistant said
+    const isAssistantQuery = /\b(you said|you mentioned|you recommended|you suggested|you told|you explained|you stated|what did you|which did you|remind me what you)\b/i.test(query)
 
     // search facts only — chunks are attached at retrieval, not ranked separately
     let bm25Results = [];
@@ -633,8 +653,17 @@ export class Storage {
       if (!scores[key]) {
         scores[key] = { ...fact, rrf: 0, sources: [] };
       }
-      // confidence weighting for preferences — higher confidence = higher score
-      const weight = fact.memory_type === 'preference' ? (fact.confidence ?? 1.0) : 1.0;
+
+      // base weight — preferences weighted by confidence
+      let weight = fact.memory_type === 'preference'
+        ? (fact.confidence ?? 1.0)
+        : 1.0
+
+      // boost assistant facts when query is about what the assistant said
+      if (isAssistantQuery && fact.source_role === 'assistant') {
+        weight *= 2.0
+      }
+
       scores[key].rrf += (1 / (k + rank)) * weight;
       scores[key].sources.push(source);
     };

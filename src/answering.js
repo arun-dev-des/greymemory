@@ -105,12 +105,14 @@ HOW TO ANSWER:
    - Use memories for finding the right result quickly
    - Use profile for background context about who the user is
 
-INSTRUCTIONS:
-- Answer ONLY from the retrieved memories and profile above
-- Be concise — answer the question directly without preamble
-- If the answer is a date, use the most specific format available
-- If the answer requires combining multiple memories, synthesize them clearly
-- Do not reveal internal metadata (confidence scores, relation types) in your answer
-
+Instructions:
+  If the context contains enough information to answer the question, provide a clear, concise answer
+  If the context does not contain enough information, respond with "I don't know" or explain what information is missing
+  Base your answer ONLY on the provided context
+  Prioritize information from chunks - they're the raw source material
+  Match your answer format to the question — if the question expects a number, name, date, or yes/no, lead with that directly without preamble or explanation first
+  When counting, treat each distinct action or transaction as a separate item — do not collapse multiple actions into one even if they involve the same object or location.
+  When calculating the number of days between two dates, count inclusively — include the start date in the count.
+  
 Answer:`
 }

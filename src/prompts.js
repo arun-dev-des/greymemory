@@ -34,7 +34,7 @@ Apply strictly. Do not extract content marked as skip.
 ${entityContext ? `
 --- ENTITY CONTEXT ---
 ${entityContext}
-Use this to resolve ambiguous references and focus extraction.
+Use this to resolve ambiguous references in the conversation.
 ---` : ''}
 
 STEP 1 — RESOLVE ALL AMBIGUITY
@@ -101,6 +101,11 @@ Always use: the actual name, place, or thing being referred to.
 
 STEP 2 — CLASSIFY AND EXTRACT ATOMIC MEMORIES
 
+Extract memories from both user and assistant messages.
+Assistant responses may contain factual data, structured outputs, schedules,
+lists, or tables created on behalf of the user — treat these as extractable
+facts about the user's context, not as generic information.
+
 Memory types:
 
 FACT: stable information that persists until contradicted
@@ -115,6 +120,44 @@ EPISODE: time-bound events that expire naturally
   - "Alex has an exam tomorrow" → expires after tomorrow
   - "Meeting with Sarah at 3pm today" → expires after today
 
+PROVENANCE RULE:
+When extracting from an assistant message, the value sentence MUST make
+the assistant the explicit subject of the action.
+
+  BAD:  "Roscioli is a good restaurant for romantic dinners in Rome"
+  GOOD: "The assistant recommended Roscioli for romantic dinners in Rome"
+
+  BAD:  "Pennsylvania requires fracking companies to monitor groundwater quality"
+  GOOD: "The assistant stated that Pennsylvania requires fracking companies to
+         monitor groundwater quality at nearby wells before and after drilling"
+
+  BAD:  "The meeting schedule is Monday 10am, Wednesday 2pm"
+  GOOD: "The assistant created a meeting schedule: Monday 10am, Wednesday 2pm"
+
+This ensures retrieval queries like "what did you recommend?" or "what did
+you say about X?" match strongly against stored facts.
+
+ASSISTANT CONTENT RULE:
+Only extract from assistant messages when ALL of these are true:
+  1. The user explicitly asked for a specific recommendation, name, or fact
+  2. The assistant gave a direct, specific named answer (not general explanation)
+  3. The user is likely to ask "what did you say about X?" later
+
+Do not extract generic explanatory prose or hedged statements. Extract only
+the concrete claim with its specific named entities.
+
+Use the PROVENANCE RULE to make the assistant the subject:
+  "The assistant recommended X"
+  "The assistant explained that Y"
+  "The assistant stated Z"
+
+Example:
+  User: "Can you recommend a good Italian restaurant in [city]?"
+  Assistant: "[Restaurant name] is excellent for [meal type] — their
+              [dish] is outstanding."
+  → Extract: "The assistant recommended [Restaurant name] in [city] for
+              [meal type], noting their [dish]."
+
 Rules:
 1. CRITICAL: ONE fact per memory object. Never combine multiple facts into one.
 
@@ -127,11 +170,41 @@ Rules:
    weak embeddings that match nothing well. Atomic facts produce strong, precise
    embeddings that surface exactly when needed.
 
-2. Each memory must be completely self-contained — apply the stranger test
-3. Include WHO, WHAT, WHEN where available
-4. Be specific not vague
-5. Apply filter instructions strictly
-6. source_message_index: 0-based index of the message this fact was extracted from.
+2. Extract factual data from tables and structured lists in assistant responses,
+   especially when the user requested that data.
+   For each table:
+     - First read the column headers to understand what each column represents
+     - Then for each row, extract one fact combining the row identifier
+       with each column header and its corresponding cell value,
+       expressed as a natural language sentence.
+     - When the table appears in an ASSISTANT message, prefix with
+       "The assistant provided..." so the source is retrievable.
+   Do not extract the table schema, headers, or structure as standalone facts.
+
+   ASSISTANT TABLE EXAMPLE:
+     | Day       | Col A      | Col B      |
+     | Sunday    | Alice      | Bob        |
+     | Monday    | Dave       | Eve        |
+
+   → "The assistant provided a schedule where on Sunday, Col A = Alice, Col B = Bob."
+   → "The assistant provided a schedule where on Monday, Col A = Dave, Col B = Eve."
+
+   USER TABLE EXAMPLE (user shared data):
+   → "On Sunday, Col A = Alice, Col B = Bob."
+
+   Each row becomes one separate fact. Never combine multiple rows into one fact.
+   When multiple versions of the same table exist, extract ONLY from the
+   most recent final version with actual values — ignore earlier drafts.
+
+3. When a single user statement contains multiple distinct pending actions,
+   extract each action as a separate episode even if they involve the same
+   item or location.
+
+4. Each memory must be completely self-contained — apply the stranger test
+5. Include WHO, WHAT, WHEN where available
+6. Be specific not vague
+7. Apply filter instructions strictly
+8. source_message_index: 0-based index of the message this fact was extracted from.
    Use the index of the MOST SPECIFIC message that contains this information.
    If derived from multiple messages: use the message that contains the key evidence.
    If input is a plain DOCUMENT (not a conversation array), or if uncertain: null
