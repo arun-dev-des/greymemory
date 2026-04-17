@@ -634,46 +634,96 @@ export class Storage {
   hybridSearch(query, queryVector, container, topN = 5, asOf = null) {
     const k = 60;
 
-    // detect if query is asking about something the assistant said
-    const isAssistantQuery = /\b(you said|you mentioned|you recommended|you suggested|you told|you explained|you stated|what did you|which did you|remind me what you)\b/i.test(query)
+    // TODO: handle shared chat content (e.g. user pastes a GPT conversation)
+    // current assumption: all input.role='assistant' refers to greymemory's assistant
+    // fix: add sourceType option to add() — sourceType:'shared_chat' changes extraction framing
 
-    // search facts only — chunks are attached at retrieval, not ranked separately
+    // detect if query is asking about something the assistant said
+    const isAssistantQuery = /\b(you say|you said|you mentioned|you recommended|you suggested|you told|you explained|you stated|did you say|did you mention|did you recommend|did you suggest|what did you|which did you|remind me what you|remind me which|remind me of the|can you remind|could you remind|you gave|you provided|you described|you listed|you showed)\b/i.test(query)
+
+    // ── fact-level search ──────────────────────────────────────
     let bm25Results = [];
     try {
       bm25Results = this.bm25Search(query, container, topN * 2, asOf);
     } catch (e) {}
 
     const vectorResults = this.vectorSearch(queryVector, container, topN * 2, asOf);
- 
-    // RRF fusion — keyed by fact id to preserve full fact data
-    const scores = {};
- 
-    const addScore = (fact, rank, source) => {
-      const key = fact.id;
-      if (!scores[key]) {
-        scores[key] = { ...fact, rrf: 0, sources: [] };
-      }
 
-      // base weight — preferences weighted by confidence
+    // ── chunk-level search (fallback for sessions with no extracted facts) ──
+    const chunkBm25    = this.chunkBm25Search(query, container, topN * 2)
+    const chunkVector  = this.chunkVectorSearch(queryVector, container, topN * 2)
+
+    // RRF fusion — keyed by fact id to preserve full fact data
+    // RRF fusion — namespace keys to avoid id collisions between facts and chunks
+    const scores = {}
+
+    const addFactScore = (fact, rank, source) => {
+      const key = `fact_${fact.id}`
+      if (!scores[key]) {
+        scores[key] = {
+          ...fact,
+          _type:    'fact',
+          _key:     key,
+          rrf:      0,
+          sources:  [],
+        }
+      }
       let weight = fact.memory_type === 'preference'
         ? (fact.confidence ?? 1.0)
         : 1.0
-
-      // boost assistant facts when query is about what the assistant said
       if (isAssistantQuery && fact.source_role === 'assistant') {
         weight *= 2.0
       }
+      scores[key].rrf += (1 / (k + rank)) * weight
+      scores[key].sources.push(source)
+    }
 
-      scores[key].rrf += (1 / (k + rank)) * weight;
-      scores[key].sources.push(source);
-    };
+    const addChunkScore = (chunk, rank, source) => {
+      const key = `chunk_${chunk.chunk_id}`
+      if (!scores[key]) {
+        scores[key] = {
+          chunk_id:    chunk.chunk_id,
+          content:     chunk.content,
+          source_role: chunk.source_role,
+          created_at:  chunk.created_at,
+          _type:       'chunk',
+          _key:        key,
+          rrf:         0,
+          sources:     [],
+        }
+      }
+      // chunks get 0.8x weight — facts preferred when both exist for same content
+      let weight = 1.0
+      if (isAssistantQuery && chunk.source_role === 'assistant') {
+        weight *= 2.0
+      }
+      scores[key].rrf += (1 / (k + rank)) * weight
+      scores[key].sources.push(source)
+    }
  
-    bm25Results.forEach(r  => addScore(r, r.rank, 'bm25'));
-    vectorResults.forEach(r => addScore(r, r.rank, 'vector'));
+    bm25Results.forEach(r   => addFactScore(r, r.rank, 'bm25'))
+    vectorResults.forEach(r => addFactScore(r, r.rank, 'vector'))
+    chunkBm25.forEach(r     => addChunkScore(r, r.rank, 'chunk_bm25'))
+    chunkVector.forEach(r   => addChunkScore(r, r.rank, 'chunk_vector'))
  
-    return Object.values(scores)
+    // sort by RRF score
+    const ranked = Object.values(scores)
       .sort((a, b) => b.rrf - a.rrf)
-      .slice(0, topN);
+
+    // deduplicate: if a fact already covers a chunk (via fact.chunk_id),
+    // remove the standalone chunk result — the fact version is richer
+    const coveredChunkIds = new Set(
+      ranked
+        .filter(r => r._type === 'fact' && r.chunk_id)
+        .map(r => r.chunk_id)
+    )
+
+    const deduped = ranked.filter(r => {
+      if (r._type === 'chunk' && coveredChunkIds.has(r.chunk_id)) return false
+      return true
+    })
+
+    return deduped.slice(0, topN)
   }
 
   // get chunk using id
@@ -683,6 +733,60 @@ export class Storage {
       SELECT content FROM chunks WHERE id = ?
     `).get(chunkId);
     return row?.content ?? null;
+  }
+
+  // ── Chunk Search ───────────────────────────────────
+
+  chunkBm25Search(query, container, topN = 10) {
+    const ftsQuery = query
+      .trim()
+      .split(/\s+/)
+      .join(' OR ')
+
+    let rows = []
+    try {
+      rows = this.db.prepare(`
+        SELECT c.id AS chunk_id, c.content, c.source_role, c.created_at,
+               bm25(chunks_fts) AS score
+        FROM chunks_fts
+        JOIN chunks c ON chunks_fts.rowid = c.id
+        WHERE chunks_fts MATCH @query
+          AND c.container = @container
+        ORDER BY score
+        LIMIT @topN
+      `).all({ query: ftsQuery, container, topN })
+    } catch {}
+
+    return rows.map((r, index) => ({
+      chunk_id:    r.chunk_id,
+      content:     r.content,
+      source_role: r.source_role,
+      created_at:  r.created_at,
+      rank:        index + 1,
+      score:       r.score,
+    }))
+  }
+
+  chunkVectorSearch(queryVector, container, topN = 10) {
+    const rows = this.db.prepare(`
+      SELECT ce.chunk_id, ce.vector, c.content, c.source_role, c.created_at
+      FROM chunk_embeddings ce
+      JOIN chunks c ON ce.chunk_id = c.id
+      WHERE ce.container = @container
+    `).all({ container })
+
+    const scored = rows
+      .map(row => ({
+        chunk_id:    row.chunk_id,
+        content:     row.content,
+        source_role: row.source_role,
+        created_at:  row.created_at,
+        score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
+      }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, topN)
+
+    return scored.map((r, index) => ({ ...r, rank: index + 1 }))
   }
 
   _cosineSimilarity(a, b) {

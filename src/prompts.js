@@ -89,15 +89,54 @@ Apply the stranger test to every memory before extracting it:
   GOOD: "Alex started at Stripe in March 2026"
         PASSES.
 
+-- ASSISTANT EXAMPLES --
+  BAD:  "[Restaurant name] is good for [meal type]"
+        Stranger asks: Who said this? Recommended by whom? FAILS.
+  GOOD: "The assistant recommended [Restaurant name] in [city] for [meal type]."
+        Source is clear. PASSES.
+
+  BAD:  "[State] requires companies to follow [regulation]"
+        Stranger asks: Who stated this? In what context? FAILS.
+  GOOD: "The assistant stated that [State] requires companies to [regulation]."
+        Source and context clear. PASSES.
+
+  BAD:  "[Person] is assigned to [shift] on [day]"
+        Stranger asks: Where does this come from? FAILS.
+  GOOD: "The assistant provided a schedule where [Person] works [shift] on [day]."
+        Source clear. PASSES.
+
+  BAD:  "[Product] is compatible with [device]"
+        Stranger asks: Who said this? Fact or recommendation? FAILS.
+  GOOD: "The assistant recommended [Product] as compatible with [device]."
+        Source clear. PASSES.
+
 Resolve all of the following before extracting:
 - Pronouns → actual names
 - Vague references → specific names and places
 - Relative dates → approximate real dates (session date is ${documentDate})
 - Implicit subjects → explicit
 - Incomplete descriptions → add missing context from the conversation
+- Assistant statements → make the assistant the explicit subject
 
 Never use: he, she, they, it, there, here, that, this, the company, the team, the project
 Always use: the actual name, place, or thing being referred to.
+For assistant messages: always use "The assistant recommended/stated/explained/provided..."
+
+PROVENANCE RULE:
+When extracting from an assistant message, the value sentence MUST make
+the assistant the explicit subject of the action.
+
+  BAD:  "[X] is a good option for [purpose]"
+  GOOD: "The assistant recommended [X] for [purpose]"
+
+  BAD:  "[Location] requires [regulation]"
+  GOOD: "The assistant stated that [Location] requires [regulation]"
+
+  BAD:  "The schedule has [Person] on [shift]"
+  GOOD: "The assistant provided a schedule where [Person] works [shift]"
+
+This ensures retrieval queries like "what did you recommend?" or "what did
+you say about X?" match strongly against stored facts.
 
 STEP 2 — CLASSIFY AND EXTRACT ATOMIC MEMORIES
 
@@ -120,31 +159,18 @@ EPISODE: time-bound events that expire naturally
   - "Alex has an exam tomorrow" → expires after tomorrow
   - "Meeting with Sarah at 3pm today" → expires after today
 
-PROVENANCE RULE:
-When extracting from an assistant message, the value sentence MUST make
-the assistant the explicit subject of the action.
-
-  BAD:  "Roscioli is a good restaurant for romantic dinners in Rome"
-  GOOD: "The assistant recommended Roscioli for romantic dinners in Rome"
-
-  BAD:  "Pennsylvania requires fracking companies to monitor groundwater quality"
-  GOOD: "The assistant stated that Pennsylvania requires fracking companies to
-         monitor groundwater quality at nearby wells before and after drilling"
-
-  BAD:  "The meeting schedule is Monday 10am, Wednesday 2pm"
-  GOOD: "The assistant created a meeting schedule: Monday 10am, Wednesday 2pm"
-
-This ensures retrieval queries like "what did you recommend?" or "what did
-you say about X?" match strongly against stored facts.
-
 ASSISTANT CONTENT RULE:
-Only extract from assistant messages when ALL of these are true:
-  1. The user explicitly asked for a specific recommendation, name, or fact
-  2. The assistant gave a direct, specific named answer (not general explanation)
-  3. The user is likely to ask "what did you say about X?" later
+When the assistant provides specific factual content — names, numbers,
+recipes, regulations, recommendations, schedules, lists — extract
+the concrete claims as facts using the PROVENANCE RULE.
+
+If the entire conversation is a generic Q&A with no user-specific context,
+extract the 2-3 most specific named claims from the assistant's response.
+Do not return an empty array for a conversation that contains substantive
+factual content.
 
 Do not extract generic explanatory prose or hedged statements. Extract only
-the concrete claim with its specific named entities.
+the concrete claims with their specific named entities.
 
 Use the PROVENANCE RULE to make the assistant the subject:
   "The assistant recommended X"
@@ -157,7 +183,7 @@ Example:
               [dish] is outstanding."
   → Extract: "The assistant recommended [Restaurant name] in [city] for
               [meal type], noting their [dish]."
-
+              
 Rules:
 1. CRITICAL: ONE fact per memory object. Never combine multiple facts into one.
 

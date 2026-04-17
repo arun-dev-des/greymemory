@@ -207,37 +207,53 @@ export class Memory {
  
     // apply filters
     let filtered = results;
- 
+
     if (memoryTypes) {
-      filtered = filtered.filter(r => memoryTypes.includes(r.memory_type));
+      filtered = filtered.filter(r => r._type === 'chunk' || memoryTypes.includes(r.memory_type));
     }
     if (!includeHistory && !asOfNorm) {
-      filtered = filtered.filter(r => r.is_latest !== 0)
+      filtered = filtered.filter(r => r._type === 'chunk' || r.is_latest !== 0)
     }
     if (!includeExpired) {
       const expiryCutoff = asOfNorm
         ? asOfNorm.slice(0, 10)
         : new Date().toISOString().slice(0, 10);
-      filtered = filtered.filter(r => !r.expires_at || r.expires_at > expiryCutoff);
+      filtered = filtered.filter(r => r._type === 'chunk' || !r.expires_at || r.expires_at > expiryCutoff);
     }
     if (afterDate) {
-      filtered = filtered.filter(r => r.event_date && r.event_date >= afterDate);
+      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date >= afterDate));
     }
     if (beforeDate) {
-      filtered = filtered.filter(r => r.event_date && r.event_date <= beforeDate);
+      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= beforeDate));
     }
  
     // pair each fact with its source chunk — Supermemory's dual retrieval pattern
-    return filtered.slice(0, topN).map(fact => ({
-      memory:        fact.value,
-      chunk:         this.storage.getChunk(fact.chunk_id),
-      memory_type:   fact.memory_type,
-      confidence:    fact.confidence,
-      document_date: fact.document_date,
-      event_date:    fact.event_date,
-      relation_type: fact.relation_type,
-      source_role:   fact.source_role,
-    }));
+    return filtered.slice(0, topN).map(result => {
+      if (result._type === 'chunk') {
+        // chunk-only result — no extracted fact exists for this content
+        return {
+          memory:        null,
+          chunk:         result.content,
+          memory_type:   null,
+          confidence:    null,
+          document_date: result.created_at?.slice(0, 10) ?? null,
+          event_date:    null,
+          relation_type: null,
+          source_role:   result.source_role ?? null,
+        }
+      }
+      // normal fact result
+      return {
+        memory:        result.value,
+        chunk:         this.storage.getChunk(result.chunk_id),
+        memory_type:   result.memory_type,
+        confidence:    result.confidence,
+        document_date: result.document_date,
+        event_date:    result.event_date,
+        relation_type: result.relation_type,
+        source_role:   result.source_role,
+      }
+    });
   }
 
   // ── Get Memories ──────────────────────────────────────
