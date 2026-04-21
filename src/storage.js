@@ -483,11 +483,11 @@ export class Storage {
 
   // ── Chunks ─────────────────────────────────────────
 
-  saveChunk(content, sessionId = null, sourceRole = null) {
+  saveChunk(content, sessionId = null, sourceRole = null, documentDate = null) {
     this.db.prepare(`
-      INSERT INTO chunks (content, container, session_id, source_role)
-      VALUES (?, ?, ?, ?)
-    `).run(content, this.container, sessionId, sourceRole);
+      INSERT INTO chunks (content, container, session_id, source_role, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(content, this.container, sessionId, sourceRole, documentDate ?? new Date().toISOString())
   }
 
   getLastChunkId() {

@@ -183,7 +183,22 @@ Example:
               [dish] is outstanding."
   → Extract: "The assistant recommended [Restaurant name] in [city] for
               [meal type], noting their [dish]."
-              
+
+STATE CHANGE RULE:
+When the user mentions a quantity, frequency, location, duration, or status
+that describes their CURRENT situation, ALWAYS extract it as a fact — even
+if stated casually mid-sentence as an aside.
+
+These are state changes that override earlier information:
+  - Counts: "I have 15 books now", "I've added 3 more to my collection"
+  - Durations: "I've been here for 6 months", "I spend about 3 hours a day"
+  - Frequencies: "I go 5 times a week now", "I switched to daily practice"
+  - Locations: "I moved my desk to the living room", "I keep them in the garage now"
+  - Statuses: "I switched to a new provider", "I'm using a different app now"
+
+Do not skip these because they appear inside a longer sentence about
+something else. The aside IS the important information.
+
 Rules:
 1. CRITICAL: ONE fact per memory object. Never combine multiple facts into one.
 

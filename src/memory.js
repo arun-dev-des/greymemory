@@ -66,7 +66,7 @@ export class Memory {
         ? await this._contextualizeChunk(rawChunk, fullConversation)
         : rawChunk
 
-      this.storage.saveChunk(chunkContent, null, message.role)
+      this.storage.saveChunk(chunkContent, null, message.role, documentDate)
       const chunkId = this.storage.getLastChunkId()
 
       if (chunkId) {

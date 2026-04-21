@@ -19,10 +19,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // ── config ─────────────────────────────────────────────────────────────────
 
 const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
-const PER_CATEGORY    = 5                            // questions per category
-const CATEGORY_FILTER = ['single-session-assistant'] // null = all categories
+const PER_CATEGORY    = 15                            // questions per category
+const CATEGORY_FILTER = ['knowledge-update'] // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
+const SKIP_INGEST     = true                        // true = skip ingestion, use existing DB
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -54,7 +55,7 @@ const extractor = async (prompt) => {
     },
     body: JSON.stringify({
       model:      'claude-haiku-4-5-20251001',
-      max_tokens: 6000,
+      max_tokens: 8192,
       messages:   [{ role: 'user', content: prompt }],
     }),
   })
@@ -136,7 +137,7 @@ Respond with ONLY "correct" or "incorrect".`,
 
 // ── answering prompt ───────────────────────────────────────────────────────
 
-function buildAnsweringPrompt({ question, questionDate, results, profile }) {
+function buildAnsweringPrompt({ question, questionDate, results }) {
   const retrievedContext = results.map((r, i) => {
     const lines = [`[${i + 1}]`]
     if (r.memory) lines.push(`Memory: ${r.memory}`)
@@ -149,17 +150,11 @@ function buildAnsweringPrompt({ question, questionDate, results, profile }) {
     return lines.join('\n')
   }).join('\n\n')
 
-  const profileSection = profile ? `
-Profile Data:
-  Static Profile: ${profile.static.join('. ') || '(none)'}
-  Dynamic Profile: ${profile.dynamic.join('. ') || '(none)'}
-` : ''
-
   return `You are a question-answering system. Based on the retrieved context below, answer the question.
 
 Question: ${question}
 Question Date: ${questionDate}
-${profileSection}
+
 Retrieved Context:
 ${retrievedContext || '(no memories retrieved)'}
 
@@ -178,10 +173,6 @@ Temporal Context (if present):
   documentDate: When the content was originally authored/written/said.
   eventDate: When the event/fact actually occurred or will occur.
 
-Profile Data (if present):
-  Static Profile: Permanent user characteristics (name, preferences, core identity)
-  Dynamic Profile: Recently added memories
-
 Instructions:
   Before answering, explicitly identify which memory or chunk contains the relevant
   information and note the exact value from it. Then use that noted value to construct
@@ -193,7 +184,7 @@ Instructions:
   Match your answer format to the question — number, name, date, or yes/no leads directly.
   When counting items or actions, treat each distinct action as a separate item.
   When calculating days between two dates, count inclusively — include the start date.
-  Do not reference result numbers in your answer
+  Do not reference result numbers in your answer.
 
 Answer:`
 }
@@ -317,7 +308,11 @@ if (QUESTION_ID) {
   // }
 
   // fixed set for reproducible comparison
-  const FIXED_IDS = ['fca762bc', '778164c6', '7a8d0b71']
+  const FIXED_IDS = [
+    "7a87bd0c","59524333","89941a93","b01defab","45dc21b6",
+    "2133c1b5","72e3ee87","6071bd76","a1eacc2a","852ce960",
+    "618f13b2","6a1eabeb","ce6d2d27","6a27ffc2","0977f2af"
+  ]
   if (FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
   } else if (LIMIT) {
@@ -402,11 +397,15 @@ for (let i = 0; i < questions.length; i++) {
 
   // ── ingest ─────────────────────────────────────────────────────────────
   const t0 = Date.now()
-  for (let s = 0; s < haystack_sessions.length; s++) {
-    process.stdout.write(`  ingesting session ${s + 1}/${haystack_sessions.length}...`)
-    try { await memory.add(haystack_sessions[s], { date: haystack_dates[s] }) }
-    catch (err) { process.stderr.write(`\n  [warn] session ${s}: ${err.message}\n`) }
-    process.stdout.write('\r' + ' '.repeat(50) + '\r')
+  if (SKIP_INGEST) {
+    console.log(`  ⏩ skipping ingestion (SKIP_INGEST=true)`)
+  } else {
+    for (let s = 0; s < haystack_sessions.length; s++) {
+      process.stdout.write(`  ingesting session ${s + 1}/${haystack_sessions.length}...`)
+      try { await memory.add(haystack_sessions[s], { date: haystack_dates[s] }) }
+      catch (err) { process.stderr.write(`\n  [warn] session ${s}: ${err.message}\n`) }
+      process.stdout.write('\r' + ' '.repeat(50) + '\r')
+    }
   }
   const ingestMs = Date.now() - t0
 
@@ -418,20 +417,15 @@ for (let i = 0; i < questions.length; i++) {
   // ── search ──────────────────────────────────────────────────────────────
   const t1 = Date.now()
   const questionDateNorm = memory._normalizeDate(question_date) ?? question_date
-  const retrieved        = await memory.search(question, { topN: SEARCH_TOP_N, asOf: questionDateNorm })
+  // round asOf to end-of-day so all same-day sessions are visible
+  const asOf = questionDateNorm.length === 10 
+    ? questionDateNorm + 'T23:59' 
+    : questionDateNorm.slice(0, 10) + 'T23:59'
+  const retrieved = await memory.search(question, { topN: SEARCH_TOP_N, asOf })
   console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)`)
 
-  // ── profile ─────────────────────────────────────────────────────────────
-  const t2 = Date.now()
-  const { profile } = await memory.getProfile({ asOf: questionDateNorm })
-  console.log(`  ⏱  profile:        ${(Date.now() - t2).toFixed(0)}ms  (static:${profile.static.length} dynamic:${profile.dynamic.length})`)
-
-  // cap profile to prevent token limit errors
-  profile.static  = profile.static.slice(0, 25)
-  profile.dynamic = profile.dynamic.slice(0, 25)
-
   // ── answer ───────────────────────────────────────────────────────────────
-  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, profile })
+  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved })
   const t3 = Date.now()
   let answer = 'I don\'t know'
   try { answer = await answerer(answerPrompt) }
