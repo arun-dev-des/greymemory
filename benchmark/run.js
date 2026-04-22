@@ -20,7 +20,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
 const PER_CATEGORY    = 15                            // questions per category
-const CATEGORY_FILTER = ['knowledge-update'] // null = all categories
+const CATEGORY_FILTER = ['temporal-reasoning'] // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
 const SKIP_INGEST     = true                        // true = skip ingestion, use existing DB
@@ -81,41 +81,51 @@ const embedder = createBatchEmbedder(async (texts) => {
   return data.data.map(d => d.embedding)
 }, { windowMs: 20, maxBatch: 128 })
 
-const answerer = async (prompt) => {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model:       'gpt-4o',
-      max_tokens:  512,
-      temperature: 0,
-      messages:    [{ role: 'user', content: prompt }],
-    }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(`OpenAI answerer: ${data.error.message}`)
-  tokenLog.answering.input  += data.usage?.prompt_tokens     ?? 0
-  tokenLog.answering.output += data.usage?.completion_tokens ?? 0
-  return data.choices[0].message.content.trim()
+const answerer = async (prompt, retries = 3) => {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model:       'gpt-4o',
+        max_tokens:  512,
+        temperature: 0,
+        messages:    [{ role: 'user', content: prompt }],
+      }),
+    })
+    const data = await res.json()
+    if (data.error?.type === 'rate_limit_exceeded' || data.error?.code === 'rate_limit_exceeded') {
+      const wait = Math.pow(2, attempt) * 2000
+      process.stderr.write(`\n  [retry] rate limited, waiting ${wait/1000}s...\n`)
+      await new Promise(r => setTimeout(r, wait))
+      continue
+    }
+    if (data.error) throw new Error(`OpenAI answerer: ${data.error.message}`)
+    tokenLog.answering.input  += data.usage?.prompt_tokens     ?? 0
+    tokenLog.answering.output += data.usage?.completion_tokens ?? 0
+    return data.choices[0].message.content.trim()
+  }
+  throw new Error('OpenAI answerer: max retries exceeded')
 }
 
-const judge = async (question, expected, got) => {
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method:  'POST',
-    headers: {
-      'Content-Type':  'application/json',
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model:       'gpt-4o',
-      max_tokens:  10,
-      temperature: 0,
-      messages: [{
-        role:    'user',
-        content: `You are evaluating a question-answering system.
+const judge = async (question, expected, got, retries = 3) => {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method:  'POST',
+      headers: {
+        'Content-Type':  'application/json',
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model:       'gpt-4o',
+        max_tokens:  10,
+        temperature: 0,
+        messages: [{
+          role:    'user',
+          content: `You are evaluating a question-answering system.
 
 Question: ${question}
 Expected answer: ${expected}
@@ -126,18 +136,62 @@ The system answer may be phrased differently but must convey the same informatio
 If the expected answer is an abstention and the system says "I don't know", that is correct.
 
 Respond with ONLY "correct" or "incorrect".`,
-      }],
-    }),
+        }],
+      }),
+    })
+    const data = await res.json()
+    if (data.error?.type === 'rate_limit_exceeded' || data.error?.code === 'rate_limit_exceeded') {
+      const wait = Math.pow(2, attempt) * 2000
+      process.stderr.write(`\n  [retry] judge rate limited, waiting ${wait/1000}s...\n`)
+      await new Promise(r => setTimeout(r, wait))
+      continue
+    }
+    if (data.error) throw new Error(`OpenAI judge: ${data.error.message}`)
+    tokenLog.judging.input  += data.usage?.prompt_tokens     ?? 0
+    tokenLog.judging.output += data.usage?.completion_tokens ?? 0
+    return data.choices?.[0]?.message?.content?.trim().toLowerCase() === 'correct'
+  }
+  throw new Error('OpenAI judge: max retries exceeded')
+}
+
+// ── temporal pre-computation ───────────────────────────────────────────────
+
+function buildTemporalTimeline(question, results) {
+  const isTemporal = /how many (days|weeks|months)|how long|how old|which.*(first|before|after|earlier|later)|when did|what day|what date|ago/i.test(question)
+  if (!isTemporal) return ''
+
+  const events = results
+    .filter(r => r.event_date)
+    .map(r => ({
+      date: r.event_date,
+      description: (r.memory || r.chunk?.slice(0, 150) || '').replace(/\n/g, ' ')
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date))
+
+  if (events.length === 0) return ''
+
+  // deduplicate same date + similar description
+  const seen = new Set()
+  const unique = events.filter(e => {
+    const key = `${e.date}|${e.description.slice(0, 50)}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
   })
-  const data = await res.json()
-  tokenLog.judging.input  += data.usage?.prompt_tokens     ?? 0
-  tokenLog.judging.output += data.usage?.completion_tokens ?? 0
-  return data.choices?.[0]?.message?.content?.trim().toLowerCase() === 'correct'
+
+  return `
+TIMELINE (events sorted chronologically — use these dates for any date arithmetic):
+${unique.map(e => `  ${e.date}: ${e.description}`).join('\n')}
+
+IMPORTANT: Use the dates above for all calculations. Do NOT estimate dates from
+phrases like "a few weeks ago" or "last month" — use the extracted eventDate values.
+When computing durations, subtract the earlier date from the later date.
+`
 }
 
 // ── answering prompt ───────────────────────────────────────────────────────
 
-function buildAnsweringPrompt({ question, questionDate, results }) {
+function buildAnsweringPrompt({ question, questionDate, results, temporalTimeline }) {
   const retrievedContext = results.map((r, i) => {
     const lines = [`[${i + 1}]`]
     if (r.memory) lines.push(`Memory: ${r.memory}`)
@@ -186,6 +240,7 @@ Instructions:
   When calculating days between two dates, count inclusively — include the start date.
   Do not reference result numbers in your answer.
 
+${temporalTimeline}
 Answer:`
 }
 
@@ -309,9 +364,10 @@ if (QUESTION_ID) {
 
   // fixed set for reproducible comparison
   const FIXED_IDS = [
-    "7a87bd0c","59524333","89941a93","b01defab","45dc21b6",
-    "2133c1b5","72e3ee87","6071bd76","a1eacc2a","852ce960",
-    "618f13b2","6a1eabeb","ce6d2d27","6a27ffc2","0977f2af"
+    "6e984301","d01c6aa8","e4e14d04","0bb5a684","gpt4_76048e76",
+    "gpt4_385a5000","982b5123","gpt4_2487a7cb","gpt4_65aabe59",
+    "gpt4_4929293b","dcfa8644","gpt4_2f584639","gpt4_b4a80587",
+    "gpt4_b5700ca0","gpt4_74aed68e"
   ]
   if (FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
@@ -425,7 +481,8 @@ for (let i = 0; i < questions.length; i++) {
   console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)`)
 
   // ── answer ───────────────────────────────────────────────────────────────
-  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved })
+  const temporalTimeline = buildTemporalTimeline(question, retrieved)
+  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, temporalTimeline })
   const t3 = Date.now()
   let answer = 'I don\'t know'
   try { answer = await answerer(answerPrompt) }
