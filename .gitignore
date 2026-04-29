@@ -5,3 +5,15 @@ greymemory.config.js
 test-types.ts
 .greymemory/
 .DS_Store.DS_Store
+
+# Benchmark
+benchmark/.greymemory-bench/
+benchmark/results/
+benchmark/data/
+
+# OS
+.DS_Store
+
+# Test files
+test-v03-*.js
+test-v3-*.js

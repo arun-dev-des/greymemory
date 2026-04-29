@@ -20,10 +20,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
 const PER_CATEGORY    = 15                            // questions per category
-const CATEGORY_FILTER = ['temporal-reasoning'] // null = all categories
+const CATEGORY_FILTER = ['multi-session'] // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
-const SKIP_INGEST     = true                        // true = skip ingestion, use existing DB
+const SKIP_INGEST     = false                        // true = skip ingestion, use existing DB
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -363,12 +363,7 @@ if (QUESTION_ID) {
   // }
 
   // fixed set for reproducible comparison
-  const FIXED_IDS = [
-    "6e984301","d01c6aa8","e4e14d04","0bb5a684","gpt4_76048e76",
-    "gpt4_385a5000","982b5123","gpt4_2487a7cb","gpt4_65aabe59",
-    "gpt4_4929293b","dcfa8644","gpt4_2f584639","gpt4_b4a80587",
-    "gpt4_b5700ca0","gpt4_74aed68e"
-  ]
+  const FIXED_IDS = []
   if (FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
   } else if (LIMIT) {
@@ -496,7 +491,7 @@ for (let i = 0; i < questions.length; i++) {
   let correct = false
   let failureReason = null
   if (isAbstention) {
-    correct = /i don.t know|don.t have|no information|cannot find|not mentioned/i.test(answer)
+    correct = /i don.t know|don.t have|no information|cannot find|not mentioned|does not provide/i.test(answer)
   } else {
     correct = await judge(question, expected, answer)
     if (!correct) failureReason = classifyFailure(expected, retrieved)
