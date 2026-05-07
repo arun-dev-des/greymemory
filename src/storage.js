@@ -621,7 +621,7 @@ export class Storage {
         event_date:    row.event_date,
         relation_type: row.relation_type,
         chunk_id:      row.chunk_id,
-        source_role: row.source_role,
+        source_role:   row.source_role,
         score:         this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)
@@ -658,24 +658,28 @@ export class Storage {
     const scores = {}
 
     const addFactScore = (fact, rank, source) => {
-      const key = `fact_${fact.id}`
-      if (!scores[key]) {
-        scores[key] = {
+      const key = `fact_${fact.id}`          // ← unique key from fact ID
+  
+      if (!scores[key]) {                    // ← first time seeing this fact?
+        scores[key] = {                      //    create new entry with rrf: 0
           ...fact,
-          _type:    'fact',
-          _key:     key,
-          rrf:      0,
-          sources:  [],
+          _type: 'fact',
+          _key: key,
+          rrf: 0,                           // ← starts at zero
+          sources: [],
         }
       }
+
       let weight = fact.memory_type === 'preference'
-        ? (fact.confidence ?? 1.0)
+        ? (fact.confidence ?? 1.0)  // preferences weighted by confidence (1.0-2.0)
         : 1.0
       if (isAssistantQuery && fact.source_role === 'assistant') {
-        weight *= 2.0
+        weight *= 2.0               // 2x boost for assistant facts when query asks about assistant
       }
-      scores[key].rrf += (1 / (k + rank)) * weight
-      scores[key].sources.push(source)
+
+      // This line runs EVERY time — even if the key already exists
+      scores[key].rrf += (1 / (k + rank)) * weight     // ← ACCUMULATES
+      scores[key].sources.push(source)                 // ← tracks which channel
     }
 
     const addChunkScore = (chunk, rank, source) => {

@@ -80,6 +80,8 @@ export class Memory {
     // 3. Now run extraction — if it returns empty, chunks are already safe
     const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
     const inputVector = await this.embedder(inputText)
+
+    //Todo: Why not Dedup by bm25search as well?
     const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
       .filter(f => f.memory_type !== 'preference')
 
@@ -176,48 +178,48 @@ export class Memory {
   }
 
   // ── Search ─────────────────────────────────────────
-
   async search(query, options = {}) {
     const {
       topN           = 5,
-      memoryTypes    = null,   // ['fact', 'preference', 'episode'] — null means all
-      afterDate      = null,   // filter by event_date >= afterDate
-      beforeDate     = null,   // filter by event_date <= beforeDate
-      includeHistory = false,  // include superseded facts (is_latest=0)
-      includeExpired = false,  // include expired episodes
-      asOf           = null,   // time-travel: return facts current at this point in time
+      memoryTypes    = null,      // e.g. ['fact', 'preference'] or null for all
+      afterDate      = null,      // filter: only facts with event_date >= this
+      beforeDate     = null,      // filter: only facts with event_date <= this
+      includeHistory = false,     // if true, include superseded (is_latest=0) facts
+      includeExpired = false,     // if true, include facts past their expires_at
+      asOf           = null,      // time-travel: pretend it's this date
+      expandViaGraph = true,      // master toggle for graph expansion
+      expandedLimit  = 10,        // max additional facts from graph traversal
+      expandDepth    = 5,         // max EXTENDS hops to walk
     } = typeof options === 'number' ? { topN: options } : options;
 
-    // normalize asOf — accept ISO date or datetime; date-only → end of that day
-    // so a fact recorded at "2023-03-10T14:00" is still considered current on asOf "2023-03-10"
+    // ── normalize asOf ──
     let asOfNorm = null;
     if (asOf) {
       const normalized = this._normalizeDate(asOf) ?? asOf;
       asOfNorm = normalized.includes('T') ? normalized : `${normalized}T23:59:59`;
     }
 
+    // ── core retrieval ──
     const queryVector = await this.embedder(query);
-    const results     = this.storage.hybridSearch(
-      query,
-      queryVector,
-      this.storage.container,
-      topN * 3, // fetch more candidates — filters may reduce count
-      asOfNorm,
+    const rawResults  = this.storage.hybridSearch(
+      query,           // raw text for BM25
+      queryVector,     // embedding for vector search
+      this.storage.container,  // e.g. "852ce960"
+      topN * 3,        // overfetch factor: 30 candidates for topN=10
+      asOfNorm,        // temporal cutoff
     );
- 
-    // apply filters
-    let filtered = results;
+
+    // ── apply filters (unchanged) ──
+    let filtered = rawResults;
 
     if (memoryTypes) {
       filtered = filtered.filter(r => r._type === 'chunk' || memoryTypes.includes(r.memory_type));
     }
     if (!includeHistory && !asOfNorm) {
-      filtered = filtered.filter(r => r._type === 'chunk' || r.is_latest !== 0)
+      filtered = filtered.filter(r => r._type === 'chunk' || r.is_latest !== 0);
     }
     if (!includeExpired) {
-      const expiryCutoff = asOfNorm
-        ? asOfNorm.slice(0, 10)
-        : new Date().toISOString().slice(0, 10);
+      const expiryCutoff = asOfNorm ? asOfNorm.slice(0, 10) : new Date().toISOString().slice(0, 10);
       filtered = filtered.filter(r => r._type === 'chunk' || !r.expires_at || r.expires_at > expiryCutoff);
     }
     if (afterDate) {
@@ -226,11 +228,59 @@ export class Memory {
     if (beforeDate) {
       filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= beforeDate));
     }
- 
-    // pair each fact with its source chunk — Supermemory's dual retrieval pattern
-    return filtered.slice(0, topN).map(result => {
+
+    // ── slice seed budget (new boundary) ──
+    // Seeds are the topN best matches by RRF score from core retrieval.
+    // Expansion pulls in additional context but does not compete for these slots.
+    const seedResults = filtered.slice(0, topN);
+
+    // ── graph expansion (UPDATED) ──
+    let expanded = []
+    let history  = []
+
+    if (expandViaGraph && expandedLimit > 0) {
+      const seedFacts = seedResults.filter(r => r._type !== 'chunk' && r.id)
+
+      if (seedFacts.length > 0) {
+        // Forward semantic traversal: facts connected via EXTENDS chains
+        const rawExpanded = await this._expandViaExtends(seedFacts, {
+          maxDepth:   expandDepth,
+          maxResults: expandedLimit,
+          asOfNorm,
+        })
+        expanded = rawExpanded.filter(({ fact }) => {
+          if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
+          if (afterDate  && (!fact.event_date || fact.event_date <  afterDate))  return false
+          if (beforeDate && (!fact.event_date || fact.event_date >  beforeDate)) return false
+          return true
+        })
+
+        // Backward temporal traversal: predecessors via superseded_from chain.
+        // Skipped when caller explicitly excluded history (includeHistory: false
+        // is the default; setting it to true means they want full version chains
+        // surfaced, but our backward walk should run regardless of that flag —
+        // the question is whether the caller said "give me ONLY current state").
+        //
+        // Decision: walk history whenever expandViaGraph is true. Callers who
+        // truly want only current state can set expandViaGraph: false to opt
+        // out of all expansion mechanisms.
+        const rawHistory = await this._expandViaSupersessionHistory(seedFacts, {
+          maxResults: 5,
+        })
+        history = rawHistory.filter(({ fact }) => {
+          if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
+          if (afterDate  && (!fact.event_date || fact.event_date <  afterDate))  return false
+          if (beforeDate && (!fact.event_date || fact.event_date >  beforeDate)) return false
+          // is_latest filter NOT applied — history facts are by definition is_latest=0
+          // asOf filter NOT applied — we want history relative to the seed, not asOf
+          return true
+        })
+      }
+    }
+
+    // ── shape and return ──
+    const seedShaped = seedResults.map(result => {
       if (result._type === 'chunk') {
-        // chunk-only result — no extracted fact exists for this content
         return {
           memory:        null,
           chunk:         result.content,
@@ -242,18 +292,21 @@ export class Memory {
           source_role:   result.source_role ?? null,
         }
       }
-      // normal fact result
-      return {
-        memory:        result.value,
-        chunk:         this.storage.getChunk(result.chunk_id),
-        memory_type:   result.memory_type,
-        confidence:    result.confidence,
-        document_date: result.document_date,
-        event_date:    result.event_date,
-        relation_type: result.relation_type,
-        source_role:   result.source_role,
-      }
-    });
+      return this._factToResult(result)
+    })
+
+    const expandedShaped = expanded.map(({ fact, _expansion }) =>
+      this._factToResult(fact, _expansion)
+    )
+
+    const historyShaped = history.map(({ fact, _expansion }) =>
+      this._factToResult(fact, _expansion)
+    )
+
+    // Order: seeds (best matches) → semantic expansion → temporal history.
+    // This ordering mirrors confidence: highest-relevance first, then context,
+    // then version chain. The answerer reads top-down.
+    return [...seedShaped, ...expandedShaped, ...historyShaped]
   }
 
   // ── Get Memories ──────────────────────────────────────
@@ -563,6 +616,251 @@ Give a short succinct context (1-2 sentences) to situate this message within the
       // if contextualization fails — fall back to raw chunk, never block ingestion
       return chunk;
     }
+  }
+
+  // Walks the superseded_by chain from a stale fact to its current latest version.
+  // Returns the latest fact row, or null if the chain is broken or non-terminating.
+  // Three exit conditions:
+  //   1. We reached a fact with is_latest=1 — return it
+  //   2. We hit a dangling pointer (superseded_by points to deleted fact) — return null
+  //   3. We exceeded 20 hops (defensive cycle guard) — return null
+  _walkSupersession(factId) {
+    let current = this.storage.db.prepare(
+      `SELECT * FROM facts WHERE id = ?`
+    ).get(factId)
+
+    if (!current) return null
+
+    let hops = 0
+    while (current && current.is_latest === 0 && current.superseded_by) {
+      if (++hops > 20) return null  // cycle guard
+
+      const next = this.storage.db.prepare(
+        `SELECT * FROM facts WHERE id = ?`
+      ).get(current.superseded_by)
+
+      if (!next) return null  // dangling pointer
+      current = next
+    }
+
+    return current?.is_latest === 1 ? current : null
+  }
+
+  // Shapes a raw `facts` table row into the public search result format.
+  // Optionally attaches expansion metadata when the fact came from graph traversal
+  // rather than core retrieval.
+  //
+  // Result shape mirrors what search() currently returns for fact results,
+  // with one addition: the optional `_expansion` field on traversed facts.
+  _factToResult(fact, expansion = null) {
+    const result = {
+      memory:        fact.value,
+      chunk:         this.storage.getChunk(fact.chunk_id),
+      memory_type:   fact.memory_type,
+      confidence:    fact.confidence,
+      document_date: fact.document_date,
+      event_date:    fact.event_date,
+      relation_type: fact.relation_type,
+      source_role:   fact.source_role,
+    }
+
+    if (expansion) result._expansion = expansion
+
+    return result
+  }
+
+  // Walks EXTENDS edges from seed facts in both directions (outgoing and incoming).
+  // Bidirectional because EXTENDS is a directed edge but conceptually a chain has
+  // no "preferred" direction — refinements above and below the seed are both relevant.
+  //
+  // For each fact discovered:
+  //   - If it's the latest version (is_latest=1), include it directly
+  //   - If it's been superseded (is_latest=0), resolve to the latest version,
+  //     annotate with `supersededFrom`, and walk further from the LATEST not the stale one
+  //   - Apply asOf and expiry filters (consistent with core search behavior)
+  //
+  // Returns: [{ fact, _expansion: { via, depth, seedId, supersededFrom } }, ...]
+  async _expandViaExtends(seedFacts, { maxDepth = 5, maxResults = 10, asOfNorm = null } = {}) {
+    const seedIds = seedFacts.filter(f => f.id).map(f => f.id)
+    if (seedIds.length === 0) return []
+
+    // `seen` tracks every fact id we've already processed (seed or expanded) — prevents
+    // revisiting and prevents the expanded set from including seeds.
+    const seen = new Set(seedIds)
+
+    // Frontier: the set of fact ids whose neighbors we'll explore in the next iteration.
+    // Starts with seeds; each iteration replaces it with the newly-discovered ids.
+    let frontier = [...seedIds]
+
+    // Provenance tracking: for each discovered fact, which seed brought it in?
+    // Useful for debugging and for the answerer to weight results by seed proximity.
+    const seedIdByFact = new Map()
+    for (const id of seedIds) seedIdByFact.set(id, id)
+
+    // Pre-compute expiry cutoff once — used to filter expired episodes consistently
+    // with the rest of the codebase's expiry semantics.
+    const expiryCutoff = asOfNorm
+      ? asOfNorm.slice(0, 10)
+      : new Date().toISOString().slice(0, 10)
+
+    const collected = []
+
+    for (let depth = 1; depth <= maxDepth && frontier.length > 0 && collected.length < maxResults; depth++) {
+      const placeholders = frontier.map(() => '?').join(',')
+
+      // Find all EXTENDS neighbors of the current frontier — both directions in one query.
+      //
+      //   Outgoing: facts in frontier extend X → return X
+      //     "the seed extends fact A" → fetch A
+      //
+      //   Incoming: X extends facts in frontier → return X
+      //     "fact B extends the seed" → fetch B
+      //
+      // We fetch all columns because we need the full row to apply filters
+      // (is_latest, expires_at, document_date) and to attach as result.
+      const neighbors = this.storage.db.prepare(`
+        SELECT DISTINCT f.* FROM facts f
+        WHERE f.container = ?
+          AND (
+            -- outgoing: the thing frontier extends
+            f.id IN (
+              SELECT related_to FROM facts
+              WHERE id IN (${placeholders})
+                AND relation_type = 'EXTENDS'
+                AND related_to IS NOT NULL
+            )
+            OR
+            -- incoming: the thing that extends frontier
+            (f.related_to IN (${placeholders}) AND f.relation_type = 'EXTENDS')
+          )
+      `).all(this.storage.container, ...frontier, ...frontier)
+
+      const nextFrontier = []
+
+      for (const neighbor of neighbors) {
+        // Skip if we've already processed this fact in any earlier iteration
+        // (or if it's a seed). Prevents duplicates and prevents cycles.
+        if (seen.has(neighbor.id)) continue
+        seen.add(neighbor.id)
+
+        // Resolve to the latest version if this neighbor was superseded.
+        // We want to surface the CURRENT truth, not a stale ancestor.
+        let resolved = neighbor
+        let supersededFrom = null
+
+        if (neighbor.is_latest === 0) {
+          const latest = this._walkSupersession(neighbor.id)
+          if (!latest) continue              // chain broken or fully forgotten
+
+          // The latest version might already be a seed or already collected.
+          // If so, we don't add it again — but we DO want to record that we
+          // walked through this stale neighbor (no-op for now since we skip).
+          if (seen.has(latest.id)) continue
+
+          seen.add(latest.id)
+          resolved = latest
+          supersededFrom = { id: neighbor.id, value: neighbor.value }
+        }
+
+        // asOf time-travel: skip facts recorded after the asOf timestamp.
+        // Keeps expansion consistent with the core search's temporal cutoff.
+        if (asOfNorm && resolved.document_date && resolved.document_date > asOfNorm) continue
+
+        // Expiry filter: skip episodes that have expired by the cutoff date.
+        // Mirrors the includeExpired check in search() — graph expansion shouldn't
+        // resurrect expired episodes that core search would have filtered.
+        if (resolved.expires_at && resolved.expires_at <= expiryCutoff) continue
+
+        // Attribute this fact to a seed for provenance tracking.
+        // Best-effort: if this fact was reached via a previously-expanded fact,
+        // inherit that fact's seed attribution. Otherwise fall back to the first
+        // frontier element (imperfect but only matters for multi-seed debugging).
+        const parentSeed =
+          seedIdByFact.get(neighbor.related_to)
+          ?? seedIdByFact.get(neighbor.id)
+          ?? frontier[0]
+        seedIdByFact.set(resolved.id, parentSeed)
+
+        collected.push({
+          fact: resolved,
+          _expansion: {
+            via: 'EXTENDS',
+            depth,
+            seedId: parentSeed,
+            supersededFrom,
+          }
+        })
+
+        // Walk further from the resolved (latest) fact, not the stale one.
+        // This is the key correctness property: the latest fact's edges may differ
+        // from the stale fact's edges (new EXTENDS may have been added since).
+        nextFrontier.push(resolved.id)
+
+        if (collected.length >= maxResults) break
+      }
+
+      frontier = nextFrontier
+    }
+
+    return collected
+  }
+
+  // Walks backward from each seed fact via superseded_from to surface version history.
+  // Where _expandViaExtends walks the SEMANTIC graph (refinements that are all currently
+  // true), this walks the TEMPORAL graph (predecessors that USED to be true).
+  //
+  // Critical for queries like "did I switch to more or less" where the answer requires
+  // comparing the current value against the historical value. Without this, search
+  // surfaces only the latest fact and the answerer has nothing to compare against.
+  //
+  // Each predecessor is annotated with `via: 'UPDATES_HISTORY'` and a `supersededBy`
+  // pointer so the answerer can see the version chain explicitly.
+  //
+  // Returns: [{ fact, _expansion: { via, depth, seedId, supersededBy } }, ...]
+  async _expandViaSupersessionHistory(seedFacts, { maxResults = 5 } = {}) {
+    const seedIds = new Set(seedFacts.map(f => f.id).filter(Boolean))
+    if (seedIds.size === 0) return []
+
+    const seen = new Set(seedIds)
+    const collected = []
+
+    for (const seed of seedFacts) {
+      if (!seed.id) continue
+
+      // Re-fetch the seed's full row — hybridSearch results don't include
+      // superseded_from, which is what we need to walk backward.
+      let current = this.storage.db.prepare(
+        `SELECT * FROM facts WHERE id = ?`
+      ).get(seed.id)
+
+      let depth = 0
+      while (current?.superseded_from && depth < 20) {
+        depth++
+
+        const prev = this.storage.db.prepare(
+          `SELECT * FROM facts WHERE id = ?`
+        ).get(current.superseded_from)
+
+        if (!prev) break
+        if (seen.has(prev.id)) break
+        seen.add(prev.id)
+
+        collected.push({
+          fact: prev,
+          _expansion: {
+            via: 'UPDATES_HISTORY',
+            depth,
+            seedId: seed.id,
+            supersededBy: { id: current.id, value: current.value },
+          }
+        })
+
+        if (collected.length >= maxResults) return collected
+        current = prev
+      }
+    }
+
+    return collected
   }
  
   // use cosine similarity to find an existing preference with similar meaning

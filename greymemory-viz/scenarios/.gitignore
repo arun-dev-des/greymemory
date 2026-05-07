@@ -1,0 +1,10 @@
+node_modules
+.env
+.env.local
+dist
+.DS_Store
+*.log
+.vite
+
+# Generated scenario DBs — re-run the scripts to regenerate
+scenarios/.greymemory-scenarios/

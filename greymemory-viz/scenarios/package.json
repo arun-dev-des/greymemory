@@ -1,0 +1,17 @@
+{
+  "name": "greymemory-viz-scenarios",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Handcrafted GreyMemory scenarios — small, named, reproducible test cases for visualizing system behavior.",
+  "scripts": {
+    "all":     "node 01-updates.js && node 02-extends.js && node 03-expires.js",
+    "updates": "node 01-updates.js",
+    "extends": "node 02-extends.js",
+    "expires": "node 03-expires.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5"
+  }
+}

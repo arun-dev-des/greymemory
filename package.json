@@ -1,6 +1,6 @@
 {
   "name": "greymemory",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Self-hosted memory for AI agents. Extracts facts, detects contradictions, builds user profiles. Bring your own LLM. Your data never leaves your server.",
   "type": "module",
   "main": "src/index.js",

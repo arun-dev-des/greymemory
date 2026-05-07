@@ -20,10 +20,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
 const PER_CATEGORY    = 15                            // questions per category
-const CATEGORY_FILTER = ['multi-session'] // null = all categories
+const CATEGORY_FILTER = ['single-session-preference'] // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
-const SKIP_INGEST     = false                        // true = skip ingestion, use existing DB
+const SKIP_INGEST     = true                        // true = skip ingestion, use existing DB
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -201,9 +201,22 @@ function buildAnsweringPrompt({ question, questionDate, results, temporalTimelin
     if (r.event_date)    lines.push(`eventDate: ${r.event_date}`)
     if (r.relation_type) lines.push(`Version: ${r.relation_type}`)
     if (r.source_role)   lines.push(`Source: ${r.source_role}`)
+
+    // NEW: surface graph expansion provenance
+    if (r._expansion?.via === 'UPDATES_HISTORY') {
+      lines.push(
+        `⚠️ HISTORICAL VERSION: this fact USED TO be true but was replaced. ` +
+        `Current value (from result #${r._expansion.seedId}): "${r._expansion.supersededBy.value}". ` +
+        `When answering, treat this as the previous state, not a current fact.`
+      )
+    } else if (r._expansion?.via === 'EXTENDS') {
+      lines.push(`(Related context: connected to result #${r._expansion.seedId} via EXTENDS chain, depth ${r._expansion.depth})`)
+    }
+
     return lines.join('\n')
   }).join('\n\n')
 
+  // Also strengthen the instructions section to handle version chains explicitly:
   return `You are a question-answering system. Based on the retrieved context below, answer the question.
 
 Question: ${question}
@@ -217,28 +230,30 @@ The context contains search results from a memory system. Each result has multip
 
 Memory: A high-level summary/atomic fact — the searchable title/summary of what was stored
 Chunks: The actual detailed raw content where the memory was extracted from
-  Contains conversations, documents, messages, or text excerpts
-  This is your primary source for detailed information and facts
-Source: "assistant" means this memory came from something the assistant said
-        "user" means this memory came from something the user said
+Source: "assistant" means this came from something the assistant said
+        "user" means this came from something the user said
 
 Temporal Context (if present):
-  Question Date: The date when the question was asked. Use this for temporal perspective.
-  documentDate: When the content was originally authored/written/said.
-  eventDate: When the event/fact actually occurred or will occur.
+  Question Date: when the question was asked
+  documentDate: when the content was originally authored/written/said
+  eventDate: when the event/fact actually occurred or will occur
+
+Version Chains (CRITICAL):
+  Some results are marked "⚠️ HISTORICAL VERSION" — these describe what USED TO
+  be true, not what is currently true. The replacement value is shown inline.
+  When the question asks about a CHANGE ("did you switch from X to Y", "more or
+  less", "previous vs current"), you MUST compare:
+    - The current fact (the seed, which has no HISTORICAL marker)
+    - The historical fact (marked HISTORICAL) — this is what it used to be
+  Do not infer the previous value from anywhere else. Use the HISTORICAL marker.
 
 Instructions:
-  Before answering, explicitly identify which memory or chunk contains the relevant
-  information and note the exact value from it. Then use that noted value to construct
-  your final answer.
+  Before answering, identify which memory or chunk contains the relevant
+  information and note the exact value from it.
   If the context contains enough information, provide a clear, concise answer.
   If not, respond with "I don't know" or explain what is missing.
   Base your answer ONLY on the provided context.
-  Prioritize information from chunks and raw content — they are the raw source material.
-  Match your answer format to the question — number, name, date, or yes/no leads directly.
-  When counting items or actions, treat each distinct action as a separate item.
-  When calculating days between two dates, count inclusively — include the start date.
-  Do not reference result numbers in your answer.
+  Match your answer format to the question.
 
 ${temporalTimeline}
 Answer:`
@@ -363,7 +378,8 @@ if (QUESTION_ID) {
   // }
 
   // fixed set for reproducible comparison
-  const FIXED_IDS = []
+  const FIXED_IDS = ['57f827a0', 'b6025781', '35a27287', '1d4e3b97', '32260d93']
+
   if (FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
   } else if (LIMIT) {
