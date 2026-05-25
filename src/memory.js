@@ -28,6 +28,12 @@ export class Memory {
     this.filterPrompt        = options.filterPrompt       ?? '';
     this.entityContext       = options.entityContext       ?? '';
     this.contextualRetrieval = options.contextualRetrieval ?? false;
+    // Optional diagnostic hook — called once per relationship-classification
+    // decision (Task 5.1). Errors thrown by the consumer are swallowed so
+    // ingestion never blocks on logging.
+    this.onRelationshipDecision = typeof options.onRelationshipDecision === 'function'
+      ? options.onRelationshipDecision
+      : null;
     this.storage       = new Storage(
       options.dir       ?? ".greymemory",
       options.container ?? "default",
@@ -1086,8 +1092,12 @@ Give a short succinct context (1-2 sentences) to situate this message within the
     }
  
     // no candidates — this is a brand new memory
-    if (candidates.length === 0) return { type: 'NEW', relatedTo: null };
- 
+    if (candidates.length === 0) {
+      const decision = { type: 'NEW', relatedTo: null };
+      this._logRelationshipDecision({ mem, documentDate, candidates, decision, reason: 'no_candidates', llmRaw: null });
+      return decision;
+    }
+
     // step 2 — LLM classifies the relationship
     const prompt = `You are a memory relationship classifier.
  
@@ -1132,22 +1142,69 @@ NEW — no meaningful relationship to any existing memory.
 Return ONLY valid JSON, no explanation:
 {"type": "UPDATES|EXTENDS|NEW", "relatedTo": <id of most related existing memory, or null if NEW>}`;
  
+    let llmRaw = null;
     try {
-      const raw    = await this.extractor(prompt, { phase: 'relationship' });
-      const text   = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+      llmRaw = await this.extractor(prompt, { phase: 'relationship' });
+      const text   = llmRaw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
       const result = JSON.parse(text);
 
       // validate — ensure relatedTo points to a real candidate
       const validId = candidates.find(c => c.id === result.relatedTo)?.id ?? null;
- 
-      return {
+
+      const decision = {
         type:      ['UPDATES', 'EXTENDS', 'NEW'].includes(result.type) ? result.type : 'NEW',
         relatedTo: result.type !== 'NEW' ? validId : null,
       };
+      this._logRelationshipDecision({ mem, documentDate, candidates, decision, reason: 'llm', llmRaw });
+      return decision;
     } catch {
       // if LLM fails or returns invalid JSON — treat as NEW, never block ingestion
-      return { type: 'NEW', relatedTo: null };
+      const decision = { type: 'NEW', relatedTo: null };
+      this._logRelationshipDecision({ mem, documentDate, candidates, decision, reason: 'llm_failed', llmRaw });
+      return decision;
     }
+  }
+
+  // Internal helper for Task 5.1 instrumentation. Builds a structured log
+  // entry and hands it to the consumer-supplied callback if one was provided.
+  // Errors thrown by the callback are swallowed — ingestion must never block
+  // on diagnostic logging.
+  _logRelationshipDecision({ mem, documentDate, candidates, decision, reason, llmRaw }) {
+    if (!this.onRelationshipDecision) return;
+    try {
+      const topCandidate = decision.relatedTo != null
+        ? candidates.find(c => c.id === decision.relatedTo)
+        : (candidates[0] ?? null);
+      this.onRelationshipDecision({
+        timestamp: Date.now(),
+        container: this.storage.container,
+        new_fact: {
+          key:           mem.key,
+          value:         mem.value,
+          memory_type:   mem.memory_type,
+          document_date: documentDate,
+          event_date:    mem.event_date ?? null,
+          source_role:   mem.source_role ?? null,
+        },
+        candidate_count: candidates.length,
+        candidates: candidates.map(c => ({
+          id:            c.id,
+          key:           c.key,
+          value:         c.value,
+          memory_type:   c.memory_type,
+          document_date: c.document_date ?? null,
+          event_date:    c.event_date ?? null,
+        })),
+        decision,
+        top_candidate: topCandidate ? {
+          id:    topCandidate.id,
+          key:   topCandidate.key,
+          value: topCandidate.value,
+        } : null,
+        reason,
+        llm_raw: llmRaw,
+      });
+    } catch { /* swallow logger errors — never block ingestion */ }
   }
  
   // parse raw extractor string → array of memory objects
