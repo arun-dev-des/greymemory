@@ -7,6 +7,7 @@ test-types.ts
 .DS_Store.DS_Store
 greymemory-longmemeval-implementation-plan.md
 .greymemory-verify-task1/
+.greymemory-verify-task3/
 
 # Benchmark
 benchmark/.greymemory-bench/

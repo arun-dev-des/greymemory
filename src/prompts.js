@@ -326,3 +326,90 @@ Do NOT extract:
 ${existingFacts.slice(0, 20).map(f => `- [${f.memory_type}] ${f.value}`).join('\n')}
 ` : ''}`
 }
+
+/**
+ * buildTimeRangeExtractionPrompt
+ *
+ * Asks an LLM (M_T in LongMemEval §5.4) to extract a date range from a user's
+ * question. The output bounds are applied as a filter on the `event_date`
+ * column at retrieval time — so the range must describe WHEN THE EVENT
+ * OCCURRED, not when the question is being asked.
+ *
+ * Paper finding (§5.4, Table 4): a strong M_T gives +11.3% temporal recall;
+ * a weak M_T (Llama 8B in the paper) hallucinates ranges and makes recall
+ * WORSE than baseline. The prompt below leans heavily on examples and a
+ * "return nulls when uncertain" instruction to keep weaker models honest.
+ *
+ * @param {object} opts
+ * @param {string} opts.query  the user question
+ * @param {string} opts.today  ISO YYYY-MM-DD — date the question is being asked
+ *                              (use `asOf` when retrieving from a historical
+ *                              point so "last month" resolves correctly)
+ */
+export function buildTimeRangeExtractionPrompt({ query, today }) {
+  return `You extract a date range from a user's question so a memory system can filter retrieval to events that happened in that range.
+
+Today's date: ${today}
+
+Return a JSON object with exactly two fields:
+{
+  "afterDate":  "YYYY-MM-DD" | null,
+  "beforeDate": "YYYY-MM-DD" | null
+}
+
+The range describes WHEN THE EVENT BEING ASKED ABOUT OCCURRED — not when the question is being asked.
+
+RULES
+1. If the question has NO temporal cue, return {"afterDate": null, "beforeDate": null}.
+2. If only one side of the range is constrained, set the other to null.
+3. Use \`today\` to resolve relative phrases ("last month", "two weeks ago").
+4. Be CONSERVATIVE. A wrong range filters out the correct answer. When uncertain whether a phrase carries a temporal cue, return nulls.
+5. Always return YYYY-MM-DD (full ISO). For "April 2024" use afterDate "2024-04-01" and beforeDate "2024-04-30".
+6. Return ONLY the JSON object. No prose, no markdown.
+
+EXAMPLES
+
+Q: "What did I eat for breakfast last week?"
+today: 2024-05-20
+→ {"afterDate": "2024-05-13", "beforeDate": "2024-05-19"}
+
+Q: "When did I switch from Vim to VSCode?"
+today: 2024-05-20
+→ {"afterDate": null, "beforeDate": null}
+(question asks WHEN — no bound is implied; let retrieval find the event)
+
+Q: "What movies did I watch in January 2024?"
+today: 2024-05-20
+→ {"afterDate": "2024-01-01", "beforeDate": "2024-01-31"}
+
+Q: "What have I been working on since I joined Stripe?"
+today: 2024-05-20
+→ {"afterDate": null, "beforeDate": null}
+(open-ended start "since I joined" cannot be resolved without knowing the join date — return nulls and let retrieval do its work)
+
+Q: "Where do I work?"
+today: 2024-05-20
+→ {"afterDate": null, "beforeDate": null}
+
+Q: "What did I do two weeks ago?"
+today: 2024-05-20
+→ {"afterDate": "2024-05-06", "beforeDate": "2024-05-06"}
+
+Q: "What was on my calendar yesterday?"
+today: 2024-05-20
+→ {"afterDate": "2024-05-19", "beforeDate": "2024-05-19"}
+
+Q: "What books did I read in 2023?"
+today: 2024-05-20
+→ {"afterDate": "2023-01-01", "beforeDate": "2023-12-31"}
+
+Q: "Did I meet Sarah before the conference?"
+today: 2024-05-20
+→ {"afterDate": null, "beforeDate": null}
+(the conference date is not in the question — cannot resolve)
+
+QUESTION
+${query}
+
+Return ONLY the JSON object.`
+}
