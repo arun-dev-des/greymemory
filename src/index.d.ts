@@ -315,7 +315,14 @@ export interface AddOptions {
   sessionId?: string | null;
 }
 export interface SearchOptions {
-  /** Number of results to return. @default 5 */
+  /**
+   * Number of results to return. @default 5
+   *
+   * Should scale with reader-model capability (LongMemEval §5.2): weak readers
+   * degrade past ~3k retrieved tokens, strong readers (e.g. GPT-4o) keep
+   * improving past 20k. Rough guidance: weak readers `topN: 3–5`, strong
+   * readers `topN: 15–25`. The caller decides — no auto-scaling here.
+   */
   topN?: number;
   /** Filter by memory type. null returns all types. */
   memoryTypes?: MemoryType[] | null;
