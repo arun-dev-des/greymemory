@@ -13,6 +13,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
+import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
@@ -35,17 +36,82 @@ const INITIAL_ENTITY_CONTEXT = `This is memory for a single user across multiple
 "I", "me", "my", "mine" always refer to the same person.
 Resolve all pronouns and vague references using context from the full conversation.`
 
+// ── retrieval metrics (LongMemEval §3.3) ───────────────────────────────────
+// Binary relevance at session granularity. Both metrics dedupe by session —
+// only the first appearance of each gold session contributes (NDCG gain /
+// Recall set inclusion). See plan: read-this-file-greymemory-longmemeval-im-sorted-hamming.md
+
+function recallAtK(rankedSessionIds, goldSet, k) {
+  if (goldSet.size === 0) return null
+  const seen = new Set()
+  for (let i = 0; i < Math.min(k, rankedSessionIds.length); i++) {
+    const sid = rankedSessionIds[i]
+    if (sid != null && goldSet.has(sid)) seen.add(sid)
+  }
+  return seen.size / goldSet.size
+}
+
+function ndcgAtK(rankedSessionIds, goldSet, k) {
+  if (goldSet.size === 0) return null
+  const seenRelevant = new Set()
+  let dcg = 0
+  for (let i = 0; i < Math.min(k, rankedSessionIds.length); i++) {
+    const sid = rankedSessionIds[i]
+    if (sid != null && goldSet.has(sid) && !seenRelevant.has(sid)) {
+      seenRelevant.add(sid)
+      dcg += 1 / Math.log2(i + 2)
+    }
+  }
+  let idcg = 0
+  for (let i = 0; i < Math.min(k, goldSet.size); i++) {
+    idcg += 1 / Math.log2(i + 2)
+  }
+  return idcg === 0 ? 0 : dcg / idcg
+}
+
+if (SEARCH_TOP_N < 10) {
+  throw new Error(`SEARCH_TOP_N must be >= 10 to compute Recall@10 / NDCG@10 (got ${SEARCH_TOP_N})`)
+}
+
 // ── token tracking ─────────────────────────────────────────────────────────
+// Phase-keyed buckets. Library passes { phase } to extractor/embedder so the
+// wrapper can attribute tokens/calls to the internal stage that caused them.
+// New phases added by the library fall back into the default bucket defensively.
 
 const tokenLog = {
-  extraction: { input: 0, output: 0, calls: 0 },
-  answering:  { input: 0, output: 0 },
-  judging:    { input: 0, output: 0 },
+  extractor: {
+    extraction:        { input: 0, output: 0, calls: 0 },
+    relationship:      { input: 0, output: 0, calls: 0 },
+    contextualization: { input: 0, output: 0, calls: 0 },
+    derivation:        { input: 0, output: 0, calls: 0 },
+  },
+  embedder: {
+    chunk:      { calls: 0 },
+    dedup_seed: { calls: 0 },
+    memory:     { calls: 0 },
+    query:      { calls: 0 },
+    derivation: { calls: 0 },
+  },
+  answering: { input: 0, output: 0 },
+  judging:   { input: 0, output: 0 },
+}
+
+const sumCalls = obj => Object.values(obj).reduce((s, p) => s + (p.calls  ?? 0), 0)
+const sumIn    = obj => Object.values(obj).reduce((s, p) => s + (p.input  ?? 0), 0)
+const sumOut   = obj => Object.values(obj).reduce((s, p) => s + (p.output ?? 0), 0)
+
+function resetTokenLog() {
+  for (const p of Object.values(tokenLog.extractor)) { p.input = 0; p.output = 0; p.calls = 0 }
+  for (const p of Object.values(tokenLog.embedder))  { p.calls = 0 }
+  tokenLog.answering = { input: 0, output: 0 }
+  tokenLog.judging   = { input: 0, output: 0 }
 }
 
 // ── providers ──────────────────────────────────────────────────────────────
 
-const extractor = async (prompt) => {
+const extractor = async (prompt, context) => {
+  const phase  = context?.phase ?? 'extraction'
+  const bucket = tokenLog.extractor[phase] ?? tokenLog.extractor.extraction
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method:  'POST',
     headers: {
@@ -61,13 +127,13 @@ const extractor = async (prompt) => {
   })
   const data = await res.json()
   if (data.error) throw new Error(`Anthropic: ${data.error.message}`)
-  tokenLog.extraction.input  += data.usage?.input_tokens  ?? 0
-  tokenLog.extraction.output += data.usage?.output_tokens ?? 0
-  tokenLog.extraction.calls  += 1
+  bucket.input  += data.usage?.input_tokens  ?? 0
+  bucket.output += data.usage?.output_tokens ?? 0
+  bucket.calls  += 1
   return data.content[0].text.trim()
 }
 
-const embedder = createBatchEmbedder(async (texts) => {
+const rawBatchedEmbedder = createBatchEmbedder(async (texts) => {
   const res = await fetch('https://api.voyageai.com/v1/embeddings', {
     method:  'POST',
     headers: {
@@ -80,6 +146,15 @@ const embedder = createBatchEmbedder(async (texts) => {
   if (data.error) throw new Error(`Voyage: ${data.error.message}`)
   return data.data.map(d => d.embedding)
 }, { windowMs: 20, maxBatch: 128 })
+
+// Phase-aware wrapper around the batched embedder. Counts the call before it
+// enters the batch queue so dedup/batching can't lose attribution.
+const embedder = async (text, context) => {
+  const phase  = context?.phase ?? 'query'
+  const bucket = tokenLog.embedder[phase] ?? tokenLog.embedder.query
+  bucket.calls += 1
+  return rawBatchedEmbedder(text)
+}
 
 const answerer = async (prompt, retries = 3) => {
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -111,7 +186,13 @@ const answerer = async (prompt, retries = 3) => {
   throw new Error('OpenAI answerer: max retries exceeded')
 }
 
-const judge = async (question, expected, got, retries = 3) => {
+// Uses LongMemEval's official per-question-type prompts (see ./judge-prompts.js).
+// Routes by questionType + isAbstention so accuracy is comparable to the paper.
+const judge = async (question, expected, got, questionType, isAbstention, retries = 3) => {
+  const prompt = buildJudgePrompt({
+    questionType, isAbstention,
+    question, answer: expected, response: got,
+  })
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method:  'POST',
@@ -123,20 +204,7 @@ const judge = async (question, expected, got, retries = 3) => {
         model:       'gpt-4o',
         max_tokens:  10,
         temperature: 0,
-        messages: [{
-          role:    'user',
-          content: `You are evaluating a question-answering system.
-
-Question: ${question}
-Expected answer: ${expected}
-System answer: ${got}
-
-Does the system answer correctly answer the question given the expected answer?
-The system answer may be phrased differently but must convey the same information.
-If the expected answer is an abstention and the system says "I don't know", that is correct.
-
-Respond with ONLY "correct" or "incorrect".`,
-        }],
+        messages:    [{ role: 'user', content: prompt }],
       }),
     })
     const data = await res.json()
@@ -149,7 +217,7 @@ Respond with ONLY "correct" or "incorrect".`,
     if (data.error) throw new Error(`OpenAI judge: ${data.error.message}`)
     tokenLog.judging.input  += data.usage?.prompt_tokens     ?? 0
     tokenLog.judging.output += data.usage?.completion_tokens ?? 0
-    return data.choices?.[0]?.message?.content?.trim().toLowerCase() === 'correct'
+    return parseJudgeVerdict(data.choices?.[0]?.message?.content)
   }
   throw new Error('OpenAI judge: max retries exceeded')
 }
@@ -416,6 +484,8 @@ const run = {
     model_answerer:  'gpt-4o',
     model_embedder:  'voyage-3',
     model_judge:     'gpt-4o',
+    tokens_format:   'v2-phase-keyed',  // see questions[].tokens shape
+    judge_format:    'paper-official-v1',  // LongMemEval per-type prompts (./judge-prompts.js)
   },
   summary:   {},
   questions: [],
@@ -437,7 +507,8 @@ console.log(`\n[benchmark] starting — results: ${resultsFile}\n`)
 for (let i = 0; i < questions.length; i++) {
   const tc = questions[i]
   const { question_id, question_type, question, answer: expected,
-          question_date, haystack_sessions, haystack_dates } = tc
+          question_date, haystack_sessions, haystack_dates,
+          haystack_session_ids, answer_session_ids } = tc
 
   const isAbstention = question_id.endsWith('_abs')
 
@@ -450,9 +521,7 @@ for (let i = 0; i < questions.length; i++) {
   console.log()
 
   // reset token log per question
-  tokenLog.extraction = { input: 0, output: 0, calls: 0 }
-  tokenLog.answering  = { input: 0, output: 0 }
-  tokenLog.judging    = { input: 0, output: 0 }
+  resetTokenLog()
 
   const memory = new Memory({
     extractor, embedder,
@@ -469,17 +538,33 @@ for (let i = 0; i < questions.length; i++) {
   } else {
     for (let s = 0; s < haystack_sessions.length; s++) {
       process.stdout.write(`  ingesting session ${s + 1}/${haystack_sessions.length}...`)
-      try { await memory.add(haystack_sessions[s], { date: haystack_dates[s] }) }
+      try {
+        await memory.add(haystack_sessions[s], {
+          date:      haystack_dates[s],
+          sessionId: haystack_session_ids?.[s] ?? null,
+        })
+      }
       catch (err) { process.stderr.write(`\n  [warn] session ${s}: ${err.message}\n`) }
       process.stdout.write('\r' + ' '.repeat(50) + '\r')
     }
   }
   const ingestMs = Date.now() - t0
 
+  const ext = tokenLog.extractor
+  const emb = tokenLog.embedder
+  const totalHaikuCalls = sumCalls(ext)
+  const totalHaikuIn    = sumIn(ext)
+  const totalHaikuOut   = sumOut(ext)
+
   console.log(`  ⏱  ingest:         ${(ingestMs / 1000).toFixed(1)}s  (~${(ingestMs / haystack_sessions.length / 1000).toFixed(2)}s/session)`)
-  console.log(`  🔢  haiku calls:    ${tokenLog.extraction.calls}  (~${Math.round(tokenLog.extraction.calls / haystack_sessions.length)} calls/session)`)
-  console.log(`  🔢  haiku in:       ${tokenLog.extraction.input.toLocaleString()} tokens  (~${Math.round(tokenLog.extraction.input / haystack_sessions.length).toLocaleString()} tokens/session)`)
-  console.log(`  🔢  haiku out:      ${tokenLog.extraction.output.toLocaleString()} tokens`)
+  console.log(`  🔢  haiku — extraction:        ${ext.extraction.calls} calls, ${ext.extraction.input.toLocaleString()} in / ${ext.extraction.output.toLocaleString()} out`)
+  console.log(`  🔢  haiku — relationship:      ${ext.relationship.calls} calls, ${ext.relationship.input.toLocaleString()} in / ${ext.relationship.output.toLocaleString()} out`)
+  console.log(`  🔢  haiku — contextualization: ${ext.contextualization.calls} calls, ${ext.contextualization.input.toLocaleString()} in / ${ext.contextualization.output.toLocaleString()} out`)
+  if (ext.derivation.calls > 0) {
+    console.log(`  🔢  haiku — derivation:        ${ext.derivation.calls} calls, ${ext.derivation.input.toLocaleString()} in / ${ext.derivation.output.toLocaleString()} out`)
+  }
+  console.log(`  🔢  haiku — total:             ${totalHaikuCalls} calls, ${totalHaikuIn.toLocaleString()} in / ${totalHaikuOut.toLocaleString()} out`)
+  console.log(`  📐  embedder calls — chunk/dedup/memory/query/derivation: ${emb.chunk.calls}/${emb.dedup_seed.calls}/${emb.memory.calls}/${emb.query.calls}/${emb.derivation.calls}  (total ${sumCalls(emb)})`)
 
   // ── search ──────────────────────────────────────────────────────────────
   const t1 = Date.now()
@@ -490,6 +575,28 @@ for (let i = 0; i < questions.length; i++) {
     : questionDateNorm.slice(0, 10) + 'T23:59'
   const retrieved = await memory.search(question, { topN: SEARCH_TOP_N, asOf })
   console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)`)
+
+  // ── retrieval metrics ───────────────────────────────────────────────────
+  const goldSessions     = new Set(answer_session_ids ?? [])
+  const rankedSessionIds = retrieved.map(r => r.session_id ?? null)
+  const trackedRetrieved = rankedSessionIds.filter(s => s != null).length
+  const legacyDb         = retrieved.length > 0 && trackedRetrieved === 0
+
+  let recall_at_5, recall_at_10, ndcg_at_5, ndcg_at_10
+  if (goldSessions.size === 0) {
+    recall_at_5 = recall_at_10 = ndcg_at_5 = ndcg_at_10 = null
+  } else if (legacyDb) {
+    recall_at_5 = recall_at_10 = ndcg_at_5 = ndcg_at_10 = null
+    process.stderr.write(`  [warn] metrics skipped — retrieved items have no session_id (re-ingest needed)\n`)
+  } else {
+    recall_at_5  = recallAtK(rankedSessionIds, goldSessions, 5)
+    recall_at_10 = recallAtK(rankedSessionIds, goldSessions, 10)
+    ndcg_at_5    = ndcgAtK  (rankedSessionIds, goldSessions, 5)
+    ndcg_at_10   = ndcgAtK  (rankedSessionIds, goldSessions, 10)
+  }
+
+  const fmtMetric = v => v == null ? '—' : (v * 100).toFixed(0) + '%'
+  console.log(`  📚  R@5 ${fmtMetric(recall_at_5)}  R@10 ${fmtMetric(recall_at_10)}  N@5 ${fmtMetric(ndcg_at_5)}  N@10 ${fmtMetric(ndcg_at_10)}  (${trackedRetrieved}/${retrieved.length} tagged, ${goldSessions.size} gold)`)
 
   // ── answer ───────────────────────────────────────────────────────────────
   const temporalTimeline = buildTemporalTimeline(question, retrieved)
@@ -503,32 +610,43 @@ for (let i = 0; i < questions.length; i++) {
   console.log(`  📊  expected: "${expected}"`)
 
   // ── judge ────────────────────────────────────────────────────────────────
+  // All question types (incl. _abs) route through the paper's per-type prompts.
   const t4 = Date.now()
   let correct = false
   let failureReason = null
-  if (isAbstention) {
-    correct = /i don.t know|don.t have|no information|cannot find|not mentioned|does not provide/i.test(answer)
-  } else {
-    correct = await judge(question, expected, answer)
-    if (!correct) failureReason = classifyFailure(expected, retrieved)
-  }
+  correct = await judge(question, expected, answer, question_type, isAbstention)
+  if (!correct) failureReason = classifyFailure(expected, retrieved)
   console.log(`  ⏱  judge:          ${(Date.now() - t4).toFixed(0)}ms  (${tokenLog.judging.input.toLocaleString()} tokens)`)
   console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}`)
 
   // ── cost breakdown ────────────────────────────────────────────────────────
-  const haikuCost = (tokenLog.extraction.input * 1 + tokenLog.extraction.output * 5) / 1_000_000
+  const HAIKU_IN_PER_M  = 1    // $ per million input tokens
+  const HAIKU_OUT_PER_M = 5
+  const costFor = b => (b.input * HAIKU_IN_PER_M + b.output * HAIKU_OUT_PER_M) / 1_000_000
+
+  const haikuExtractionCost = costFor(ext.extraction)
+  const haikuRelationCost   = costFor(ext.relationship)
+  const haikuContextCost    = costFor(ext.contextualization)
+  const haikuDerivationCost = costFor(ext.derivation)
+  const haikuSubtotal       = haikuExtractionCost + haikuRelationCost + haikuContextCost + haikuDerivationCost
   const gpt4oCost = (
     (tokenLog.answering.input + tokenLog.judging.input) * 2.5 +
     (tokenLog.answering.output + tokenLog.judging.output) * 10
   ) / 1_000_000
-  const totalCost = haikuCost + gpt4oCost
+  const totalCost = haikuSubtotal + gpt4oCost
   const totalMs   = Date.now() - t0
 
   console.log(`\n  💰 Cost breakdown:`)
-  console.log(`     Haiku   (extraction):   $${haikuCost.toFixed(4)}`)
-  console.log(`     GPT-4o  (answer+judge): $${gpt4oCost.toFixed(4)}`)
-  console.log(`     Total   (this question):$${totalCost.toFixed(4)}`)
-  console.log(`     × 60 questions:        ~$${(totalCost * 60).toFixed(2)}`)
+  console.log(`     Haiku — extraction:        $${haikuExtractionCost.toFixed(4)}  (${ext.extraction.calls} calls)`)
+  console.log(`     Haiku — relationship:      $${haikuRelationCost.toFixed(4)}  (${ext.relationship.calls} calls)`)
+  console.log(`     Haiku — contextualization: $${haikuContextCost.toFixed(4)}  (${ext.contextualization.calls} calls)`)
+  if (haikuDerivationCost > 0) {
+    console.log(`     Haiku — derivation:        $${haikuDerivationCost.toFixed(4)}  (${ext.derivation.calls} calls)`)
+  }
+  console.log(`     Haiku — subtotal:          $${haikuSubtotal.toFixed(4)}`)
+  console.log(`     GPT-4o (answer+judge):     $${gpt4oCost.toFixed(4)}`)
+  console.log(`     Total (this question):     $${totalCost.toFixed(4)}`)
+  console.log(`     × 60 questions:           ~$${(totalCost * 60).toFixed(2)}`)
   console.log(`\n  ⏱  Total time: ${(totalMs / 1000 / 60).toFixed(1)} min`)
   console.log(`     × 60 questions: ~${((totalMs / 1000 / 60) * 60 / 60).toFixed(1)} hours`)
 
@@ -536,10 +654,25 @@ for (let i = 0; i < questions.length; i++) {
     question_id, question_type, question, expected, answer,
     correct, is_abstention: isAbstention, failure_reason: failureReason,
     ingest_ms: ingestMs, sessions_count: haystack_sessions.length, retrieved_count: retrieved.length,
+    recall_at_5, recall_at_10, ndcg_at_5, ndcg_at_10,
+    gold_sessions:      [...goldSessions],
+    retrieved_sessions: rankedSessionIds,
     tokens: {
-      haiku_input:  tokenLog.extraction.input,
-      haiku_output: tokenLog.extraction.output,
-      haiku_calls:  tokenLog.extraction.calls,
+      extractor: {
+        extraction:        { ...ext.extraction },
+        relationship:      { ...ext.relationship },
+        contextualization: { ...ext.contextualization },
+        derivation:        { ...ext.derivation },
+        total: { input: totalHaikuIn, output: totalHaikuOut, calls: totalHaikuCalls },
+      },
+      embedder: {
+        chunk:      { ...emb.chunk },
+        dedup_seed: { ...emb.dedup_seed },
+        memory:     { ...emb.memory },
+        query:      { ...emb.query },
+        derivation: { ...emb.derivation },
+        total: { calls: sumCalls(emb) },
+      },
       gpt4o_input:  tokenLog.answering.input  + tokenLog.judging.input,
       gpt4o_output: tokenLog.answering.output + tokenLog.judging.output,
     },
@@ -552,6 +685,7 @@ for (let i = 0; i < questions.length; i++) {
       event_date:    r.event_date,
       relation_type: r.relation_type,
       source_role:   r.source_role,
+      session_id:    r.session_id ?? null,
     })),
   })
 
@@ -560,43 +694,165 @@ for (let i = 0; i < questions.length; i++) {
 
 // ── summary ────────────────────────────────────────────────────────────────
 
+const LLM_PHASES      = ['extraction', 'relationship', 'contextualization', 'derivation']
+const EMBEDDER_PHASES = ['chunk', 'dedup_seed', 'memory', 'query', 'derivation']
+
 const byCat = {}
+const llmTotal      = Object.fromEntries(LLM_PHASES.map(p      => [p, { input: 0, output: 0, calls: 0 }]))
+const embedderTotal = Object.fromEntries(EMBEDDER_PHASES.map(p => [p, { calls: 0 }]))
+
 for (const r of run.questions) {
-  if (!byCat[r.question_type]) byCat[r.question_type] = { total: 0, correct: 0, failures: {} }
-  byCat[r.question_type].total++
-  if (r.correct) byCat[r.question_type].correct++
+  if (!byCat[r.question_type]) {
+    byCat[r.question_type] = {
+      total: 0, correct: 0, failures: {},
+      r5_sum: 0, r10_sum: 0, n5_sum: 0, n10_sum: 0, metric_n: 0,
+      extractor: Object.fromEntries(LLM_PHASES.map(p      => [p, { input: 0, output: 0, calls: 0 }])),
+      embedder:  Object.fromEntries(EMBEDDER_PHASES.map(p => [p, { calls: 0 }])),
+    }
+  }
+  const cat = byCat[r.question_type]
+  cat.total++
+  if (r.correct) cat.correct++
   else if (r.failure_reason) {
-    byCat[r.question_type].failures[r.failure_reason] =
-      (byCat[r.question_type].failures[r.failure_reason] ?? 0) + 1
+    cat.failures[r.failure_reason] = (cat.failures[r.failure_reason] ?? 0) + 1
+  }
+  if (r.recall_at_5 != null) {
+    cat.r5_sum  += r.recall_at_5
+    cat.r10_sum += r.recall_at_10
+    cat.n5_sum  += r.ndcg_at_5
+    cat.n10_sum += r.ndcg_at_10
+    cat.metric_n += 1
+  }
+  // phase-keyed token/call accumulation
+  const t = r.tokens
+  if (t?.extractor) {
+    for (const phase of LLM_PHASES) {
+      const src = t.extractor[phase]; if (!src) continue
+      cat.extractor[phase].input  += src.input  ?? 0
+      cat.extractor[phase].output += src.output ?? 0
+      cat.extractor[phase].calls  += src.calls  ?? 0
+      llmTotal[phase].input  += src.input  ?? 0
+      llmTotal[phase].output += src.output ?? 0
+      llmTotal[phase].calls  += src.calls  ?? 0
+    }
+  }
+  if (t?.embedder) {
+    for (const phase of EMBEDDER_PHASES) {
+      const src = t.embedder[phase]; if (!src) continue
+      cat.embedder[phase].calls += src.calls ?? 0
+      embedderTotal[phase].calls += src.calls ?? 0
+    }
   }
 }
 
 console.log(`\n${'─'.repeat(70)}`)
 console.log('\n── Results ─────────────────────────────────────────────────────────────')
 
+const pct = (sum, n) => n ? ((sum / n) * 100).toFixed(1) + '%' : '—'
+const head = `  ${'category'.padEnd(28)} ${'acc'.padStart(7)} ${'R@5'.padStart(7)} ${'R@10'.padStart(7)} ${'N@5'.padStart(7)} ${'N@10'.padStart(7)}  ${'supermem'.padStart(8)}  failures`
+console.log(head)
+
 let totalCorrect = 0, totalTotal = 0
+let totalR5 = 0, totalR10 = 0, totalN5 = 0, totalN10 = 0, totalMetricN = 0
 for (const [cat, s] of Object.entries(byCat)) {
-  const pct  = ((s.correct / s.total) * 100).toFixed(1)
-  const sm   = SUPERMEMORY_SCORES[cat]?.toFixed(1) ?? '—'
+  const acc  = ((s.correct / s.total) * 100).toFixed(1) + '%'
+  const sm   = SUPERMEMORY_SCORES[cat] != null ? SUPERMEMORY_SCORES[cat].toFixed(1) + '%' : '—'
   const fail = Object.entries(s.failures).map(([k, v]) => `${k}:${v}`).join(' ')
-  console.log(`  ${cat.padEnd(35)} ${(pct + '%').padEnd(13)} supermemory:${sm}%  ${fail}`)
+  console.log(
+    `  ${cat.padEnd(28)} ${acc.padStart(7)} ` +
+    `${pct(s.r5_sum,  s.metric_n).padStart(7)} ` +
+    `${pct(s.r10_sum, s.metric_n).padStart(7)} ` +
+    `${pct(s.n5_sum,  s.metric_n).padStart(7)} ` +
+    `${pct(s.n10_sum, s.metric_n).padStart(7)}  ` +
+    `${sm.padStart(8)}  ${fail}`
+  )
   totalCorrect += s.correct
   totalTotal   += s.total
+  totalR5  += s.r5_sum;  totalR10 += s.r10_sum
+  totalN5  += s.n5_sum;  totalN10 += s.n10_sum
+  totalMetricN += s.metric_n
 }
 
-const overall = ((totalCorrect / totalTotal) * 100).toFixed(1)
-console.log(`  ${'overall'.padEnd(35)} ${(overall + '%').padEnd(13)} supermemory:81.6%`)
+const overall = ((totalCorrect / totalTotal) * 100).toFixed(1) + '%'
+console.log(
+  `  ${'overall'.padEnd(28)} ${overall.padStart(7)} ` +
+  `${pct(totalR5,  totalMetricN).padStart(7)} ` +
+  `${pct(totalR10, totalMetricN).padStart(7)} ` +
+  `${pct(totalN5,  totalMetricN).padStart(7)} ` +
+  `${pct(totalN10, totalMetricN).padStart(7)}  ` +
+  `${'81.6%'.padStart(8)}`
+)
+// ── Cost & call dominance ─────────────────────────────────────────────────
+const HAIKU_IN_PER_M  = 1
+const HAIKU_OUT_PER_M = 5
+const phaseCost = b => (b.input * HAIKU_IN_PER_M + b.output * HAIKU_OUT_PER_M) / 1_000_000
+
+const llmCostTotal = LLM_PHASES.reduce((s, p) => s + phaseCost(llmTotal[p]), 0)
+
+console.log('\n── Cost & call dominance ───────────────────────────────────────────────')
+console.log(`  ${'phase'.padEnd(30)} ${'calls'.padStart(8)} ${'in tok'.padStart(12)} ${'out tok'.padStart(10)} ${'$'.padStart(9)} ${'% LLM $'.padStart(9)}`)
+for (const phase of LLM_PHASES) {
+  const b = llmTotal[phase]
+  const $ = phaseCost(b)
+  const pctShare = llmCostTotal > 0 ? ((($ / llmCostTotal) * 100).toFixed(1) + '%') : '—'
+  console.log(
+    `  ${('Haiku — ' + phase).padEnd(30)} ${String(b.calls).padStart(8)} ${b.input.toLocaleString().padStart(12)} ${b.output.toLocaleString().padStart(10)} ${('$' + $.toFixed(4)).padStart(9)} ${pctShare.padStart(9)}`
+  )
+}
+const llmCallsAll = LLM_PHASES.reduce((s, p) => s + llmTotal[p].calls,  0)
+const llmInAll    = LLM_PHASES.reduce((s, p) => s + llmTotal[p].input,  0)
+const llmOutAll   = LLM_PHASES.reduce((s, p) => s + llmTotal[p].output, 0)
+console.log(
+  `  ${'Haiku — TOTAL'.padEnd(30)} ${String(llmCallsAll).padStart(8)} ${llmInAll.toLocaleString().padStart(12)} ${llmOutAll.toLocaleString().padStart(10)} ${('$' + llmCostTotal.toFixed(4)).padStart(9)} ${'100.0%'.padStart(9)}`
+)
+console.log()
+for (const phase of EMBEDDER_PHASES) {
+  const b = embedderTotal[phase]
+  console.log(`  ${('Embedder — ' + phase).padEnd(30)} ${String(b.calls).padStart(8)}`)
+}
+const embCallsAll = EMBEDDER_PHASES.reduce((s, p) => s + embedderTotal[p].calls, 0)
+console.log(`  ${'Embedder — TOTAL'.padEnd(30)} ${String(embCallsAll).padStart(8)}`)
+
 console.log(`\n[benchmark] results: ${resultsFile}`)
 
+const toPct = (sum, n) => n ? parseFloat(((sum / n) * 100).toFixed(1)) : null
+
 run.summary = {
-  overall_pct:         parseFloat(overall),
-  supermemory_overall: 81.6,
+  overall_pct:                parseFloat(overall),
+  supermemory_overall:        81.6,
+  overall_recall_at_5_pct:    toPct(totalR5,  totalMetricN),
+  overall_recall_at_10_pct:   toPct(totalR10, totalMetricN),
+  overall_ndcg_at_5_pct:      toPct(totalN5,  totalMetricN),
+  overall_ndcg_at_10_pct:     toPct(totalN10, totalMetricN),
+  overall_metric_n:           totalMetricN,
+  cost: {
+    by_phase: Object.fromEntries(LLM_PHASES.map(phase => {
+      const b = llmTotal[phase]
+      const $ = phaseCost(b)
+      return [phase, {
+        calls:      b.calls,
+        in_tokens:  b.input,
+        out_tokens: b.output,
+        cost_usd:   parseFloat($.toFixed(4)),
+        pct_of_llm: llmCostTotal > 0 ? parseFloat((($ / llmCostTotal) * 100).toFixed(1)) : null,
+      }]
+    })),
+    embedder_calls_by_phase: Object.fromEntries(EMBEDDER_PHASES.map(p => [p, embedderTotal[p].calls])),
+    total_haiku_usd: parseFloat(llmCostTotal.toFixed(4)),
+  },
   by_category: Object.fromEntries(Object.entries(byCat).map(([cat, s]) => [cat, {
-    correct:         s.correct,
-    total:           s.total,
-    pct:             parseFloat(((s.correct / s.total) * 100).toFixed(1)),
-    supermemory_pct: SUPERMEMORY_SCORES[cat] ?? null,
-    failures:        s.failures,
+    correct:           s.correct,
+    total:             s.total,
+    pct:               parseFloat(((s.correct / s.total) * 100).toFixed(1)),
+    supermemory_pct:   SUPERMEMORY_SCORES[cat] ?? null,
+    recall_at_5_pct:   toPct(s.r5_sum,  s.metric_n),
+    recall_at_10_pct:  toPct(s.r10_sum, s.metric_n),
+    ndcg_at_5_pct:     toPct(s.n5_sum,  s.metric_n),
+    ndcg_at_10_pct:    toPct(s.n10_sum, s.metric_n),
+    metric_n:          s.metric_n,
+    failures:          s.failures,
+    extractor:         s.extractor,
+    embedder:          s.embedder,
   }])),
 }
 

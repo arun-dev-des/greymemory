@@ -77,7 +77,11 @@ export function createBatchEmbedder(batchFn, opts = {}) {
     if (queue.length > 0) flush()
   }
 
-  return function embedder(text) {
+  // Accepts an optional `context` arg (e.g. { phase }) to match the EmbedderFn
+  // type used by the library. Batching mixes phases, so context is intentionally
+  // ignored here — consumers that want per-phase metering should wrap the
+  // returned function.
+  return function embedder(text, _context) {
     return new Promise((resolve, reject) => {
       queue.push({ text, resolve, reject })
 

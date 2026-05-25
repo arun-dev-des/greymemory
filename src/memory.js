@@ -41,6 +41,13 @@ export class Memory {
     const documentDate  = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
     const entityContext = opts.entityContext ?? this.entityContext;
 
+    // Per-add() call accounting. Counts attempts (before each await) so the
+    // numbers stay accurate even when an upstream API throws. Consumers wrap
+    // the extractor/embedder for per-token tally; these counters are for
+    // consumers who don't wrap.
+    const llmCallCounts      = { extraction: 0, relationship: 0, contextualization: 0 }
+    const embedderCallCounts = { chunk: 0, dedup_seed: 0, memory: 0 }
+
     // 1. Normalize input into messages array
     const messages = Array.isArray(input)
       ? input
@@ -62,31 +69,38 @@ export class Memory {
         ? `${message.role}: ${message.content}`
         : message.content
 
-      const chunkContent = this.contextualRetrieval
-        ? await this._contextualizeChunk(rawChunk, fullConversation)
-        : rawChunk
+      let chunkContent
+      if (this.contextualRetrieval) {
+        llmCallCounts.contextualization++
+        chunkContent = await this._contextualizeChunk(rawChunk, fullConversation)
+      } else {
+        chunkContent = rawChunk
+      }
 
-      this.storage.saveChunk(chunkContent, null, message.role, documentDate)
+      this.storage.saveChunk(chunkContent, opts.sessionId ?? null, message.role, documentDate)
       const chunkId = this.storage.getLastChunkId()
 
       if (chunkId) {
         if (anchorChunkId === null) anchorChunkId = chunkId
         messageIndexToChunkId[messageIndex] = chunkId
-        const vector = await this.embedder(chunkContent)
+        embedderCallCounts.chunk++
+        const vector = await this.embedder(chunkContent, { phase: 'chunk' })
         this.storage.saveChunkEmbedding(chunkId, vector)
       }
     }
 
     // 3. Now run extraction — if it returns empty, chunks are already safe
     const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
-    const inputVector = await this.embedder(inputText)
+    embedderCallCounts.dedup_seed++
+    const inputVector = await this.embedder(inputText, { phase: 'dedup_seed' })
 
     //Todo: Why not Dedup by bm25search as well?
     const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
       .filter(f => f.memory_type !== 'preference')
 
     const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
-    const raw      = await this.extractor(prompt)
+    llmCallCounts.extraction++
+    const raw      = await this.extractor(prompt, { phase: 'extraction' })
     const memories = this._parseExtraction(raw)
 
     if (memories.length === 0) {
@@ -95,7 +109,22 @@ export class Memory {
         : input
       ).slice(0, 300)
       console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${inputPreview}`)
-      return { chunksStored: Object.keys(messageIndexToChunkId).length, factsStored: 0 }
+      return {
+        chunksStored: Object.keys(messageIndexToChunkId).length,
+        factsStored:  0,
+        llmCalls: {
+          extraction:        llmCallCounts.extraction,
+          relationship:      llmCallCounts.relationship,
+          contextualization: llmCallCounts.contextualization,
+          total:             llmCallCounts.extraction + llmCallCounts.relationship + llmCallCounts.contextualization,
+        },
+        embedderCalls: {
+          chunk:      embedderCallCounts.chunk,
+          dedup_seed: embedderCallCounts.dedup_seed,
+          memory:     embedderCallCounts.memory,
+          total:      embedderCallCounts.chunk + embedderCallCounts.dedup_seed + embedderCallCounts.memory,
+        },
+      }
     }
 
     // 4. Save facts (existing logic, unchanged)
@@ -130,7 +159,8 @@ export class Memory {
         ? messageIndexToChunkId[source_message_index]
         : anchorChunkId
 
-      const embedding = await this.embedder(value)
+      embedderCallCounts.memory++
+      const embedding = await this.embedder(value, { phase: 'memory' })
 
       const isDuplicate = savedThisBatch.some(
         saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
@@ -142,9 +172,13 @@ export class Memory {
         if (strengthened) continue
       }
 
-      const relationship = (memory_type === 'fact' || memory_type === 'episode')
-        ? await this._detectRelationship(mem, embedding, documentDate)
-        : { type: 'NEW', relatedTo: null }
+      let relationship
+      if (memory_type === 'fact' || memory_type === 'episode') {
+        llmCallCounts.relationship++
+        relationship = await this._detectRelationship(mem, embedding, documentDate)
+      } else {
+        relationship = { type: 'NEW', relatedTo: null }
+      }
 
       const factId = this.storage.saveFact(key, value, {
         memory_type,
@@ -174,7 +208,22 @@ export class Memory {
       this.entityContext = `Prior context: ${known.join('. ')}.`
     }
 
-    return { chunksStored: Object.keys(messageIndexToChunkId).length, factsStored: savedThisBatch.length }
+    return {
+      chunksStored: Object.keys(messageIndexToChunkId).length,
+      factsStored:  savedThisBatch.length,
+      llmCalls: {
+        extraction:        llmCallCounts.extraction,
+        relationship:      llmCallCounts.relationship,
+        contextualization: llmCallCounts.contextualization,
+        total:             llmCallCounts.extraction + llmCallCounts.relationship + llmCallCounts.contextualization,
+      },
+      embedderCalls: {
+        chunk:      embedderCallCounts.chunk,
+        dedup_seed: embedderCallCounts.dedup_seed,
+        memory:     embedderCallCounts.memory,
+        total:      embedderCallCounts.chunk + embedderCallCounts.dedup_seed + embedderCallCounts.memory,
+      },
+    }
   }
 
   // ── Search ─────────────────────────────────────────
@@ -200,7 +249,7 @@ export class Memory {
     }
 
     // ── core retrieval ──
-    const queryVector = await this.embedder(query);
+    const queryVector = await this.embedder(query, { phase: 'query' });
     const rawResults  = this.storage.hybridSearch(
       query,           // raw text for BM25
       queryVector,     // embedding for vector search
@@ -209,22 +258,30 @@ export class Memory {
       asOfNorm,        // temporal cutoff
     );
 
-    // ── apply filters (unchanged) ──
+    // ── apply filters ──
     let filtered = rawResults;
 
     if (memoryTypes) {
-      filtered = filtered.filter(r => r._type === 'chunk' || memoryTypes.includes(r.memory_type));
+      filtered = filtered.filter(r =>
+        r._type === 'chunk' || memoryTypes.includes(r.memory_type)
+      );
     }
+
     if (!includeHistory && !asOfNorm) {
-      filtered = filtered.filter(r => r._type === 'chunk' || r.is_latest !== 0);
+      filtered = filtered.filter(r =>
+        r._type === 'chunk' || r.is_latest !== 0
+      );
     }
+
     if (!includeExpired) {
       const expiryCutoff = asOfNorm ? asOfNorm.slice(0, 10) : new Date().toISOString().slice(0, 10);
       filtered = filtered.filter(r => r._type === 'chunk' || !r.expires_at || r.expires_at > expiryCutoff);
     }
+
     if (afterDate) {
       filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date >= afterDate));
     }
+
     if (beforeDate) {
       filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= beforeDate));
     }
@@ -239,7 +296,7 @@ export class Memory {
     let history  = []
 
     if (expandViaGraph && expandedLimit > 0) {
-      const seedFacts = seedResults.filter(r => r._type !== 'chunk' && r.id)
+      const seedFacts = seedResults.filter(r => r._type !== 'chunk' && r.id) // is this a fact, not a chunk? does it have a database ID?
 
       if (seedFacts.length > 0) {
         // Forward semantic traversal: facts connected via EXTENDS chains
@@ -290,6 +347,7 @@ export class Memory {
           event_date:    null,
           relation_type: null,
           source_role:   result.source_role ?? null,
+          session_id:    result.session_id ?? null,
         }
       }
       return this._factToResult(result)
@@ -386,7 +444,7 @@ export class Memory {
   // never hard deletes — data is preserved in database for audit
   // returns the value of what was forgotten, or null if nothing found
   async forget(query) {
-    const embedding = await this.embedder(query);
+    const embedding = await this.embedder(query, { phase: 'query' });
     const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
  
     if (!results[0]) return null;
@@ -407,7 +465,7 @@ export class Memory {
   // always uses semantic search — keys are internal, not public API
   // use natural language: getCurrent('where does Alex work')
   async getCurrent(query) {
-    const embedding = await this.embedder(query);
+    const embedding = await this.embedder(query, { phase: 'query' });
     const results   = this.storage.vectorSearch(embedding, this.storage.container, 1);
     return results[0] ?? null;
   }
@@ -418,7 +476,7 @@ export class Memory {
   // newest first within each chain — current version at index 0
   // let the answering prompt reason about which chain is relevant
   async getHistory(query, topN = 3) {
-    const embedding = await this.embedder(query);
+    const embedding = await this.embedder(query, { phase: 'query' });
     const results   = this.storage.vectorSearch(embedding, this.storage.container, topN);
  
     if (!results.length) return [];
@@ -502,7 +560,7 @@ async runDerivations({ sinceDays = 7, topK = 10 } = {}) {
 
   for (const recentFact of recentFacts) {
     // find top K semantically similar existing facts — anchored to referenceDate
-    const embedding  = await this.embedder(recentFact.value);
+    const embedding  = await this.embedder(recentFact.value, { phase: 'derivation' });
     const candidates = this.storage.vectorSearch(embedding, this.storage.container, topK, referenceDate)
       .filter(f => f.id !== recentFact.id && f.memory_type === 'fact');
 
@@ -532,7 +590,7 @@ Return ONLY valid JSON, no explanation:
 or null if no confident inference exists.`;
 
     try {
-      const raw  = await this.extractor(prompt);
+      const raw  = await this.extractor(prompt, { phase: 'derivation' });
       const text = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
 
       if (text === 'null' || !text) continue;
@@ -547,7 +605,7 @@ or null if no confident inference exists.`;
       if (validIds.length < 2) continue;
 
       // check this inference doesn't already exist — anchored to referenceDate
-      const deriveEmbedding = await this.embedder(result.derives);
+      const deriveEmbedding = await this.embedder(result.derives, { phase: 'derivation' });
       const allCurrent      = this.storage.db.prepare(`
         SELECT id, value FROM facts
         WHERE container = ? AND is_latest = 1
@@ -609,7 +667,7 @@ ${chunk}
 Give a short succinct context (1-2 sentences) to situate this message within the overall conversation for improving search retrieval. Resolve all pronouns and vague references to specific names and places. Answer only with the context and nothing else.`;
  
     try {
-      const context = await this.extractor(prompt);
+      const context = await this.extractor(prompt, { phase: 'contextualization' });
       // prepend context to chunk — both are stored, embedded, and BM25 indexed together
       return `${context.trim()}\n${chunk}`;
     } catch {
@@ -625,20 +683,21 @@ Give a short succinct context (1-2 sentences) to situate this message within the
   //   2. We hit a dangling pointer (superseded_by points to deleted fact) — return null
   //   3. We exceeded 20 hops (defensive cycle guard) — return null
   _walkSupersession(factId) {
-    let current = this.storage.db.prepare(
-      `SELECT * FROM facts WHERE id = ?`
-    ).get(factId)
+    const lookup = this.storage.db.prepare(`
+      SELECT f.*, c.session_id AS session_id
+      FROM facts f
+      LEFT JOIN chunks c ON c.id = f.chunk_id
+      WHERE f.id = ?
+    `)
 
+    let current = lookup.get(factId)
     if (!current) return null
 
     let hops = 0
     while (current && current.is_latest === 0 && current.superseded_by) {
       if (++hops > 20) return null  // cycle guard
 
-      const next = this.storage.db.prepare(
-        `SELECT * FROM facts WHERE id = ?`
-      ).get(current.superseded_by)
-
+      const next = lookup.get(current.superseded_by)
       if (!next) return null  // dangling pointer
       current = next
     }
@@ -654,18 +713,17 @@ Give a short succinct context (1-2 sentences) to situate this message within the
   // with one addition: the optional `_expansion` field on traversed facts.
   _factToResult(fact, expansion = null) {
     const result = {
-      memory:        fact.value,
-      chunk:         this.storage.getChunk(fact.chunk_id),
-      memory_type:   fact.memory_type,
-      confidence:    fact.confidence,
-      document_date: fact.document_date,
-      event_date:    fact.event_date,
-      relation_type: fact.relation_type,
-      source_role:   fact.source_role,
+      memory:        fact.value,                          // the extracted memory text
+      chunk:         this.storage.getChunk(fact.chunk_id), // raw conversation that produced this fact
+      memory_type:   fact.memory_type,                    // 'fact', 'preference', 'episode'
+      confidence:    fact.confidence,                     // 0.0-2.0
+      document_date: fact.document_date,                  // when the conversation happened
+      event_date:    fact.event_date,                     // when the event described happened (may differ)
+      relation_type: fact.relation_type,                  // 'UPDATES', 'EXTENDS', or null
+      source_role:   fact.source_role,                    // 'user' or 'assistant'
+      session_id:    fact.session_id ?? null,             // chunk's session_id, propagated through search joins
     }
-
-    if (expansion) result._expansion = expansion
-
+    if (expansion) result._expansion = expansion          // only on graph-expanded results
     return result
   }
 
@@ -681,21 +739,13 @@ Give a short succinct context (1-2 sentences) to situate this message within the
   //
   // Returns: [{ fact, _expansion: { via, depth, seedId, supersededFrom } }, ...]
   async _expandViaExtends(seedFacts, { maxDepth = 5, maxResults = 10, asOfNorm = null } = {}) {
-    const seedIds = seedFacts.filter(f => f.id).map(f => f.id)
+    const seedIds = seedFacts.filter(f => f.id).map(f => f.id)  // only IDs in a array ~ [42, 45, 51, 89, 102, 107]
     if (seedIds.length === 0) return []
 
-    // `seen` tracks every fact id we've already processed (seed or expanded) — prevents
-    // revisiting and prevents the expanded set from including seeds.
-    const seen = new Set(seedIds)
-
-    // Frontier: the set of fact ids whose neighbors we'll explore in the next iteration.
-    // Starts with seeds; each iteration replaces it with the newly-discovered ids.
-    let frontier = [...seedIds]
-
-    // Provenance tracking: for each discovered fact, which seed brought it in?
-    // Useful for debugging and for the answerer to weight results by seed proximity.
+    const seen = new Set(seedIds) // seen internally looks like: { 42, 45, 51, 89, 102, 107 }
+    let frontier = [...seedIds]   // copy of seed id in array ~ [42, 45, 51, 89, 102, 107]
     const seedIdByFact = new Map()
-    for (const id of seedIds) seedIdByFact.set(id, id)
+    for (const id of seedIds) seedIdByFact.set(id, id)  // Store Set(67, 42) ~ "fact 67 was brought in by seed 42"
 
     // Pre-compute expiry cutoff once — used to filter expired episodes consistently
     // with the rest of the codebase's expiry semantics.
@@ -706,7 +756,7 @@ Give a short succinct context (1-2 sentences) to situate this message within the
     const collected = []
 
     for (let depth = 1; depth <= maxDepth && frontier.length > 0 && collected.length < maxResults; depth++) {
-      const placeholders = frontier.map(() => '?').join(',')
+      const placeholders = frontier.map(() => '?').join(',')  // "?"  (one placeholder for one frontier ID)
 
       // Find all EXTENDS neighbors of the current frontier — both directions in one query.
       //
@@ -719,10 +769,12 @@ Give a short succinct context (1-2 sentences) to situate this message within the
       // We fetch all columns because we need the full row to apply filters
       // (is_latest, expires_at, document_date) and to attach as result.
       const neighbors = this.storage.db.prepare(`
-        SELECT DISTINCT f.* FROM facts f
+        SELECT DISTINCT f.*, c.session_id AS session_id
+        FROM facts f
+        LEFT JOIN chunks c ON c.id = f.chunk_id
         WHERE f.container = ?
           AND (
-            -- outgoing: the thing frontier extends
+            -- outgoing: what does the frontier extend?
             f.id IN (
               SELECT related_to FROM facts
               WHERE id IN (${placeholders})
@@ -730,7 +782,7 @@ Give a short succinct context (1-2 sentences) to situate this message within the
                 AND related_to IS NOT NULL
             )
             OR
-            -- incoming: the thing that extends frontier
+            -- incoming: what extends the frontier?
             (f.related_to IN (${placeholders}) AND f.relation_type = 'EXTENDS')
           )
       `).all(this.storage.container, ...frontier, ...frontier)
@@ -824,22 +876,25 @@ Give a short succinct context (1-2 sentences) to situate this message within the
     const seen = new Set(seedIds)
     const collected = []
 
+    const lookup = this.storage.db.prepare(`
+      SELECT f.*, c.session_id AS session_id
+      FROM facts f
+      LEFT JOIN chunks c ON c.id = f.chunk_id
+      WHERE f.id = ?
+    `)
+
     for (const seed of seedFacts) {
       if (!seed.id) continue
 
       // Re-fetch the seed's full row — hybridSearch results don't include
       // superseded_from, which is what we need to walk backward.
-      let current = this.storage.db.prepare(
-        `SELECT * FROM facts WHERE id = ?`
-      ).get(seed.id)
+      let current = lookup.get(seed.id)
 
       let depth = 0
       while (current?.superseded_from && depth < 20) {
         depth++
 
-        const prev = this.storage.db.prepare(
-          `SELECT * FROM facts WHERE id = ?`
-        ).get(current.superseded_from)
+        const prev = lookup.get(current.superseded_from)
 
         if (!prev) break
         if (seen.has(prev.id)) break
@@ -986,10 +1041,10 @@ Return ONLY valid JSON, no explanation:
 {"type": "UPDATES|EXTENDS|NEW", "relatedTo": <id of most related existing memory, or null if NEW>}`;
  
     try {
-      const raw    = await this.extractor(prompt);
+      const raw    = await this.extractor(prompt, { phase: 'relationship' });
       const text   = raw.trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
       const result = JSON.parse(text);
- 
+
       // validate — ensure relatedTo points to a real candidate
       const validId = candidates.find(c => c.id === result.relatedTo)?.id ?? null;
  

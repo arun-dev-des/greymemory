@@ -58,6 +58,10 @@ export interface SearchResult {
   document_date: string | null;
   event_date:    string | null;
   relation_type: RelationType;
+  /** 'user' or 'assistant' — source role of the producing message */
+  source_role:   'user' | 'assistant' | null;
+  /** identifier of the session this item came from — null if the chunk had no sessionId at ingest */
+  session_id:    string | null;
 }
 
 /**
@@ -140,7 +144,16 @@ export interface DerivedMemory {
  *   return (await res.json()).message.content
  * }
  */
-export type ExtractorFn = (prompt: string) => Promise<string> | string;
+export interface ExtractorContext {
+  /**
+   * Internal call site the library is making this call from. Lets consumers
+   * attribute LLM tokens/cost to a specific stage of the pipeline.
+   * New phases may be added without breaking changes — match defensively.
+   */
+  phase?: 'extraction' | 'relationship' | 'contextualization' | 'derivation';
+}
+
+export type ExtractorFn = (prompt: string, context?: ExtractorContext) => Promise<string> | string;
 
 /**
  * Converts text into a vector embedding.
@@ -164,7 +177,16 @@ export type ExtractorFn = (prompt: string) => Promise<string> | string;
  *   return res.data[0].embedding
  * }
  */
-export type EmbedderFn = (text: string) => Promise<number[]> | number[];
+export interface EmbedderContext {
+  /**
+   * Internal call site the library is making this call from. Lets consumers
+   * attribute embedder calls (and downstream cost) to a specific stage.
+   * New phases may be added without breaking changes — match defensively.
+   */
+  phase?: 'chunk' | 'dedup_seed' | 'memory' | 'query' | 'derivation';
+}
+
+export type EmbedderFn = (text: string, context?: EmbedderContext) => Promise<number[]> | number[];
 
 // ── Options ────────────────────────────────────────────────────────────────
 
@@ -236,6 +258,27 @@ export interface GreyMemoryOptions {
 }
 
 /**
+ * Result returned by add(). Counts are accumulated per-call (attempts, not
+ * successes), so they match the wrapper's view modulo API-error edge cases.
+ */
+export interface AddResult {
+  chunksStored: number;
+  factsStored:  number;
+  llmCalls: {
+    extraction:        number;
+    relationship:      number;
+    contextualization: number;
+    total:             number;
+  };
+  embedderCalls: {
+    chunk:      number;
+    dedup_seed: number;
+    memory:     number;
+    total:      number;
+  };
+}
+
+/**
  * Options for add()
  */
 export interface AddOptions {
@@ -263,6 +306,13 @@ export interface AddOptions {
    * await memory.add(nextSession, { date, entityContext })
    */
   entityContext?: string;
+
+  /**
+   * Caller-supplied session identifier. Persisted to chunks.session_id and surfaces
+   * on SearchResult.session_id, enabling per-session provenance tracking and
+   * evaluation metrics (e.g. LongMemEval-style Recall@k / NDCG@k).
+   */
+  sessionId?: string | null;
 }
 export interface SearchOptions {
   /** Number of results to return. @default 5 */
@@ -342,7 +392,7 @@ export default class GreyMemory {
    * @example Plain text
    * await memory.add('Arun is building greymemory.', { date: new Date() })
    */
-  add(input: Message[] | string, options?: AddOptions): Promise<void>;
+  add(input: Message[] | string, options?: AddOptions): Promise<AddResult>;
 
   /**
    * Search memory using hybrid BM25 + vector search with RRF fusion.

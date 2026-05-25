@@ -551,9 +551,11 @@ export class Storage {
         f.relation_type,
         f.chunk_id,
         f.source_role,
+        c.session_id AS session_id,
         bm25(facts_fts) AS score
       FROM facts_fts
       JOIN facts f ON facts_fts.rowid = f.id
+      LEFT JOIN chunks c ON c.id = f.chunk_id
       WHERE facts_fts MATCH @query
         AND f.container = @container
         ${versionClause}
@@ -572,7 +574,8 @@ export class Storage {
       event_date:    r.event_date,
       relation_type: r.relation_type,
       chunk_id:      r.chunk_id,
-      source_role: r.source_role,
+      source_role:   r.source_role,
+      session_id:    r.session_id ?? null,
       rank:          index + 1,
       score:         r.score,
     }));
@@ -602,9 +605,10 @@ export class Storage {
     const rows = this.db.prepare(`
       SELECT e.fact_id, f.key, e.vector, f.value, f.memory_type, f.confidence,
             f.document_date, f.event_date, f.relation_type, f.chunk_id,
-            f.source_role
+            f.source_role, c.session_id AS session_id
       FROM embeddings e
       JOIN facts f ON e.fact_id = f.id
+      LEFT JOIN chunks c ON c.id = f.chunk_id
       WHERE e.container = @container
         ${versionClause}
         ${expiresClause}
@@ -622,6 +626,7 @@ export class Storage {
         relation_type: row.relation_type,
         chunk_id:      row.chunk_id,
         source_role:   row.source_role,
+        session_id:    row.session_id ?? null,
         score:         this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)
@@ -690,6 +695,7 @@ export class Storage {
           content:     chunk.content,
           source_role: chunk.source_role,
           created_at:  chunk.created_at,
+          session_id:  chunk.session_id ?? null,
           _type:       'chunk',
           _key:        key,
           rrf:         0,
@@ -750,7 +756,7 @@ export class Storage {
     let rows = []
     try {
       rows = this.db.prepare(`
-        SELECT c.id AS chunk_id, c.content, c.source_role, c.created_at,
+        SELECT c.id AS chunk_id, c.content, c.source_role, c.created_at, c.session_id,
                bm25(chunks_fts) AS score
         FROM chunks_fts
         JOIN chunks c ON chunks_fts.rowid = c.id
@@ -766,6 +772,7 @@ export class Storage {
       content:     r.content,
       source_role: r.source_role,
       created_at:  r.created_at,
+      session_id:  r.session_id ?? null,
       rank:        index + 1,
       score:       r.score,
     }))
@@ -773,7 +780,7 @@ export class Storage {
 
   chunkVectorSearch(queryVector, container, topN = 10) {
     const rows = this.db.prepare(`
-      SELECT ce.chunk_id, ce.vector, c.content, c.source_role, c.created_at
+      SELECT ce.chunk_id, ce.vector, c.content, c.source_role, c.created_at, c.session_id
       FROM chunk_embeddings ce
       JOIN chunks c ON ce.chunk_id = c.id
       WHERE ce.container = @container
@@ -785,6 +792,7 @@ export class Storage {
         content:     row.content,
         source_role: row.source_role,
         created_at:  row.created_at,
+        session_id:  row.session_id ?? null,
         score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),
       }))
       .sort((a, b) => b.score - a.score)

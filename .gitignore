@@ -5,9 +5,11 @@ greymemory.config.js
 test-types.ts
 .greymemory/
 .DS_Store.DS_Store
+greymemory-longmemeval-implementation-plan.md
 
 # Benchmark
 benchmark/.greymemory-bench/
+benchmark/.greymemory-bench-test/
 benchmark/results/
 benchmark/data/
 
