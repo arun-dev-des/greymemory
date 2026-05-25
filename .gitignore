@@ -10,8 +10,7 @@ greymemory-longmemeval-implementation-plan.md
 .greymemory-verify-task3/
 
 # Benchmark
-benchmark/.greymemory-bench/
-benchmark/.greymemory-bench-test/
+benchmark/.greymemory-bench*/
 benchmark/results/
 benchmark/data/
 

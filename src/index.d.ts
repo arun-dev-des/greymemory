@@ -255,6 +255,59 @@ export interface GreyMemoryOptions {
    * Use when you want to manage the database lifecycle yourself.
    */
   db?: object;
+
+  /**
+   * Diagnostic callback — invoked once per relationship-classification
+   * decision (UPDATES / EXTENDS / NEW). Use to instrument the supersession
+   * classifier (Task 5.1: KU-gap diagnosis). Errors thrown by the callback
+   * are swallowed so ingestion never blocks on logging.
+   */
+  onRelationshipDecision?: (entry: RelationshipDecisionLog) => void;
+}
+
+/**
+ * Structured log entry emitted by Memory for each relationship-classification
+ * call. Lets consumers diagnose whether KU failures originate in candidate
+ * retrieval (`candidate_count === 0`, or correct old fact not in `candidates`)
+ * vs. the classifier prompt (correct old fact present but `decision.type !==
+ * 'UPDATES'`).
+ */
+export interface RelationshipDecisionLog {
+  /** Wall-clock ms when the decision was made */
+  timestamp: number;
+  /** Memory container this decision belongs to */
+  container: string;
+  /** The new fact being classified */
+  new_fact: {
+    key:           string;
+    value:         string;
+    memory_type:   MemoryType;
+    document_date: string | null;
+    event_date:    string | null;
+    source_role:   'user' | 'assistant' | null;
+  };
+  /** Number of existing facts the classifier considered */
+  candidate_count: number;
+  /** Trimmed view of each candidate the classifier saw */
+  candidates: Array<{
+    id:            number;
+    key:           string;
+    value:         string;
+    memory_type:   MemoryType;
+    document_date: string | null;
+    event_date:    string | null;
+  }>;
+  /** The chosen relationship */
+  decision: {
+    type:      'UPDATES' | 'EXTENDS' | 'NEW';
+    relatedTo: number | null;
+  };
+  /** The candidate that decision.relatedTo points at — or candidates[0] for NEW */
+  top_candidate: { id: number; key: string; value: string } | null;
+  /** How the decision was reached */
+  reason: 'no_candidates' | 'llm' | 'llm_failed';
+  /** Raw LLM response (when reason === 'llm' | 'llm_failed'); null otherwise */
+  llm_raw: string | null;
 }
 
 /**

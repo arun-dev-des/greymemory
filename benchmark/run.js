@@ -335,14 +335,50 @@ Answer:`
 }
 
 // ── failure classification ─────────────────────────────────────────────────
+// Categories:
+//   'retrieval' — neither gold session reached the top-N. Search problem.
+//   'answering' — the gold session was retrieved but the model still got it
+//                 wrong. Reading-stage / format / timeline issue.
+//   'extraction' — the gold session was retrieved AND the expected literal
+//                 string appears in a chunk/memory, but no atomic fact was
+//                 created for it. Extraction-coverage gap.
+//   'unknown'   — gold session retrieved, no literal match in chunks; the
+//                 answer is derived (number, date arithmetic, comparison).
+//                 The substring heuristic can't tell extraction vs reading
+//                 here, so we name it honestly instead of defaulting to one.
+//
+// Derived-answer categories (TR, MR) bypass the substring test entirely —
+// the expected answer ("7 days", "3 events") never appears literally in
+// source text, so substring-matching always false-negatives and the old
+// classifier always called these 'extraction' regardless of the real cause.
+function classifyFailure({ expected, retrieved, questionType, goldSessions }) {
+  // Retrieval check: did any gold session land in top-N at all?
+  if (goldSessions && goldSessions.size > 0) {
+    const retrievedSessions = new Set(retrieved.map(r => r.session_id).filter(Boolean))
+    const anyGoldRetrieved = [...goldSessions].some(g => retrievedSessions.has(g))
+    if (!anyGoldRetrieved) return 'retrieval'
+  }
 
-function classifyFailure(expected, retrieved) {
+  // Derived-answer categories — substring test is meaningless because the
+  // expected answer is a computation result, not a stored string. We can't
+  // distinguish extraction vs reading from the retrieved chunks alone here;
+  // mark 'answering' since the gold session WAS reached.
+  if (questionType === 'temporal-reasoning' || questionType === 'multi-session') {
+    return 'answering'
+  }
+
+  // Direct-lookup categories — substring test on retrieved items.
   const exp = String(expected).toLowerCase()
   const inRetrieval = retrieved.some(r =>
     r.memory?.toLowerCase().includes(exp) ||
     r.chunk?.toLowerCase().includes(exp)
   )
-  return inRetrieval ? 'answering' : 'extraction'
+  if (inRetrieval) return 'answering'
+
+  // Gold session retrieved but expected string absent from chunks → either
+  // the answer is derived (KU comparing values) or the extractor missed it.
+  // We can't tell which, so 'unknown' rather than the old false 'extraction'.
+  return goldSessions && goldSessions.size > 0 ? 'unknown' : 'extraction'
 }
 
 // ── pre-flight checks ──────────────────────────────────────────────────────
@@ -482,6 +518,21 @@ if (!fs.existsSync(DB_DIR))      fs.mkdirSync(DB_DIR,      { recursive: true })
 const timestamp   = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
 const resultsFile = path.join(RESULTS_DIR, `run-${timestamp}.json`)
 
+// Task 5.1 — relationship-classification log. One JSON line per decision.
+// Tagged with current_question_id so per-question diagnosis is possible.
+const relationshipLogFile = path.join(RESULTS_DIR, `relationship-decisions-${timestamp}.jsonl`)
+let currentQuestionId = null  // set inside the question loop
+const relationshipStats = { total: 0, UPDATES: 0, EXTENDS: 0, NEW: 0, no_candidates: 0, llm_failed: 0, candidate_count_sum: 0 }
+const relationshipLogStream = fs.createWriteStream(relationshipLogFile, { flags: 'a' })
+const onRelationshipDecision = entry => {
+  relationshipStats.total += 1
+  relationshipStats[entry.decision.type] += 1
+  relationshipStats.candidate_count_sum += entry.candidate_count
+  if (entry.reason === 'no_candidates') relationshipStats.no_candidates += 1
+  if (entry.reason === 'llm_failed')    relationshipStats.llm_failed    += 1
+  relationshipLogStream.write(JSON.stringify({ question_id: currentQuestionId, ...entry }) + '\n')
+}
+
 const run = {
   meta: {
     timestamp, total: questions.length, per_category: PER_CATEGORY,
@@ -530,12 +581,14 @@ for (let i = 0; i < questions.length; i++) {
   // reset token log per question
   resetTokenLog()
 
+  currentQuestionId = question_id
   const memory = new Memory({
     extractor, embedder,
     dir:           DB_DIR,
     container:     question_id,
     filterPrompt:  FILTER_PROMPT,
     entityContext: INITIAL_ENTITY_CONTEXT,
+    onRelationshipDecision,
   })
 
   // ── ingest ─────────────────────────────────────────────────────────────
@@ -637,7 +690,7 @@ for (let i = 0; i < questions.length; i++) {
   let failureReason = null
   const judgedAnswer = answer.match(/^Answer:\s*(.*)$/m)?.[1]?.trim() ?? answer
   correct = await judge(question, expected, judgedAnswer, question_type, isAbstention)
-  if (!correct) failureReason = classifyFailure(expected, retrieved)
+  if (!correct) failureReason = classifyFailure({ expected, retrieved, questionType: question_type, goldSessions })
   console.log(`  ⏱  judge:          ${(Date.now() - t4).toFixed(0)}ms  (${tokenLog.judging.input.toLocaleString()} tokens)`)
   console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}`)
 
@@ -835,6 +888,25 @@ for (const phase of EMBEDDER_PHASES) {
 }
 const embCallsAll = EMBEDDER_PHASES.reduce((s, p) => s + embedderTotal[p].calls, 0)
 console.log(`  ${'Embedder — TOTAL'.padEnd(30)} ${String(embCallsAll).padStart(8)}`)
+
+// Task 5.1 — relationship-classifier summary. Surfaces the UPDATES /
+// EXTENDS / NEW distribution and how often the classifier even had
+// candidates to choose from. KU diagnosis happens against the JSONL.
+relationshipLogStream.end()
+if (relationshipStats.total > 0) {
+  const r = relationshipStats
+  const pct = n => ((n / r.total) * 100).toFixed(1) + '%'
+  const avgCands = (r.candidate_count_sum / r.total).toFixed(2)
+  console.log(`\n── Relationship classifier (Task 5.1) ─────────────────────────────────`)
+  console.log(`  total decisions:    ${r.total}`)
+  console.log(`  UPDATES:            ${r.UPDATES} (${pct(r.UPDATES)})`)
+  console.log(`  EXTENDS:            ${r.EXTENDS} (${pct(r.EXTENDS)})`)
+  console.log(`  NEW:                ${r.NEW} (${pct(r.NEW)})`)
+  console.log(`  no candidates:      ${r.no_candidates} (${pct(r.no_candidates)})  ← went straight to NEW`)
+  console.log(`  LLM parse failed:   ${r.llm_failed} (${pct(r.llm_failed)})  ← fell back to NEW`)
+  console.log(`  avg candidate count: ${avgCands}`)
+  console.log(`  log: ${relationshipLogFile}`)
+}
 
 console.log(`\n[benchmark] results: ${resultsFile}`)
 
