@@ -62,7 +62,6 @@ export class Storage {
         content     TEXT NOT NULL,
         container   TEXT NOT NULL DEFAULT 'default',
         session_id  TEXT,
-        source_role TEXT,
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
@@ -336,14 +335,6 @@ export class Storage {
       }
     }
 
-    // add source_role to chunks if missing
-    const chunkCols = new Set(
-      this.db.pragma('table_info(chunks)').map(c => c.name)
-    )
-    if (!chunkCols.has('source_role')) {
-      this.db.exec(`ALTER TABLE chunks ADD COLUMN source_role TEXT`)
-    }
-
     // backfill defaults on existing v0.2.x rows
     this.db.exec(`
       UPDATE facts SET
@@ -363,10 +354,81 @@ export class Storage {
       CREATE INDEX IF NOT EXISTS idx_facts_expires ON facts(expires_at) WHERE expires_at IS NOT NULL;
     `);
 
+    // ── chunks table rebuild ──────────────────────────────────────────────────
+    // Drop the source_role column. Round-level chunks (CP1) contain both a user
+    // turn and the assistant reply, so a single role attribution is no longer
+    // meaningful. Existing rows keep their content/session_id/created_at; only
+    // the source_role column is removed. Per-fact source_role on the `facts`
+    // table is unaffected — it remains the canonical role attribution.
+
+    const chunksDef = this.db.prepare(
+      `SELECT sql FROM sqlite_master WHERE type='table' AND name='chunks'`
+    ).get();
+
+    const needsChunksRebuild = chunksDef?.sql?.includes('source_role');
+
+    if (needsChunksRebuild) {
+      // Disable FKs for the rebuild — chunk_embeddings references chunks(id)
+      // and the temporary rename would leave the reference dangling mid-tx.
+      this.db.pragma('foreign_keys = OFF');
+      try {
+        this.db.transaction(() => {
+          // 1. drop triggers — they reference chunks; recreate against new table
+          this.db.exec(`
+            DROP TRIGGER IF EXISTS chunks_ai;
+            DROP TRIGGER IF EXISTS chunks_ad;
+          `);
+
+          // 2. rename old, create new without source_role
+          this.db.exec(`ALTER TABLE chunks RENAME TO chunks_old`);
+
+          this.db.exec(`
+            CREATE TABLE chunks (
+              id          INTEGER PRIMARY KEY AUTOINCREMENT,
+              content     TEXT NOT NULL,
+              container   TEXT NOT NULL DEFAULT 'default',
+              session_id  TEXT,
+              created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+          `);
+
+          // 3. copy rows (preserve ids so chunk_embeddings/facts FK targets stay valid)
+          this.db.exec(`
+            INSERT INTO chunks (id, content, container, session_id, created_at)
+            SELECT id, content, container, session_id, created_at FROM chunks_old;
+          `);
+
+          // 4. drop old
+          this.db.exec(`DROP TABLE chunks_old`);
+
+          // 5. recreate triggers against the new chunks table
+          this.db.exec(`
+            CREATE TRIGGER IF NOT EXISTS chunks_ai
+            AFTER INSERT ON chunks BEGIN
+              INSERT INTO chunks_fts(rowid, content, container)
+              VALUES (new.id, new.content, new.container);
+            END;
+
+            CREATE TRIGGER IF NOT EXISTS chunks_ad
+            AFTER DELETE ON chunks BEGIN
+              INSERT INTO chunks_fts(chunks_fts, rowid, content, container)
+              VALUES ('delete', old.id, old.content, old.container);
+            END;
+          `);
+
+          // 6. rebuild FTS5 — content_rowid still maps cleanly since ids preserved,
+          //    but a rebuild guarantees consistency after the table swap.
+          this.db.exec(`INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')`);
+        })();
+      } finally {
+        this.db.pragma('foreign_keys = ON');
+      }
+    }
+
     // ── chunk_embeddings rebuild ──────────────────────────────────────────────
     // add REFERENCES chunks(id) — missing from original v0.2 definition
     // chunk_embeddings data is regenerated on every add() — safe to drop and recreate
- 
+
     const chunkEmbDef = this.db.prepare(
       `SELECT sql FROM sqlite_master WHERE type='table' AND name='chunk_embeddings'`
     ).get();
@@ -483,11 +545,11 @@ export class Storage {
 
   // ── Chunks ─────────────────────────────────────────
 
-  saveChunk(content, sessionId = null, sourceRole = null, documentDate = null) {
+  saveChunk(content, sessionId = null, documentDate = null) {
     this.db.prepare(`
-      INSERT INTO chunks (content, container, session_id, source_role, created_at)
-      VALUES (?, ?, ?, ?, ?)
-    `).run(content, this.container, sessionId, sourceRole, documentDate ?? new Date().toISOString())
+      INSERT INTO chunks (content, container, session_id, created_at)
+      VALUES (?, ?, ?, ?)
+    `).run(content, this.container, sessionId, documentDate ?? new Date().toISOString())
   }
 
   getLastChunkId() {
@@ -693,7 +755,6 @@ export class Storage {
         scores[key] = {
           chunk_id:    chunk.chunk_id,
           content:     chunk.content,
-          source_role: chunk.source_role,
           created_at:  chunk.created_at,
           session_id:  chunk.session_id ?? null,
           _type:       'chunk',
@@ -702,12 +763,10 @@ export class Storage {
           sources:     [],
         }
       }
-      // chunks get 0.8x weight — facts preferred when both exist for same content
-      let weight = 1.0
-      if (isAssistantQuery && chunk.source_role === 'assistant') {
-        weight *= 2.0
-      }
-      scores[key].rrf += (1 / (k + rank)) * weight
+      // Round-level chunks carry both user and assistant text. The fact-level
+      // assistant-query boost above is the canonical mechanism for "you said X"
+      // queries; no separate chunk-level boost.
+      scores[key].rrf += (1 / (k + rank))
       scores[key].sources.push(source)
     }
  
@@ -756,7 +815,7 @@ export class Storage {
     let rows = []
     try {
       rows = this.db.prepare(`
-        SELECT c.id AS chunk_id, c.content, c.source_role, c.created_at, c.session_id,
+        SELECT c.id AS chunk_id, c.content, c.created_at, c.session_id,
                bm25(chunks_fts) AS score
         FROM chunks_fts
         JOIN chunks c ON chunks_fts.rowid = c.id
@@ -770,7 +829,6 @@ export class Storage {
     return rows.map((r, index) => ({
       chunk_id:    r.chunk_id,
       content:     r.content,
-      source_role: r.source_role,
       created_at:  r.created_at,
       session_id:  r.session_id ?? null,
       rank:        index + 1,
@@ -780,7 +838,7 @@ export class Storage {
 
   chunkVectorSearch(queryVector, container, topN = 10) {
     const rows = this.db.prepare(`
-      SELECT ce.chunk_id, ce.vector, c.content, c.source_role, c.created_at, c.session_id
+      SELECT ce.chunk_id, ce.vector, c.content, c.created_at, c.session_id
       FROM chunk_embeddings ce
       JOIN chunks c ON ce.chunk_id = c.id
       WHERE ce.container = @container
@@ -790,7 +848,6 @@ export class Storage {
       .map(row => ({
         chunk_id:    row.chunk_id,
         content:     row.content,
-        source_role: row.source_role,
         created_at:  row.created_at,
         session_id:  row.session_id ?? null,
         score:       this._cosineSimilarity(queryVector, JSON.parse(row.vector)),

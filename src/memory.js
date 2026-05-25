@@ -56,18 +56,42 @@ export class Memory {
     const fullConversation = messages.map(m => `${m.role}: ${m.content}`).join('\n')
 
     // 2. ALWAYS save chunks first — they are the raw record, independent of extraction
+    //
+    // Granularity = ROUND (CP1 from LongMemEval §5.2): one chunk row = one
+    // user turn + the immediate assistant reply. Greedy left-to-right pairing.
+    // Orphan turns (leading/standalone assistant, trailing user, back-to-back
+    // same-role turns) become single-turn rounds.
+    //
+    // messageIndexToRole is kept as an in-memory mapping so per-fact
+    // source_role can still be derived from the LLM's source_message_index.
+    // The chunk row no longer carries a role — a round contains both.
     let anchorChunkId = null
     const messageIndexToChunkId = {}
     const messageIndexToRole = {}
 
-    for (let messageIndex = 0; messageIndex < messages.length; messageIndex++) {
-      const message = messages[messageIndex]
-      if (!message.content?.trim()) continue
-      messageIndexToRole[messageIndex] = message.role  // 'user' or 'assistant'
+    for (let i = 0; i < messages.length; i++) {
+      messageIndexToRole[i] = messages[i].role
+    }
 
-      const rawChunk = Array.isArray(input)
-        ? `${message.role}: ${message.content}`
-        : message.content
+    let i = 0
+    while (i < messages.length) {
+      const cur = messages[i]
+      const next = messages[i + 1]
+      const paired =
+        Array.isArray(input) &&
+        cur.role === 'user' &&
+        next?.role === 'assistant' &&
+        cur.content?.trim() &&
+        next.content?.trim()
+
+      const indexes = paired ? [i, i + 1] : [i]
+      const advance = paired ? 2 : 1
+
+      if (!cur.content?.trim()) { i += advance; continue }
+
+      const rawChunk = paired
+        ? `user: ${cur.content}\nassistant: ${next.content}`
+        : (Array.isArray(input) ? `${cur.role}: ${cur.content}` : cur.content)
 
       let chunkContent
       if (this.contextualRetrieval) {
@@ -77,16 +101,18 @@ export class Memory {
         chunkContent = rawChunk
       }
 
-      this.storage.saveChunk(chunkContent, opts.sessionId ?? null, message.role, documentDate)
+      this.storage.saveChunk(chunkContent, opts.sessionId ?? null, documentDate)
       const chunkId = this.storage.getLastChunkId()
 
       if (chunkId) {
         if (anchorChunkId === null) anchorChunkId = chunkId
-        messageIndexToChunkId[messageIndex] = chunkId
+        for (const idx of indexes) messageIndexToChunkId[idx] = chunkId
         embedderCallCounts.chunk++
         const vector = await this.embedder(chunkContent, { phase: 'chunk' })
         this.storage.saveChunkEmbedding(chunkId, vector)
       }
+
+      i += advance
     }
 
     // 3. Now run extraction — if it returns empty, chunks are already safe
@@ -110,7 +136,7 @@ export class Memory {
       ).slice(0, 300)
       console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${inputPreview}`)
       return {
-        chunksStored: Object.keys(messageIndexToChunkId).length,
+        chunksStored: new Set(Object.values(messageIndexToChunkId)).size,
         factsStored:  0,
         llmCalls: {
           extraction:        llmCallCounts.extraction,
@@ -209,7 +235,7 @@ export class Memory {
     }
 
     return {
-      chunksStored: Object.keys(messageIndexToChunkId).length,
+      chunksStored: new Set(Object.values(messageIndexToChunkId)).size,
       factsStored:  savedThisBatch.length,
       llmCalls: {
         extraction:        llmCallCounts.extraction,
@@ -227,6 +253,12 @@ export class Memory {
   }
 
   // ── Search ─────────────────────────────────────────
+  //
+  // `topN` should scale with reader-model capability. LongMemEval §5.2 found
+  // weak readers (small local models) degrade past ~3k retrieved tokens;
+  // strong readers (e.g. GPT-4o) keep improving past 20k. Rough guidance:
+  // weak readers topN: 3–5, strong readers topN: 15–25. The caller decides —
+  // no auto-scaling here.
   async search(query, options = {}) {
     const {
       topN           = 5,
@@ -346,7 +378,7 @@ export class Memory {
           document_date: result.created_at?.slice(0, 10) ?? null,
           event_date:    null,
           relation_type: null,
-          source_role:   result.source_role ?? null,
+          source_role:   null,
           session_id:    result.session_id ?? null,
         }
       }

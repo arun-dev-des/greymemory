@@ -67,7 +67,7 @@ export function buildGraph(db, container, opts = {}) {
 
   const chunks = includeChunks
     ? db.prepare(`
-        SELECT id, content, source_role, session_id, created_at
+        SELECT id, content, session_id, created_at
         FROM chunks
         WHERE container = ?
           ${asOf ? `AND created_at <= ?` : ''}
@@ -111,7 +111,6 @@ export function buildGraph(db, container, opts = {}) {
         chunkId: c.id,
         label: `chunk #${c.id}`,
         value: c.content,
-        source_role: c.source_role,
         created_at: c.created_at,
       })
     }
@@ -274,7 +273,7 @@ export function getMemoryDetail(db, factId) {
 
   return {
     fact,
-    chunk: chunk ? { id: chunk.id, content: chunk.content, source_role: chunk.source_role, created_at: chunk.created_at } : null,
+    chunk: chunk ? { id: chunk.id, content: chunk.content, created_at: chunk.created_at } : null,
     history: chain.slice(1),     // older versions, newest-first
     successors,                  // newer versions if this is a stale node
     extendedBy: extendsFrom,
