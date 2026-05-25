@@ -65,9 +65,15 @@ export class Memory {
     // messageIndexToRole is kept as an in-memory mapping so per-fact
     // source_role can still be derived from the LLM's source_message_index.
     // The chunk row no longer carries a role — a round contains both.
+    //
+    // Chunk EMBEDDING is deferred until after extraction (see step 5) so we
+    // can use the K = V + fact indexing-stage merge from LongMemEval §5.3.
+    // chunkIdToUserText holds the user-side text per round; the deferred loop
+    // combines it with the facts attributed to the same round.
     let anchorChunkId = null
     const messageIndexToChunkId = {}
     const messageIndexToRole = {}
+    const chunkIdToUserText = new Map()
 
     for (let i = 0; i < messages.length; i++) {
       messageIndexToRole[i] = messages[i].role
@@ -107,9 +113,13 @@ export class Memory {
       if (chunkId) {
         if (anchorChunkId === null) anchorChunkId = chunkId
         for (const idx of indexes) messageIndexToChunkId[idx] = chunkId
-        embedderCallCounts.chunk++
-        const vector = await this.embedder(chunkContent, { phase: 'chunk' })
-        this.storage.saveChunkEmbedding(chunkId, vector)
+
+        // user-side text for K = V + fact (§5.3 — user-side only)
+        // paired:        user turn of the round
+        // orphan user:   the turn content
+        // orphan asst /  fall back to the raw turn content (no user side) so the
+        // document:      embedding still has signal. Never the CR context prefix.
+        chunkIdToUserText.set(chunkId, cur.content)
       }
 
       i += advance
@@ -129,12 +139,122 @@ export class Memory {
     const raw      = await this.extractor(prompt, { phase: 'extraction' })
     const memories = this._parseExtraction(raw)
 
+    // 4. Save facts. Skipped (but chunks still get embedded below) when the
+    //    extractor returned nothing — chunks remain queryable via BM25 + the
+    //    user-side text embedding.
+    const savedThisBatch = []
+    const DEDUP_THRESHOLD = 0.92
+    const chunkIdToFacts = new Map()  // chunk_id → [factValue, ...] for K = V + fact
+
     if (memories.length === 0) {
       const inputPreview = (Array.isArray(input)
         ? input.map(m => m.content).join(' ')
         : input
       ).slice(0, 300)
       console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${inputPreview}`)
+    } else {
+      for (const mem of memories) {
+        const {
+          key,
+          value,
+          memory_type          = 'fact',
+          event_date           = null,
+          expires_at           = null,
+          context              = null,
+          source_message_index = null,
+        } = mem
+
+        if (!key || !value) continue
+
+        // derive source_role from message index — deterministic, no LLM needed
+        const source_role = (
+          Number.isInteger(source_message_index) &&
+          messageIndexToRole[source_message_index] != null
+        )
+          ? messageIndexToRole[source_message_index]
+          : null
+
+        const resolvedChunkId = (
+          Number.isInteger(source_message_index) &&
+          messageIndexToChunkId[source_message_index] != null
+        )
+          ? messageIndexToChunkId[source_message_index]
+          : anchorChunkId
+
+        embedderCallCounts.memory++
+        const embedding = await this.embedder(value, { phase: 'memory' })
+
+        const isDuplicate = savedThisBatch.some(
+          saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
+        )
+        if (isDuplicate) continue
+
+        if (memory_type === 'preference') {
+          const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
+          if (strengthened) continue
+        }
+
+        let relationship
+        if (memory_type === 'fact' || memory_type === 'episode') {
+          llmCallCounts.relationship++
+          relationship = await this._detectRelationship(mem, embedding, documentDate)
+        } else {
+          relationship = { type: 'NEW', relatedTo: null }
+        }
+
+        const factId = this.storage.saveFact(key, value, {
+          memory_type,
+          document_date:   documentDate,
+          event_date,
+          expires_at,
+          confidence:      1.0,
+          relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
+          related_to:      relationship.relatedTo,
+          superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
+          chunk_id:        resolvedChunkId,
+          source_role,
+          metadata:        JSON.stringify(context ? { context } : {}),
+        })
+
+        if (relationship.type === 'UPDATES' && relationship.relatedTo) {
+          this.storage.supersedeFact(relationship.relatedTo, factId)
+        }
+
+        this.storage.saveEmbedding(factId, embedding)
+        savedThisBatch.push(embedding)
+
+        // collect this fact's value for the K = V + fact chunk embedding
+        if (resolvedChunkId) {
+          if (!chunkIdToFacts.has(resolvedChunkId)) chunkIdToFacts.set(resolvedChunkId, [])
+          chunkIdToFacts.get(resolvedChunkId).push(value)
+        }
+      }
+    }
+
+    // 5. Embed chunks with K = V + fact (LongMemEval §5.3 indexing-stage merge).
+    //    Runs unconditionally — even on empty extraction, chunks get a user-side
+    //    embedding (still better than the diluted full-round embedding we'd have
+    //    used pre-Task-2).
+    const USER_TEXT_CAP       = 4000   // chars — paper §5.3 dilution control
+    const MAX_FACTS_PER_CHUNK = 50
+
+    for (const [chunkId, userText] of chunkIdToUserText) {
+      const facts = (chunkIdToFacts.get(chunkId) ?? []).slice(0, MAX_FACTS_PER_CHUNK)
+      const trimmedUserText = userText.slice(0, USER_TEXT_CAP)
+
+      const parts = []
+      if (trimmedUserText) parts.push(trimmedUserText)
+      if (facts.length)    parts.push(`Facts:\n- ${facts.join('\n- ')}`)
+
+      const embeddingInput = parts.join('\n\n')
+      if (!embeddingInput.trim()) continue  // defensive guard; shouldn't fire
+
+      embedderCallCounts.chunk++
+      const vector = await this.embedder(embeddingInput, { phase: 'chunk' })
+      this.storage.saveChunkEmbedding(chunkId, vector)
+    }
+
+    if (memories.length === 0) {
       return {
         chunksStored: new Set(Object.values(messageIndexToChunkId)).size,
         factsStored:  0,
@@ -151,81 +271,6 @@ export class Memory {
           total:      embedderCallCounts.chunk + embedderCallCounts.dedup_seed + embedderCallCounts.memory,
         },
       }
-    }
-
-    // 4. Save facts (existing logic, unchanged)
-    const savedThisBatch = []
-    const DEDUP_THRESHOLD = 0.92
-
-    for (const mem of memories) {
-      const {
-        key,
-        value,
-        memory_type          = 'fact',
-        event_date           = null,
-        expires_at           = null,
-        context              = null,
-        source_message_index = null,
-      } = mem
-
-      if (!key || !value) continue
-
-      // derive source_role from message index — deterministic, no LLM needed
-      const source_role = (
-        Number.isInteger(source_message_index) &&
-        messageIndexToRole[source_message_index] != null
-      )
-        ? messageIndexToRole[source_message_index]
-        : null
-
-      const resolvedChunkId = (
-        Number.isInteger(source_message_index) &&
-        messageIndexToChunkId[source_message_index] != null
-      )
-        ? messageIndexToChunkId[source_message_index]
-        : anchorChunkId
-
-      embedderCallCounts.memory++
-      const embedding = await this.embedder(value, { phase: 'memory' })
-
-      const isDuplicate = savedThisBatch.some(
-        saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
-      )
-      if (isDuplicate) continue
-
-      if (memory_type === 'preference') {
-        const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
-        if (strengthened) continue
-      }
-
-      let relationship
-      if (memory_type === 'fact' || memory_type === 'episode') {
-        llmCallCounts.relationship++
-        relationship = await this._detectRelationship(mem, embedding, documentDate)
-      } else {
-        relationship = { type: 'NEW', relatedTo: null }
-      }
-
-      const factId = this.storage.saveFact(key, value, {
-        memory_type,
-        document_date:   documentDate,
-        event_date,
-        expires_at,
-        confidence:      1.0,
-        relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
-        related_to:      relationship.relatedTo,
-        superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
-        chunk_id:        resolvedChunkId,
-        source_role,
-        metadata:        JSON.stringify(context ? { context } : {}),
-      })
-
-      if (relationship.type === 'UPDATES' && relationship.relatedTo) {
-        this.storage.supersedeFact(relationship.relatedTo, factId)
-      }
-
-      this.storage.saveEmbedding(factId, embedding)
-      savedThisBatch.push(embedding)
     }
 
     const { profile } = await this.getProfile({ asOf: documentDate })
