@@ -233,11 +233,14 @@ function buildTemporalTimeline(question, results) {
   if (!isTemporal) return ''
 
   const events = results
-    .filter(r => r.event_date)
-    .map(r => ({
-      date: r.event_date,
-      description: (r.memory || r.chunk?.slice(0, 150) || '').replace(/\n/g, ' ')
-    }))
+    .map(r => {
+      const date = r.event_date ?? r.document_date
+      return date ? {
+        date,
+        description: (r.memory || r.chunk?.slice(0, 150) || '').replace(/\n/g, ' ')
+      } : null
+    })
+    .filter(Boolean)
     .sort((a, b) => a.date.localeCompare(b.date))
 
   if (events.length === 0) return ''
@@ -627,10 +630,13 @@ for (let i = 0; i < questions.length; i++) {
 
   // ── judge ────────────────────────────────────────────────────────────────
   // All question types (incl. _abs) route through the paper's per-type prompts.
+  // CoN answers start with a "Notes:" block; strip to the final "Answer:" line
+  // so the paper's terse-answer judge prompt sees what it was designed for.
   const t4 = Date.now()
   let correct = false
   let failureReason = null
-  correct = await judge(question, expected, answer, question_type, isAbstention)
+  const judgedAnswer = answer.match(/^Answer:\s*(.*)$/m)?.[1]?.trim() ?? answer
+  correct = await judge(question, expected, judgedAnswer, question_type, isAbstention)
   if (!correct) failureReason = classifyFailure(expected, retrieved)
   console.log(`  ⏱  judge:          ${(Date.now() - t4).toFixed(0)}ms  (${tokenLog.judging.input.toLocaleString()} tokens)`)
   console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}`)
