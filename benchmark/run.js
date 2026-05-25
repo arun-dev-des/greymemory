@@ -13,6 +13,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
+import { formatForReading }    from '../src/answering.js'
 import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -26,6 +27,7 @@ const QUESTION_ID     = null                         // set to a question_id to 
 const SEARCH_TOP_N    = 10
 const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
 const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
+const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -231,11 +233,14 @@ function buildTemporalTimeline(question, results) {
   if (!isTemporal) return ''
 
   const events = results
-    .filter(r => r.event_date)
-    .map(r => ({
-      date: r.event_date,
-      description: (r.memory || r.chunk?.slice(0, 150) || '').replace(/\n/g, ' ')
-    }))
+    .map(r => {
+      const date = r.event_date ?? r.document_date
+      return date ? {
+        date,
+        description: (r.memory || r.chunk?.slice(0, 150) || '').replace(/\n/g, ' ')
+      } : null
+    })
+    .filter(Boolean)
     .sort((a, b) => a.date.localeCompare(b.date))
 
   if (events.length === 0) return ''
@@ -604,7 +609,17 @@ for (let i = 0; i < questions.length; i++) {
 
   // ── answer ───────────────────────────────────────────────────────────────
   const temporalTimeline = buildTemporalTimeline(question, retrieved)
-  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, temporalTimeline })
+  let answerPrompt
+  if (READING_MODE === 'json-con') {
+    answerPrompt = formatForReading({
+      question,
+      questionDate: questionDateNorm,
+      results:      retrieved,
+    })
+    if (temporalTimeline) answerPrompt += '\n' + temporalTimeline
+  } else {
+    answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, temporalTimeline })
+  }
   const t3 = Date.now()
   let answer = 'I don\'t know'
   try { answer = await answerer(answerPrompt) }
@@ -615,10 +630,13 @@ for (let i = 0; i < questions.length; i++) {
 
   // ── judge ────────────────────────────────────────────────────────────────
   // All question types (incl. _abs) route through the paper's per-type prompts.
+  // CoN answers start with a "Notes:" block; strip to the final "Answer:" line
+  // so the paper's terse-answer judge prompt sees what it was designed for.
   const t4 = Date.now()
   let correct = false
   let failureReason = null
-  correct = await judge(question, expected, answer, question_type, isAbstention)
+  const judgedAnswer = answer.match(/^Answer:\s*(.*)$/m)?.[1]?.trim() ?? answer
+  correct = await judge(question, expected, judgedAnswer, question_type, isAbstention)
   if (!correct) failureReason = classifyFailure(expected, retrieved)
   console.log(`  ⏱  judge:          ${(Date.now() - t4).toFixed(0)}ms  (${tokenLog.judging.input.toLocaleString()} tokens)`)
   console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}`)
