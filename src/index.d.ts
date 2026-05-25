@@ -150,7 +150,7 @@ export interface ExtractorContext {
    * attribute LLM tokens/cost to a specific stage of the pipeline.
    * New phases may be added without breaking changes — match defensively.
    */
-  phase?: 'extraction' | 'relationship' | 'contextualization' | 'derivation';
+  phase?: 'extraction' | 'relationship' | 'contextualization' | 'derivation' | 'time_extraction';
 }
 
 export type ExtractorFn = (prompt: string, context?: ExtractorContext) => Promise<string> | string;
@@ -341,6 +341,19 @@ export interface SearchOptions {
    * Critical for temporal queries — "where did the user work in March 2023?"
    */
   asOf?: string | null;
+  /**
+   * Auto-extract a date range from the query via an LLM call (LongMemEval §5.4).
+   * Only fires when both `afterDate` and `beforeDate` are unset — caller-supplied
+   * bounds always win. Gated by a cheap temporal-cue regex; non-temporal queries
+   * skip the LLM call entirely.
+   *
+   * Paper note: the extractor model must be reasonably strong — a weak model
+   * that hallucinates ranges can make temporal recall WORSE than baseline by
+   * filtering out the correct answer. Set to false if your extractor is small.
+   *
+   * @default true
+   */
+  timeAwareQuery?: boolean;
 }
 
 /**

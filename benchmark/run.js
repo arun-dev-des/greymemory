@@ -24,7 +24,8 @@ const PER_CATEGORY    = 15                            // questions per category
 const CATEGORY_FILTER = ['single-session-preference'] // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
-const SKIP_INGEST     = true                        // true = skip ingestion, use existing DB
+const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
+const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -84,6 +85,7 @@ const tokenLog = {
     relationship:      { input: 0, output: 0, calls: 0 },
     contextualization: { input: 0, output: 0, calls: 0 },
     derivation:        { input: 0, output: 0, calls: 0 },
+    time_extraction:   { input: 0, output: 0, calls: 0 },
   },
   embedder: {
     chunk:      { calls: 0 },
@@ -570,11 +572,13 @@ for (let i = 0; i < questions.length; i++) {
   const t1 = Date.now()
   const questionDateNorm = memory._normalizeDate(question_date) ?? question_date
   // round asOf to end-of-day so all same-day sessions are visible
-  const asOf = questionDateNorm.length === 10 
-    ? questionDateNorm + 'T23:59' 
+  const asOf = questionDateNorm.length === 10
+    ? questionDateNorm + 'T23:59'
     : questionDateNorm.slice(0, 10) + 'T23:59'
-  const retrieved = await memory.search(question, { topN: SEARCH_TOP_N, asOf })
-  console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)`)
+  const timeExtractCallsBefore = ext.time_extraction.calls
+  const retrieved = await memory.search(question, { topN: SEARCH_TOP_N, asOf, timeAwareQuery: TIME_AWARE_QUERY })
+  const timeExtractFired = ext.time_extraction.calls > timeExtractCallsBefore
+  console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)${timeExtractFired ? `  [M_T fired: ${ext.time_extraction.input}↓/${ext.time_extraction.output}↑]` : '  [M_T skipped]'}`)
 
   // ── retrieval metrics ───────────────────────────────────────────────────
   const goldSessions     = new Set(answer_session_ids ?? [])
@@ -663,7 +667,8 @@ for (let i = 0; i < questions.length; i++) {
         relationship:      { ...ext.relationship },
         contextualization: { ...ext.contextualization },
         derivation:        { ...ext.derivation },
-        total: { input: totalHaikuIn, output: totalHaikuOut, calls: totalHaikuCalls },
+        time_extraction:   { ...ext.time_extraction },
+        total: { input: sumIn(ext), output: sumOut(ext), calls: sumCalls(ext) },
       },
       embedder: {
         chunk:      { ...emb.chunk },

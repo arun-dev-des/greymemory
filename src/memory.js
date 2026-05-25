@@ -1,5 +1,5 @@
 import { Storage } from "./storage.js";
-import { buildExtractorPrompt } from "./prompts.js";
+import { buildExtractorPrompt, buildTimeRangeExtractionPrompt } from "./prompts.js";
 
 export class Memory {
   constructor(options = {}) {
@@ -316,6 +316,7 @@ export class Memory {
       expandViaGraph = true,      // master toggle for graph expansion
       expandedLimit  = 10,        // max additional facts from graph traversal
       expandDepth    = 5,         // max EXTENDS hops to walk
+      timeAwareQuery = true,      // LongMemEval §5.4: auto-extract a date range from the query
     } = typeof options === 'number' ? { topN: options } : options;
 
     // ── normalize asOf ──
@@ -323,6 +324,20 @@ export class Memory {
     if (asOf) {
       const normalized = this._normalizeDate(asOf) ?? asOf;
       asOfNorm = normalized.includes('T') ? normalized : `${normalized}T23:59:59`;
+    }
+
+    // ── time-aware query expansion (CP3, LongMemEval §5.4) ──
+    // Caller-supplied bounds ALWAYS win. Only auto-extract when both bounds
+    // are null AND the caller did not opt out. "Today" for relative-phrase
+    // resolution is asOf if provided (question asked at a historical point),
+    // else wall-clock today.
+    let effectiveAfter  = afterDate;
+    let effectiveBefore = beforeDate;
+    if (timeAwareQuery && afterDate == null && beforeDate == null) {
+      const todayForQuery = (asOfNorm ?? new Date().toISOString()).slice(0, 10);
+      const auto = await this._extractQueryTimeRange(query, todayForQuery);
+      effectiveAfter  = auto.afterDate;
+      effectiveBefore = auto.beforeDate;
     }
 
     // ── core retrieval ──
@@ -355,12 +370,12 @@ export class Memory {
       filtered = filtered.filter(r => r._type === 'chunk' || !r.expires_at || r.expires_at > expiryCutoff);
     }
 
-    if (afterDate) {
-      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date >= afterDate));
+    if (effectiveAfter) {
+      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date >= effectiveAfter));
     }
 
-    if (beforeDate) {
-      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= beforeDate));
+    if (effectiveBefore) {
+      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= effectiveBefore));
     }
 
     // ── slice seed budget (new boundary) ──
@@ -384,8 +399,8 @@ export class Memory {
         })
         expanded = rawExpanded.filter(({ fact }) => {
           if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
-          if (afterDate  && (!fact.event_date || fact.event_date <  afterDate))  return false
-          if (beforeDate && (!fact.event_date || fact.event_date >  beforeDate)) return false
+          if (effectiveAfter  && (!fact.event_date || fact.event_date <  effectiveAfter))  return false
+          if (effectiveBefore && (!fact.event_date || fact.event_date >  effectiveBefore)) return false
           return true
         })
 
@@ -403,8 +418,8 @@ export class Memory {
         })
         history = rawHistory.filter(({ fact }) => {
           if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
-          if (afterDate  && (!fact.event_date || fact.event_date <  afterDate))  return false
-          if (beforeDate && (!fact.event_date || fact.event_date >  beforeDate)) return false
+          if (effectiveAfter  && (!fact.event_date || fact.event_date <  effectiveAfter))  return false
+          if (effectiveBefore && (!fact.event_date || fact.event_date >  effectiveBefore)) return false
           // is_latest filter NOT applied — history facts are by definition is_latest=0
           // asOf filter NOT applied — we want history relative to the seed, not asOf
           return true
@@ -1170,6 +1185,80 @@ Return ONLY valid JSON, no explanation:
       console.warn('[greymemory] extractor returned invalid JSON:', text.slice(0, 200))
     }
     return []
+  }
+
+  // M_T from LongMemEval §5.4 — extract {afterDate, beforeDate} from a question.
+  //
+  // Two-stage: a cheap regex gate skips the LLM call for non-temporal queries
+  // (most queries), then the extractor LLM returns a JSON object. On any
+  // parse / shape / sanity failure, returns {null, null} — never blocks search.
+  //
+  // The paper's warning: a weak time extractor (Llama 8B in the paper) made
+  // recall WORSE than baseline because a wrong range filters out the correct
+  // answer. Hence the defensive posture — when in doubt, return nulls.
+  async _extractQueryTimeRange(query, today) {
+    const nulls = { afterDate: null, beforeDate: null }
+    if (typeof query !== 'string' || query.length === 0) return nulls
+
+    // ── temporal-cue gate ──
+    // Cheap regex check. If nothing matches, the question has no temporal
+    // anchor and M_T cannot meaningfully constrain it — skip the LLM call.
+    const lower = query.toLowerCase()
+    const hasTemporalCue =
+      /\b(last|next|ago|yesterday|today|tomorrow|since|before|after|until|during|when|recent|recently|earlier|later|past|previous|upcoming)\b/.test(lower) ||
+      /\b(year|years|month|months|week|weeks|day|days|hour|hours|minute|minutes)\b/.test(lower) ||
+      /\b(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(lower) ||
+      /\b(jan|feb|mar|apr|jun|jul|aug|sep|sept|oct|nov|dec)\b/.test(lower) ||
+      /\b(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b/.test(lower) ||
+      /\b(19|20)\d{2}\b/.test(query) ||
+      /\b\d{1,2}[\-\/]\d{1,2}\b/.test(query)
+
+    if (!hasTemporalCue) return nulls
+
+    // ── LLM call ──
+    const prompt = buildTimeRangeExtractionPrompt({ query, today })
+    let raw
+    try {
+      raw = await this.extractor(prompt, { phase: 'time_extraction' })
+    } catch (err) {
+      console.warn('[greymemory] time-range extractor failed:', err?.message ?? err)
+      return nulls
+    }
+
+    // ── parse ──
+    let text = String(raw ?? '').trim()
+    text = text.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
+    let parsed
+    try {
+      parsed = JSON.parse(text)
+    } catch {
+      // try to pull out a JSON object embedded in prose
+      const objMatch = text.match(/\{[\s\S]*\}/)
+      if (objMatch) {
+        try { parsed = JSON.parse(objMatch[0]) } catch {}
+      }
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return nulls
+
+    // ── normalize fields ──
+    // Accept partial dates (YYYY-MM, YYYY) by expanding to period start/end.
+    // afterDate gets the earliest possible day, beforeDate the latest.
+    const expandAfter  = s => /^\d{4}$/.test(s) ? `${s}-01-01` : /^\d{4}-\d{2}$/.test(s) ? `${s}-01` : s
+    const expandBefore = s => /^\d{4}$/.test(s) ? `${s}-12-31` : /^\d{4}-\d{2}$/.test(s) ? `${s}-${new Date(Number(s.slice(0,4)), Number(s.slice(5,7)), 0).getDate().toString().padStart(2,'0')}` : s
+
+    const rawAfter  = parsed.afterDate  ?? parsed.after_date  ?? null
+    const rawBefore = parsed.beforeDate ?? parsed.before_date ?? null
+
+    const normAfter  = rawAfter  ? this._normalizeDate(rawAfter)  : null
+    const normBefore = rawBefore ? this._normalizeDate(rawBefore) : null
+
+    const after  = normAfter  ? expandAfter(normAfter.slice(0, 10))   : null
+    const before = normBefore ? expandBefore(normBefore.slice(0, 10)) : null
+
+    // ── sanity: contradictory range → return nulls rather than filter wrong ──
+    if (after && before && after > before) return nulls
+
+    return { afterDate: after, beforeDate: before }
   }
 
   // normalize a date input to an ISO string — preserving only absolute truths
