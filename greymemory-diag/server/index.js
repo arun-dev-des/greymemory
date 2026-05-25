@@ -21,6 +21,7 @@ import { fileURLToPath } from 'url'
 import { listRunFiles, readRunSummary, readRunFull, readRelationshipLog } from './runs.js'
 import { listDatabases, listFacts, getFactHistory, getChunk }              from './databases.js'
 import { getSearchFn }                                                    from './memory-loader.js'
+import { buildAnalysisPrompt, callClaude }                                from './analyze.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // Repo root = two levels up from server/ (../../). User override via env.
@@ -74,6 +75,34 @@ app.get('/api/runs/:id/questions/:qid', async (req, res) => {
     if (!q) return res.status(404).json({ error: 'question not found in run' })
     const relationshipLog = await readRelationshipLog(RESULTS_DIR, req.params.id, req.params.qid)
     res.json({ meta: run.meta, question: q, relationship_log: relationshipLog })
+  } catch (err) {
+    res.status(500).json({ error: err.message })
+  }
+})
+
+// AI analysis — calls Claude API with everything we know about this question.
+// In-memory per-(runId, qid) cache so repeated clicks don't re-bill. Restart
+// the server to clear.
+const analysisCache = new Map()
+app.post('/api/runs/:id/questions/:qid/analyze', async (req, res) => {
+  const cacheKey = `${req.params.id}::${req.params.qid}`
+  if (analysisCache.has(cacheKey) && !req.query.refresh) {
+    return res.json({ ...analysisCache.get(cacheKey), cached: true })
+  }
+  try {
+    const file = listRunFiles(RESULTS_DIR).find(f => f.id === req.params.id)
+    if (!file) return res.status(404).json({ error: 'run not found' })
+    const run = readRunFull(file)
+    const q = (run.questions ?? []).find(q => q.question_id === req.params.qid)
+    if (!q) return res.status(404).json({ error: 'question not found in run' })
+    const relationshipLog = await readRelationshipLog(RESULTS_DIR, req.params.id, req.params.qid)
+
+    const prompt = buildAnalysisPrompt({ question: q, relationshipLog })
+    const t0 = Date.now()
+    const result = await callClaude(prompt)
+    const payload = { ...result, elapsed_ms: Date.now() - t0, prompt_chars: prompt.length, cached: false }
+    analysisCache.set(cacheKey, payload)
+    res.json(payload)
   } catch (err) {
     res.status(500).json({ error: err.message })
   }

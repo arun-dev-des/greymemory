@@ -4,6 +4,7 @@ import { badgeForFail, formatRatio } from './RunDetail.jsx'
 import RetrievalList      from '../components/RetrievalList.jsx'
 import RelationshipLog    from '../components/RelationshipLog.jsx'
 import TokenBreakdown     from '../components/TokenBreakdown.jsx'
+import AnalysisPanel      from '../components/AnalysisPanel.jsx'
 
 export default function QuestionDetail({ runId, qid }) {
   const [data, setData] = useState(null)
@@ -40,6 +41,14 @@ export default function QuestionDetail({ runId, qid }) {
             {' '}
             {q.is_abstention && <span className="badge neutral">abstention question</span>}
           </p>
+        </div>
+      </div>
+
+      {/* AI analysis */}
+      <div className="panel">
+        <div className="panel-header"><h2>AI analysis</h2><span className="count">Claude diagnoses this question end-to-end</span></div>
+        <div className="panel-body compact">
+          <AnalysisPanel runId={runId} qid={qid} />
         </div>
       </div>
 

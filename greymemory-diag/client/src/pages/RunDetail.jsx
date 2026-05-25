@@ -31,7 +31,16 @@ export default function RunDetail({ runId }) {
         byFail[q.failure_reason] = (byFail[q.failure_reason] ?? 0) + 1
       }
     }
-    return { total, correct, byCat, byFail }
+    // Aggregate retrieval metrics — mean across questions with non-null values.
+    // Questions without gold sessions (or pre-tagged with null) are skipped so
+    // the average isn't pulled down by N/A entries.
+    const mean = arr => arr.length === 0 ? null : arr.reduce((a, b) => a + b, 0) / arr.length
+    const r5  = mean(qs.map(q => q.recall_at_5 ).filter(v => v != null))
+    const r10 = mean(qs.map(q => q.recall_at_10).filter(v => v != null))
+    const n5  = mean(qs.map(q => q.ndcg_at_5   ).filter(v => v != null))
+    const n10 = mean(qs.map(q => q.ndcg_at_10  ).filter(v => v != null))
+    const trackedCount = qs.filter(q => q.recall_at_10 != null).length
+    return { total, correct, byCat, byFail, r5, r10, n5, n10, trackedCount }
   }, [run])
 
   const filtered = useMemo(() => {
@@ -53,13 +62,21 @@ export default function RunDetail({ runId }) {
       <h2>Run {runId}</h2>
 
       {stats && (
-        <div className="metrics-bar">
-          <Metric label="Questions" value={stats.total} />
-          <Metric label="Correct"   value={`${stats.correct} (${((stats.correct/stats.total)*100).toFixed(0)}%)`} />
-          {Object.entries(stats.byCat).map(([cat, s]) => (
-            <Metric key={cat} label={cat} value={`${s.correct}/${s.total}`} />
-          ))}
-        </div>
+        <>
+          <div className="metrics-bar">
+            <Metric label="Questions" value={stats.total} />
+            <Metric label="Correct"   value={`${stats.correct} (${((stats.correct/stats.total)*100).toFixed(0)}%)`} />
+            {Object.entries(stats.byCat).map(([cat, s]) => (
+              <Metric key={cat} label={cat} value={`${s.correct}/${s.total}`} />
+            ))}
+          </div>
+          <div className="metrics-bar">
+            <Metric label={`R@5  (n=${stats.trackedCount})`}  value={formatMetric(stats.r5)} />
+            <Metric label="R@10"                              value={formatMetric(stats.r10)} />
+            <Metric label="NDCG@5"                            value={formatMetric(stats.n5)} />
+            <Metric label="NDCG@10"                           value={formatMetric(stats.n10)} />
+          </div>
+        </>
       )}
 
       {stats && Object.keys(stats.byFail).length > 0 && (
@@ -145,6 +162,11 @@ function Metric({ label, value }) {
 export function formatRatio(r) {
   if (r == null) return '—'
   return `${(r*100).toFixed(0)}%`
+}
+
+function formatMetric(r) {
+  if (r == null) return '—'
+  return `${(r * 100).toFixed(1)}%`
 }
 
 export function badgeForFail(reason) {
