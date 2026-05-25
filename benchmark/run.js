@@ -13,6 +13,7 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
+import { formatForReading }    from '../src/answering.js'
 import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -26,6 +27,7 @@ const QUESTION_ID     = null                         // set to a question_id to 
 const SEARCH_TOP_N    = 10
 const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
 const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
+const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
 
 const DB_DIR      = path.join(__dirname, '.greymemory-bench')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
@@ -604,7 +606,17 @@ for (let i = 0; i < questions.length; i++) {
 
   // ── answer ───────────────────────────────────────────────────────────────
   const temporalTimeline = buildTemporalTimeline(question, retrieved)
-  const answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, temporalTimeline })
+  let answerPrompt
+  if (READING_MODE === 'json-con') {
+    answerPrompt = formatForReading({
+      question,
+      questionDate: questionDateNorm,
+      results:      retrieved,
+    })
+    if (temporalTimeline) answerPrompt += '\n' + temporalTimeline
+  } else {
+    answerPrompt = buildAnsweringPrompt({ question, questionDate: questionDateNorm, results: retrieved, temporalTimeline })
+  }
   const t3 = Date.now()
   let answer = 'I don\'t know'
   try { answer = await answerer(answerPrompt) }

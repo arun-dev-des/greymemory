@@ -552,3 +552,44 @@ export interface AnsweringOptions {
  * const answer = await extractor(prompt)
  */
 export function buildAnsweringPrompt(options: AnsweringOptions): string;
+
+/**
+ * Options for formatForReading()
+ */
+export interface FormatForReadingOptions {
+  /** The question to answer */
+  question: string;
+  /** When the question was asked — ISO date or datetime */
+  questionDate: string;
+  /** Search results from memory.search() */
+  results: SearchResult[];
+  /** Optional profile from memory.getProfile() */
+  profile?: Profile | null;
+  /** Max results to include in prompt. @default 10 */
+  topN?: number;
+  /** Reserved for future date-anchoring (unused today) */
+  asOf?: string | null;
+}
+
+/**
+ * Builds a JSON + Chain-of-Note (CoN) answering prompt.
+ *
+ * Per LongMemEval §5.5 (Wu et al., ICLR 2025), this rendering adds ~10
+ * absolute points to answerer accuracy over plain-prose. JSON and CoN are
+ * intentionally bundled — JSON alone underperforms prose.
+ *
+ * Retrieved items are sorted by document_date ascending (null dates last)
+ * for the prompt only; the input `results` array is not mutated.
+ *
+ * @example
+ * import GreyMemory, { formatForReading } from 'greymemory'
+ *
+ * const results = await memory.search(question, { topN: 10 })
+ * const prompt  = formatForReading({
+ *   question,
+ *   questionDate: '2026-05-25',
+ *   results,
+ * })
+ * const answer  = await answerer(prompt)
+ */
+export function formatForReading(options: FormatForReadingOptions): string;
