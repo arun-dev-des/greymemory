@@ -13,7 +13,8 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
-import { formatForReading }    from '../src/answering.js'
+import { formatForReading, formatRetrievedContext } from '../src/answering.js'
+import { encode as encodeGpt4o } from 'gpt-tokenizer/model/gpt-4o'
 import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -21,15 +22,20 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 // ── config ─────────────────────────────────────────────────────────────────
 
 const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
-const PER_CATEGORY    = 15                            // questions per category
-const CATEGORY_FILTER = ['single-session-preference'] // null = all categories
+const PER_CATEGORY    = 10                            // questions per category
+const CATEGORY_FILTER = ['knowledge-update']         // null = all categories
 const QUESTION_ID     = null                         // set to a question_id to run a single question
 const SEARCH_TOP_N    = 10
 const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
 const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
 const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
+const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v2' ? 'v2' : 'v1')  // 'v2' = anchor + 3-tier scoring + self-check (see formatForReadingV2)
+const RERANK_ENABLED  = false                        // CP5: cross-encoder rerank between RRF and seed slicing. Off = baseline (no rerank). On = use @xenova/transformers MiniLM ms-marco model.
+const RERANK_CANDIDATES = 20                         // how many post-RRF candidates the reranker sees
+const JUDGE_DUAL      = false                        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks. Off by default: KU-10 run 2026-05-26 regressed −10pp via a state-change false-negative.
+const QUESTION_DELAY_MS = 6000                       // sleep between questions to stay under OpenAI per-minute TPM (dual judge ~triples 4o calls per Q)
 
-const DB_DIR      = path.join(__dirname, '.greymemory-bench')
+const DB_DIR      = path.join(__dirname, '.greymemory-bench-ku10-validation')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
 const RESULTS_DIR = path.join(__dirname, 'results')
 
@@ -100,6 +106,10 @@ const tokenLog = {
   judging:   { input: 0, output: 0 },
 }
 
+// Reranker has no token cost (local cross-encoder). Track latency + count
+// in a sibling log instead of polluting the dollars-from-tokens buckets.
+const rerankLog = { calls: 0, candidates: 0, ms: 0 }
+
 const sumCalls = obj => Object.values(obj).reduce((s, p) => s + (p.calls  ?? 0), 0)
 const sumIn    = obj => Object.values(obj).reduce((s, p) => s + (p.input  ?? 0), 0)
 const sumOut   = obj => Object.values(obj).reduce((s, p) => s + (p.output ?? 0), 0)
@@ -109,6 +119,7 @@ function resetTokenLog() {
   for (const p of Object.values(tokenLog.embedder))  { p.calls = 0 }
   tokenLog.answering = { input: 0, output: 0 }
   tokenLog.judging   = { input: 0, output: 0 }
+  rerankLog.calls = 0; rerankLog.candidates = 0; rerankLog.ms = 0
 }
 
 // ── providers ──────────────────────────────────────────────────────────────
@@ -160,6 +171,45 @@ const embedder = async (text, context) => {
   return rawBatchedEmbedder(text)
 }
 
+// ── reranker (cross-encoder via @xenova/transformers, optional) ─────────────
+// Lazy-loaded module-level singleton. First call pays ~1.5s model download +
+// load; subsequent calls reuse warmed weights (~30–80ms for 20 candidates).
+// Only constructed when RERANK_ENABLED — the import is dynamic so users who
+// haven't `npm install @xenova/transformers` aren't impacted.
+
+let _crossEncoder = null
+const getCrossEncoder = async () => {
+  if (_crossEncoder) return _crossEncoder
+  const { pipeline } = await import('@xenova/transformers')
+  _crossEncoder = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2')
+  return _crossEncoder
+}
+
+const reranker = RERANK_ENABLED
+  ? async (query, candidates) => {
+      const t0 = performance.now()
+      try {
+        const ce = await getCrossEncoder()
+        // transformers.js cross-encoder API: classifier(query, passages[])
+        const passages = candidates.map(c => c.text)
+        const scored = await ce(query, passages)
+        const arr = Array.isArray(scored) ? scored : [scored]
+        const out = candidates.map((c, i) => {
+          const result = Array.isArray(arr[i]) ? arr[i][0] : arr[i]
+          return { id: c.id, score: result?.score ?? 0 }
+        })
+        rerankLog.calls += 1
+        rerankLog.candidates += candidates.length
+        rerankLog.ms += performance.now() - t0
+        return out
+      } catch (err) {
+        process.stderr.write(`\n  [warn] rerank failed: ${err.message ?? err}\n`)
+        // Don't count failed calls in rerankLog; search() falls back to RRF.
+        return []
+      }
+    }
+  : undefined
+
 const answerer = async (prompt, retries = 3) => {
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -192,10 +242,13 @@ const answerer = async (prompt, retries = 3) => {
 
 // Uses LongMemEval's official per-question-type prompts (see ./judge-prompts.js).
 // Routes by questionType + isAbstention so accuracy is comparable to the paper.
-const judge = async (question, expected, got, questionType, isAbstention, retries = 3) => {
+// `sourceChunks` is the optional deduped chunk list (supermemory-style A/B); when
+// null the prompt stays byte-identical to the vendored template.
+const judge = async (question, expected, got, questionType, isAbstention, sourceChunks = null, retries = 3) => {
   const prompt = buildJudgePrompt({
     questionType, isAbstention,
     question, answer: expected, response: got,
+    sourceChunks,
   })
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
@@ -488,8 +541,12 @@ if (QUESTION_ID) {
   //   })
   // }
 
-  // fixed set for reproducible comparison
-  const FIXED_IDS = ['57f827a0', 'b6025781', '35a27287', '1d4e3b97', '32260d93']
+  // fixed set for reproducible comparison — the 10 KU question_ids from the
+  // historic baseline at benchmark/results/run-2026-05-25T18-38-43.json (80% acc).
+  const FIXED_IDS = [
+    '6a1eabeb', '6aeb4375', '830ce83f', '852ce960', '945e3d21',
+    'd7c942c3', '71315a70', '89941a93', 'ce6d2d27', '9ea5eabc',
+  ]
 
   if (FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
@@ -544,6 +601,7 @@ const run = {
     model_judge:     'gpt-4o',
     tokens_format:   'v2-phase-keyed',  // see questions[].tokens shape
     judge_format:    'paper-official-v1',  // LongMemEval per-type prompts (./judge-prompts.js)
+    con_prompt_version: CON_PROMPT_VERSION,
   },
   summary:   {},
   questions: [],
@@ -584,6 +642,7 @@ for (let i = 0; i < questions.length; i++) {
   currentQuestionId = question_id
   const memory = new Memory({
     extractor, embedder,
+    reranker,
     dir:           DB_DIR,
     container:     question_id,
     filterPrompt:  FILTER_PROMPT,
@@ -634,9 +693,31 @@ for (let i = 0; i < questions.length; i++) {
     ? questionDateNorm + 'T23:59'
     : questionDateNorm.slice(0, 10) + 'T23:59'
   const timeExtractCallsBefore = ext.time_extraction.calls
-  const retrieved = await memory.search(question, { topN: SEARCH_TOP_N, asOf, timeAwareQuery: TIME_AWARE_QUERY })
+  const rerankCallsBefore      = rerankLog.calls
+  const rerankMsBefore         = rerankLog.ms
+  const retrieved = await memory.search(question, {
+    topN: SEARCH_TOP_N,
+    asOf,
+    timeAwareQuery: TIME_AWARE_QUERY,
+    rerank:           RERANK_ENABLED,
+    rerankCandidates: RERANK_CANDIDATES,
+  })
+  const searchMs         = Date.now() - t1
   const timeExtractFired = ext.time_extraction.calls > timeExtractCallsBefore
-  console.log(`\n  ⏱  search:         ${(Date.now() - t1).toFixed(0)}ms  (${retrieved.length} results)${timeExtractFired ? `  [M_T fired: ${ext.time_extraction.input}↓/${ext.time_extraction.output}↑]` : '  [M_T skipped]'}`)
+  const rerankFired      = rerankLog.calls > rerankCallsBefore
+  const rerankMsThisQ    = rerankLog.ms - rerankMsBefore
+
+  // MemScore contextTok: tokens in just the retrieved-context string (not the full answering prompt).
+  // Only the json-con path produces a cleanly isolable context block — see formatRetrievedContext.
+  let contextTokens = null
+  if (READING_MODE === 'json-con') {
+    const contextString = formatRetrievedContext(retrieved, SEARCH_TOP_N)
+    contextTokens = encodeGpt4o(contextString).length
+  }
+  console.log(`\n  ⏱  search:         ${searchMs.toFixed(0)}ms  (${retrieved.length} results, ctxTok ${contextTokens ?? '—'})${timeExtractFired ? `  [M_T fired: ${ext.time_extraction.input}↓/${ext.time_extraction.output}↑]` : '  [M_T skipped]'}`)
+  if (RERANK_ENABLED) {
+    console.log(`  🔀  rerank:         ${rerankFired ? `${rerankMsThisQ.toFixed(0)}ms, ${RERANK_CANDIDATES} cands` : 'skipped (filtered.length ≤ 1)'}`)
+  }
 
   // ── retrieval metrics ───────────────────────────────────────────────────
   const goldSessions     = new Set(answer_session_ids ?? [])
@@ -668,6 +749,7 @@ for (let i = 0; i < questions.length; i++) {
       question,
       questionDate: questionDateNorm,
       results:      retrieved,
+      version:      CON_PROMPT_VERSION,
     })
     if (temporalTimeline) answerPrompt += '\n' + temporalTimeline
   } else {
@@ -687,12 +769,77 @@ for (let i = 0; i < questions.length; i++) {
   // so the paper's terse-answer judge prompt sees what it was designed for.
   const t4 = Date.now()
   let correct = false
+  let correctWithChunks = null
   let failureReason = null
   const judgedAnswer = answer.match(/^Answer:\s*(.*)$/m)?.[1]?.trim() ?? answer
-  correct = await judge(question, expected, judgedAnswer, question_type, isAbstention)
+
+  // Baseline judge — vendored LongMemEval prompt, paper-comparable.
+  correct = await judge(question, expected, judgedAnswer, question_type, isAbstention, null)
+
+  // Treatment judge — same prompt + a Source Context block built from chunks
+  // for ONLY the items CoN flagged as relevant (skip "Not relevant" notes).
+  // supermemory-style: atomic memories for precision, chunks for nuance, with
+  // CoN as the precision filter so the judge sees high-signal source only.
+  // CoN item indices match the chronologically-sorted top-N retrieved list
+  // built by _buildContextItems() in src/answering.js — replicate that sort here.
+  let conRelevantN = 0, conTotalN = 0, conOffTopicN = 0
+  if (JUDGE_DUAL) {
+    const topRetrieved = retrieved.slice(0, SEARCH_TOP_N)
+    const sortedForCoN = [...topRetrieved].sort((a, b) => {
+      const da = a.document_date ?? '9999-12-31'
+      const db = b.document_date ?? '9999-12-31'
+      return da.localeCompare(db)
+    })
+
+    // Parse CoN notes: lines like "[N] <text>". Recognize both v1 and v2:
+    //   v1 — "[N] Not relevant" → filter; everything else → keep
+    //   v2 — "[N] off-topic: <reason>" → filter; "[N] answers: ..." /
+    //        "[N] related: ..." → keep; "[N] (revised) <tag>: ..." overrides
+    //        an earlier line for the same N (Step 1.5 self-check promotion).
+    // Last write wins per index so a revised line beats its original tag.
+    const noteRe = /^\s*\[(\d+)\]\s+(.+?)\s*$/gm
+    const tagByIdx = new Map()  // idx → 'relevant' | 'off-topic'
+    let m
+    while ((m = noteRe.exec(answer)) !== null) {
+      const idx = parseInt(m[1], 10)
+      const note = m[2].trim().replace(/^\(revised\)\s+/i, '')
+      const isOffTopic = /^not relevant\.?$/i.test(note) || /^off-topic\b/i.test(note)
+      tagByIdx.set(idx, isOffTopic ? 'off-topic' : 'relevant')
+    }
+    conTotalN = tagByIdx.size
+    const relevantIdxs = [...tagByIdx.entries()]
+      .filter(([, tag]) => tag === 'relevant')
+      .map(([idx]) => idx)
+    conOffTopicN = conTotalN - relevantIdxs.length
+    conRelevantN = relevantIdxs.length
+
+    const seenChunkIds = new Set()
+    const sourceChunks = []
+    const addChunk = (r) => {
+      if (!r || !r.chunk) return
+      const cid = r.chunk_id ?? null
+      if (cid != null) {
+        if (seenChunkIds.has(cid)) return
+        seenChunkIds.add(cid)
+      }
+      sourceChunks.push(r.chunk)
+    }
+    if (relevantIdxs.length > 0) {
+      // CoN-filtered: only the items the answerer marked relevant
+      for (const idx of relevantIdxs) addChunk(sortedForCoN[idx - 1])
+    } else {
+      // Fallback when CoN couldn't be parsed (malformed output) — use all
+      // retrieved so the treatment arm still gets *some* signal instead of
+      // degenerating to the baseline prompt.
+      for (const r of retrieved) addChunk(r)
+    }
+    correctWithChunks = await judge(question, expected, judgedAnswer, question_type, isAbstention, sourceChunks)
+  }
+
   if (!correct) failureReason = classifyFailure({ expected, retrieved, questionType: question_type, goldSessions })
   console.log(`  ⏱  judge:          ${(Date.now() - t4).toFixed(0)}ms  (${tokenLog.judging.input.toLocaleString()} tokens)`)
-  console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}`)
+  console.log(`  ${correct ? '✅ correct' : `❌ incorrect — ${failureReason ?? 'abstention'}`}` +
+    (JUDGE_DUAL ? `   | with-chunks: ${correctWithChunks ? '✅' : '❌'}  (CoN relevant ${conRelevantN}/${conTotalN})` : ''))
 
   // ── cost breakdown ────────────────────────────────────────────────────────
   const HAIKU_IN_PER_M  = 1    // $ per million input tokens
@@ -727,8 +874,17 @@ for (let i = 0; i < questions.length; i++) {
 
   run.questions.push({
     question_id, question_type, question, expected, answer,
-    correct, is_abstention: isAbstention, failure_reason: failureReason,
+    correct, correct_with_chunks: correctWithChunks,
+    con_relevant_n: conRelevantN, con_total_n: conTotalN, con_off_topic_n: conOffTopicN,
+    is_abstention: isAbstention, failure_reason: failureReason,
     ingest_ms: ingestMs, sessions_count: haystack_sessions.length, retrieved_count: retrieved.length,
+    search_ms:      searchMs,
+    context_tokens: contextTokens,
+    m_t_fired:      timeExtractFired,
+    rerank_enabled: RERANK_ENABLED,
+    rerank_fired:   rerankFired,
+    rerank_ms:      rerankFired ? rerankMsThisQ : null,
+    rerank_candidates: rerankFired ? RERANK_CANDIDATES : null,
     recall_at_5, recall_at_10, ndcg_at_5, ndcg_at_10,
     gold_sessions:      [...goldSessions],
     retrieved_sessions: rankedSessionIds,
@@ -766,6 +922,12 @@ for (let i = 0; i < questions.length; i++) {
   })
 
   fs.writeFileSync(resultsFile, JSON.stringify(run, null, 2))
+
+  // Throttle to keep cumulative GPT-4o token rate under per-minute TPM —
+  // dual judge ~triples 4o calls per question vs the baseline runner.
+  if (QUESTION_DELAY_MS > 0 && i < questions.length - 1) {
+    await new Promise(r => setTimeout(r, QUESTION_DELAY_MS))
+  }
 }
 
 // ── summary ────────────────────────────────────────────────────────────────
@@ -781,7 +943,13 @@ for (const r of run.questions) {
   if (!byCat[r.question_type]) {
     byCat[r.question_type] = {
       total: 0, correct: 0, failures: {},
+      correct_with_chunks: 0, chunks_n: 0, flipped_to_correct: 0, flipped_to_wrong: 0,
       r5_sum: 0, r10_sum: 0, n5_sum: 0, n10_sum: 0, metric_n: 0,
+      search_ms_sum: 0, search_ms_n: 0,
+      search_ms_mt_on_sum:  0, search_ms_mt_on_n:  0,
+      search_ms_mt_off_sum: 0, search_ms_mt_off_n: 0,
+      context_tokens_sum: 0, context_tokens_n: 0,
+      rerank_ms_sum: 0, rerank_ms_n: 0,
       extractor: Object.fromEntries(LLM_PHASES.map(p      => [p, { input: 0, output: 0, calls: 0 }])),
       embedder:  Object.fromEntries(EMBEDDER_PHASES.map(p => [p, { calls: 0 }])),
     }
@@ -792,12 +960,31 @@ for (const r of run.questions) {
   else if (r.failure_reason) {
     cat.failures[r.failure_reason] = (cat.failures[r.failure_reason] ?? 0) + 1
   }
+  // A/B treatment arm — count only when the dual judge actually ran.
+  if (r.correct_with_chunks != null) {
+    cat.chunks_n++
+    if (r.correct_with_chunks) cat.correct_with_chunks++
+    if (!r.correct &&  r.correct_with_chunks) cat.flipped_to_correct++
+    if ( r.correct && !r.correct_with_chunks) cat.flipped_to_wrong++
+  }
   if (r.recall_at_5 != null) {
     cat.r5_sum  += r.recall_at_5
     cat.r10_sum += r.recall_at_10
     cat.n5_sum  += r.ndcg_at_5
     cat.n10_sum += r.ndcg_at_10
     cat.metric_n += 1
+  }
+  // MemScore: search latency (split by M_T fired/not) + context tokens.
+  if (r.search_ms != null) {
+    cat.search_ms_sum += r.search_ms; cat.search_ms_n++
+    if (r.m_t_fired) { cat.search_ms_mt_on_sum  += r.search_ms; cat.search_ms_mt_on_n++  }
+    else             { cat.search_ms_mt_off_sum += r.search_ms; cat.search_ms_mt_off_n++ }
+  }
+  if (r.context_tokens != null) {
+    cat.context_tokens_sum += r.context_tokens; cat.context_tokens_n++
+  }
+  if (r.rerank_ms != null) {
+    cat.rerank_ms_sum += r.rerank_ms; cat.rerank_ms_n++
   }
   // phase-keyed token/call accumulation
   const t = r.tokens
@@ -825,39 +1012,105 @@ console.log(`\n${'─'.repeat(70)}`)
 console.log('\n── Results ─────────────────────────────────────────────────────────────')
 
 const pct = (sum, n) => n ? ((sum / n) * 100).toFixed(1) + '%' : '—'
-const head = `  ${'category'.padEnd(28)} ${'acc'.padStart(7)} ${'R@5'.padStart(7)} ${'R@10'.padStart(7)} ${'N@5'.padStart(7)} ${'N@10'.padStart(7)}  ${'supermem'.padStart(8)}  failures`
+const meanMs  = (sum, n) => n ? Math.round(sum / n) + 'ms' : '—'
+const meanTok = (sum, n) => n ? Math.round(sum / n).toString()   : '—'
+const head = `  ${'category'.padEnd(28)} ${'acc'.padStart(7)} ${'acc+ch'.padStart(7)} ${'R@5'.padStart(7)} ${'R@10'.padStart(7)} ${'N@5'.padStart(7)} ${'N@10'.padStart(7)} ${'search'.padStart(7)} ${'ctxTok'.padStart(7)}  ${'supermem'.padStart(8)}  failures`
 console.log(head)
 
 let totalCorrect = 0, totalTotal = 0
+let totalCorrectChunks = 0, totalChunksN = 0
+let totalFlippedToCorrect = 0, totalFlippedToWrong = 0
 let totalR5 = 0, totalR10 = 0, totalN5 = 0, totalN10 = 0, totalMetricN = 0
 for (const [cat, s] of Object.entries(byCat)) {
   const acc  = ((s.correct / s.total) * 100).toFixed(1) + '%'
+  const accCh = s.chunks_n
+    ? ((s.correct_with_chunks / s.chunks_n) * 100).toFixed(1) + '%'
+    : '—'
   const sm   = SUPERMEMORY_SCORES[cat] != null ? SUPERMEMORY_SCORES[cat].toFixed(1) + '%' : '—'
   const fail = Object.entries(s.failures).map(([k, v]) => `${k}:${v}`).join(' ')
   console.log(
-    `  ${cat.padEnd(28)} ${acc.padStart(7)} ` +
+    `  ${cat.padEnd(28)} ${acc.padStart(7)} ${accCh.padStart(7)} ` +
     `${pct(s.r5_sum,  s.metric_n).padStart(7)} ` +
     `${pct(s.r10_sum, s.metric_n).padStart(7)} ` +
     `${pct(s.n5_sum,  s.metric_n).padStart(7)} ` +
-    `${pct(s.n10_sum, s.metric_n).padStart(7)}  ` +
+    `${pct(s.n10_sum, s.metric_n).padStart(7)} ` +
+    `${meanMs(s.search_ms_sum, s.search_ms_n).padStart(7)} ` +
+    `${meanTok(s.context_tokens_sum, s.context_tokens_n).padStart(7)}  ` +
     `${sm.padStart(8)}  ${fail}`
   )
   totalCorrect += s.correct
   totalTotal   += s.total
+  totalCorrectChunks    += s.correct_with_chunks
+  totalChunksN          += s.chunks_n
+  totalFlippedToCorrect += s.flipped_to_correct
+  totalFlippedToWrong   += s.flipped_to_wrong
   totalR5  += s.r5_sum;  totalR10 += s.r10_sum
   totalN5  += s.n5_sum;  totalN10 += s.n10_sum
   totalMetricN += s.metric_n
 }
 
 const overall = ((totalCorrect / totalTotal) * 100).toFixed(1) + '%'
+const overallChunks = totalChunksN
+  ? ((totalCorrectChunks / totalChunksN) * 100).toFixed(1) + '%'
+  : '—'
+// totals for the search-ms / ctx-tok columns mirror byCat aggregates.
+const overallSearchMsSum  = Object.values(byCat).reduce((a, c) => a + c.search_ms_sum, 0)
+const overallSearchMsN    = Object.values(byCat).reduce((a, c) => a + c.search_ms_n,   0)
+const overallMtOnSum      = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_on_sum,  0)
+const overallMtOnN        = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_on_n,    0)
+const overallMtOffSum     = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_off_sum, 0)
+const overallMtOffN       = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_off_n,   0)
+const overallCtxTokSum    = Object.values(byCat).reduce((a, c) => a + c.context_tokens_sum, 0)
+const overallCtxTokN      = Object.values(byCat).reduce((a, c) => a + c.context_tokens_n,   0)
 console.log(
-  `  ${'overall'.padEnd(28)} ${overall.padStart(7)} ` +
+  `  ${'overall'.padEnd(28)} ${overall.padStart(7)} ${overallChunks.padStart(7)} ` +
   `${pct(totalR5,  totalMetricN).padStart(7)} ` +
   `${pct(totalR10, totalMetricN).padStart(7)} ` +
   `${pct(totalN5,  totalMetricN).padStart(7)} ` +
-  `${pct(totalN10, totalMetricN).padStart(7)}  ` +
+  `${pct(totalN10, totalMetricN).padStart(7)} ` +
+  `${meanMs(overallSearchMsSum, overallSearchMsN).padStart(7)} ` +
+  `${meanTok(overallCtxTokSum,  overallCtxTokN).padStart(7)}  ` +
   `${'81.6%'.padStart(8)}`
 )
+
+// A/B summary — only print when the dual judge actually ran.
+if (totalChunksN > 0) {
+  const baseAcc  = (totalCorrect       / totalChunksN) * 100
+  const chAcc    = (totalCorrectChunks / totalChunksN) * 100
+  const delta    = chAcc - baseAcc
+  const sign     = delta > 0 ? '+' : ''
+  console.log(
+    `\n  A/B (judge with vs without source chunks, n=${totalChunksN}):\n` +
+    `    baseline (no chunks):  ${baseAcc.toFixed(1)}%  (${totalCorrect}/${totalChunksN} correct)\n` +
+    `    treatment (+chunks):   ${chAcc.toFixed(1)}%  (${totalCorrectChunks}/${totalChunksN} correct)\n` +
+    `    delta:                 ${sign}${delta.toFixed(1)} pp\n` +
+    `    flipped → correct:     ${totalFlippedToCorrect}\n` +
+    `    flipped → wrong:       ${totalFlippedToWrong}`
+  )
+}
+
+// supermemory-style triple: accuracy% / latencyMs / contextTok
+//   https://supermemory.ai/docs/memorybench/memscore
+// Bimodality from the optional M_T (time-extraction) LLM call is reported
+// separately so the headline mean doesn't average it away.
+const mtOnMs  = overallMtOnN  ? Math.round(overallMtOnSum  / overallMtOnN)  + 'ms' : '—'
+const mtOffMs = overallMtOffN ? Math.round(overallMtOffSum / overallMtOffN) + 'ms' : '—'
+console.log(
+  `\n  MemScore (accuracy/latency/ctxTok): ${overall} / ` +
+  `${meanMs(overallSearchMsSum, overallSearchMsN)} / ` +
+  `${meanTok(overallCtxTokSum, overallCtxTokN)} tok` +
+  `    (M_T on: ${mtOnMs}, off: ${mtOffMs})`
+)
+
+// Reranker summary — cross-encoder is local and has no $ cost, so report
+// latency only. Only print when the reranker actually fired at least once.
+if (rerankLog.calls > 0) {
+  const meanRerankMs = (rerankLog.ms / rerankLog.calls).toFixed(0)
+  console.log(
+    `  🔀 Reranker (cross-encoder): ${rerankLog.calls} calls, mean ${meanRerankMs}ms, ` +
+    `${rerankLog.candidates} total candidates scored (${(rerankLog.ms / 1000).toFixed(1)}s wall-clock)`
+  )
+}
 // ── Cost & call dominance ─────────────────────────────────────────────────
 const HAIKU_IN_PER_M  = 1
 const HAIKU_OUT_PER_M = 5
@@ -911,6 +1164,17 @@ if (relationshipStats.total > 0) {
 console.log(`\n[benchmark] results: ${resultsFile}`)
 
 const toPct = (sum, n) => n ? parseFloat(((sum / n) * 100).toFixed(1)) : null
+const meanOrNull = (sum, n, digits = 0) => n ? parseFloat((sum / n).toFixed(digits)) : null
+
+// MemScore aggregate — overall + per-category mirrors of supermemory's triple.
+const totalSearchMsSum    = Object.values(byCat).reduce((a, c) => a + c.search_ms_sum, 0)
+const totalSearchMsN      = Object.values(byCat).reduce((a, c) => a + c.search_ms_n,   0)
+const totalMtOnSum        = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_on_sum, 0)
+const totalMtOnN          = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_on_n,   0)
+const totalMtOffSum       = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_off_sum, 0)
+const totalMtOffN         = Object.values(byCat).reduce((a, c) => a + c.search_ms_mt_off_n,   0)
+const totalCtxTokSum      = Object.values(byCat).reduce((a, c) => a + c.context_tokens_sum, 0)
+const totalCtxTokN        = Object.values(byCat).reduce((a, c) => a + c.context_tokens_n,   0)
 
 run.summary = {
   overall_pct:                parseFloat(overall),
@@ -920,6 +1184,16 @@ run.summary = {
   overall_ndcg_at_5_pct:      toPct(totalN5,  totalMetricN),
   overall_ndcg_at_10_pct:     toPct(totalN10, totalMetricN),
   overall_metric_n:           totalMetricN,
+  // supermemory-style triple: accuracy% / latencyMs / contextTok
+  // https://supermemory.ai/docs/memorybench/memscore
+  memscore: {
+    accuracy_pct:          parseFloat(overall),
+    mean_search_ms:        meanOrNull(totalSearchMsSum,  totalSearchMsN),
+    mean_search_ms_mt_on:  meanOrNull(totalMtOnSum,      totalMtOnN),
+    mean_search_ms_mt_off: meanOrNull(totalMtOffSum,     totalMtOffN),
+    mean_context_tokens:   meanOrNull(totalCtxTokSum,    totalCtxTokN),
+    n_questions:           totalSearchMsN,
+  },
   cost: {
     by_phase: Object.fromEntries(LLM_PHASES.map(phase => {
       const b = llmTotal[phase]
@@ -946,6 +1220,11 @@ run.summary = {
     ndcg_at_10_pct:    toPct(s.n10_sum, s.metric_n),
     metric_n:          s.metric_n,
     failures:          s.failures,
+    memscore: {
+      accuracy_pct:        parseFloat(((s.correct / s.total) * 100).toFixed(1)),
+      mean_search_ms:      meanOrNull(s.search_ms_sum,      s.search_ms_n),
+      mean_context_tokens: meanOrNull(s.context_tokens_sum, s.context_tokens_n),
+    },
     extractor:         s.extractor,
     embedder:          s.embedder,
   }])),

@@ -49,10 +49,14 @@ export interface Memory {
  * Pairs atomic memory with its source chunk (dual retrieval)
  */
 export interface SearchResult {
+  /** internal fact id — stable within this DB, null for chunk-only results */
+  id:            number | null;
   /** atomic extracted memory — high signal, precise */
   memory:        string;
   /** source conversation chunk — full context, may be null for old facts */
   chunk:         string | null;
+  /** FK into the chunks table — lets callers dedupe across facts sharing a source */
+  chunk_id:      number | null;
   memory_type:   MemoryType;
   confidence:    number;
   document_date: string | null;
@@ -188,6 +192,60 @@ export interface EmbedderContext {
 
 export type EmbedderFn = (text: string, context?: EmbedderContext) => Promise<number[]> | number[];
 
+/**
+ * Reranks a list of post-RRF candidates against the query. Optional —
+ * you provide this if you want better precision-at-rank than RRF gives.
+ *
+ * Recommended path: a local cross-encoder (~30–80ms for 20 candidates
+ * after warmup). See example/with-rerank.js for a transformers.js example.
+ *
+ * The function receives candidates pre-built by greymemory and returns
+ * score-only entries keyed by candidate id. The library re-keys by id
+ * and preserves all internal fields downstream graph-expansion needs.
+ *
+ * Candidates the reranker omits from its return list fall back to their
+ * original RRF order behind the reranked head. On throw, search() falls
+ * back to RRF order entirely and prints a warning.
+ *
+ * @example Cross-encoder via @xenova/transformers
+ * const ce = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2')
+ * const reranker = async (query, candidates) => {
+ *   const inputs = candidates.map(c => ({ text: query, text_pair: c.text }))
+ *   const scores = await ce(inputs, { topk: 1 })
+ *   return candidates.map((c, i) => ({ id: c.id, score: scores[i][0].score }))
+ * }
+ */
+export interface RerankerContext {
+  /** Always 'rerank' when called from search(). */
+  phase?: 'rerank';
+  /** The original user query — same string passed as the first arg. */
+  query: string;
+}
+
+export interface RerankCandidate {
+  /** Namespaced id: "fact_42" | "chunk_7". Echo this back in the score object. */
+  id: string;
+  /** Pre-built text for cross-encoder consumption. Truncated to rerankCandidateMaxChars. */
+  text: string;
+  /** Raw fields — use these if you want to build your own scoring text instead of `text`. */
+  key:     string | null;   // facts only
+  value:   string | null;   // facts only
+  content: string | null;   // chunks only
+  memory_type:   'fact' | 'preference' | 'episode' | 'chunk';
+  document_date: string | null;
+  event_date:    string | null;
+  is_latest:     boolean | null;   // null for chunks
+  confidence:    number | null;    // null for chunks
+  /** Post-RRF score before reranking — useful for blending: final = α·rrf + (1−α)·rerank. */
+  rrf_score:     number;
+}
+
+export type RerankerFn = (
+  query: string,
+  candidates: RerankCandidate[],
+  context?: RerankerContext
+) => Promise<Array<{ id: string; score: number }>> | Array<{ id: string; score: number }>;
+
 // ── Options ────────────────────────────────────────────────────────────────
 
 export interface GreyMemoryOptions {
@@ -263,6 +321,15 @@ export interface GreyMemoryOptions {
    * are swallowed so ingestion never blocks on logging.
    */
   onRelationshipDecision?: (entry: RelationshipDecisionLog) => void;
+
+  /**
+   * Optional reranker function. Called between RRF fusion and graph
+   * expansion when search() is invoked with `rerank: true`. Use any
+   * cross-encoder, BGE-reranker, Cohere/Voyage rerank API, or LLM.
+   * Recommended: a local cross-encoder for sub-100ms latency.
+   * See {@link RerankerFn} for the signature.
+   */
+  reranker?: RerankerFn;
 }
 
 /**
@@ -407,6 +474,30 @@ export interface SearchOptions {
    * @default true
    */
   timeAwareQuery?: boolean;
+
+  /**
+   * Enable the optional reranker step between RRF fusion and graph expansion.
+   * Requires a `reranker` function on the GreyMemoryOptions. No-op if no
+   * reranker was provided. @default false
+   */
+  rerank?: boolean;
+
+  /**
+   * How many post-RRF, post-filter candidates to send to the reranker.
+   * Smaller = faster but less reordering room; larger = slower but more
+   * room for the reranker to surface items the RRF order missed.
+   * @default 20
+   */
+  rerankCandidates?: number;
+
+  /**
+   * Per-candidate `text` truncation budget. Tuned for the common 512-token
+   * max-seq cross-encoders (MiniLM, BGE-reranker-base). Raise for long-
+   * context rerankers like BGE-reranker-large (8K), Cohere rerank-3 (4K),
+   * or LLM rerankers. Applied uniformly to facts and chunks.
+   * @default 512
+   */
+  rerankCandidateMaxChars?: number;
 }
 
 /**
@@ -622,6 +713,12 @@ export interface FormatForReadingOptions {
   topN?: number;
   /** Reserved for future date-anchoring (unused today) */
   asOf?: string | null;
+  /**
+   * CoN prompt variant. 'v1' is the original Chain-of-Note prompt.
+   * 'v2' (see {@link formatForReadingV2}) introduces topic anchors, 3-tier
+   * relevance tagging, and an off-topic self-check. @default 'v1'
+   */
+  version?: 'v1' | 'v2';
 }
 
 /**
@@ -646,3 +743,47 @@ export interface FormatForReadingOptions {
  * const answer  = await answerer(prompt)
  */
 export function formatForReading(options: FormatForReadingOptions): string;
+
+/**
+ * Builds a redesigned Chain-of-Note answering prompt that fixes the false-
+ * negative gold-memory rejection observed in v1 (see `formatForReading`).
+ *
+ * Differences from v1:
+ *   • Step 0 — Topic anchors (entity/attribute/event the question is about)
+ *   • Step 1 — 3-tier scoring: `answers` / `related` / `off-topic`
+ *     (`off-topic` requires a quoted noun phrase from the item)
+ *   • Step 1.5 — Self-check on off-topic items
+ *   • Step 2 — Explicit inline date comparison for superlative questions
+ *
+ * The CURRENT VALUES banner remains the sole authority for present-tense
+ * knowledge-update questions. Output still ends with `Answer: <text>`, so
+ * downstream judges that read the Answer line are unaffected.
+ *
+ * @example
+ * const prompt = formatForReadingV2({ question, questionDate, results })
+ * // equivalent to: formatForReading({ ..., version: 'v2' })
+ */
+export function formatForReadingV2(
+  options: Omit<FormatForReadingOptions, 'version' | 'asOf'>
+): string;
+
+/**
+ * Returns just the retrieved-context string the answerer sees — the JSON
+ * items block produced by `formatForReading`, without the surrounding
+ * question and instructions.
+ *
+ * Used to measure supermemory-style `contextTok` (tokens in just the
+ * context the memory provider returns to the answering model). The string
+ * is byte-identical to the corresponding section inside `formatForReading`,
+ * so token counts on this output match what the answerer is actually billed
+ * for in the context portion.
+ *
+ * @example
+ * import { formatRetrievedContext } from 'greymemory'
+ * import { encode } from 'gpt-tokenizer/model/gpt-4o'
+ *
+ * const results = await memory.search(question, { topN: 10 })
+ * const context = formatRetrievedContext(results, 10)
+ * const contextTokens = encode(context).length
+ */
+export function formatRetrievedContext(results: SearchResult[], topN?: number): string;
