@@ -49,10 +49,14 @@ export interface Memory {
  * Pairs atomic memory with its source chunk (dual retrieval)
  */
 export interface SearchResult {
+  /** internal fact id — stable within this DB, null for chunk-only results */
+  id:            number | null;
   /** atomic extracted memory — high signal, precise */
   memory:        string;
   /** source conversation chunk — full context, may be null for old facts */
   chunk:         string | null;
+  /** FK into the chunks table — lets callers dedupe across facts sharing a source */
+  chunk_id:      number | null;
   memory_type:   MemoryType;
   confidence:    number;
   document_date: string | null;
@@ -622,6 +626,12 @@ export interface FormatForReadingOptions {
   topN?: number;
   /** Reserved for future date-anchoring (unused today) */
   asOf?: string | null;
+  /**
+   * CoN prompt variant. 'v1' is the original Chain-of-Note prompt.
+   * 'v2' (see {@link formatForReadingV2}) introduces topic anchors, 3-tier
+   * relevance tagging, and an off-topic self-check. @default 'v1'
+   */
+  version?: 'v1' | 'v2';
 }
 
 /**
@@ -646,3 +656,47 @@ export interface FormatForReadingOptions {
  * const answer  = await answerer(prompt)
  */
 export function formatForReading(options: FormatForReadingOptions): string;
+
+/**
+ * Builds a redesigned Chain-of-Note answering prompt that fixes the false-
+ * negative gold-memory rejection observed in v1 (see `formatForReading`).
+ *
+ * Differences from v1:
+ *   • Step 0 — Topic anchors (entity/attribute/event the question is about)
+ *   • Step 1 — 3-tier scoring: `answers` / `related` / `off-topic`
+ *     (`off-topic` requires a quoted noun phrase from the item)
+ *   • Step 1.5 — Self-check on off-topic items
+ *   • Step 2 — Explicit inline date comparison for superlative questions
+ *
+ * The CURRENT VALUES banner remains the sole authority for present-tense
+ * knowledge-update questions. Output still ends with `Answer: <text>`, so
+ * downstream judges that read the Answer line are unaffected.
+ *
+ * @example
+ * const prompt = formatForReadingV2({ question, questionDate, results })
+ * // equivalent to: formatForReading({ ..., version: 'v2' })
+ */
+export function formatForReadingV2(
+  options: Omit<FormatForReadingOptions, 'version' | 'asOf'>
+): string;
+
+/**
+ * Returns just the retrieved-context string the answerer sees — the JSON
+ * items block produced by `formatForReading`, without the surrounding
+ * question and instructions.
+ *
+ * Used to measure supermemory-style `contextTok` (tokens in just the
+ * context the memory provider returns to the answering model). The string
+ * is byte-identical to the corresponding section inside `formatForReading`,
+ * so token counts on this output match what the answerer is actually billed
+ * for in the context portion.
+ *
+ * @example
+ * import { formatRetrievedContext } from 'greymemory'
+ * import { encode } from 'gpt-tokenizer/model/gpt-4o'
+ *
+ * const results = await memory.search(question, { topN: 10 })
+ * const context = formatRetrievedContext(results, 10)
+ * const contextTokens = encode(context).length
+ */
+export function formatRetrievedContext(results: SearchResult[], topN?: number): string;
