@@ -192,60 +192,6 @@ export interface EmbedderContext {
 
 export type EmbedderFn = (text: string, context?: EmbedderContext) => Promise<number[]> | number[];
 
-/**
- * Reranks a list of post-RRF candidates against the query. Optional —
- * you provide this if you want better precision-at-rank than RRF gives.
- *
- * Recommended path: a local cross-encoder (~30–80ms for 20 candidates
- * after warmup). See example/with-rerank.js for a transformers.js example.
- *
- * The function receives candidates pre-built by greymemory and returns
- * score-only entries keyed by candidate id. The library re-keys by id
- * and preserves all internal fields downstream graph-expansion needs.
- *
- * Candidates the reranker omits from its return list fall back to their
- * original RRF order behind the reranked head. On throw, search() falls
- * back to RRF order entirely and prints a warning.
- *
- * @example Cross-encoder via @xenova/transformers
- * const ce = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2')
- * const reranker = async (query, candidates) => {
- *   const inputs = candidates.map(c => ({ text: query, text_pair: c.text }))
- *   const scores = await ce(inputs, { topk: 1 })
- *   return candidates.map((c, i) => ({ id: c.id, score: scores[i][0].score }))
- * }
- */
-export interface RerankerContext {
-  /** Always 'rerank' when called from search(). */
-  phase?: 'rerank';
-  /** The original user query — same string passed as the first arg. */
-  query: string;
-}
-
-export interface RerankCandidate {
-  /** Namespaced id: "fact_42" | "chunk_7". Echo this back in the score object. */
-  id: string;
-  /** Pre-built text for cross-encoder consumption. Truncated to rerankCandidateMaxChars. */
-  text: string;
-  /** Raw fields — use these if you want to build your own scoring text instead of `text`. */
-  key:     string | null;   // facts only
-  value:   string | null;   // facts only
-  content: string | null;   // chunks only
-  memory_type:   'fact' | 'preference' | 'episode' | 'chunk';
-  document_date: string | null;
-  event_date:    string | null;
-  is_latest:     boolean | null;   // null for chunks
-  confidence:    number | null;    // null for chunks
-  /** Post-RRF score before reranking — useful for blending: final = α·rrf + (1−α)·rerank. */
-  rrf_score:     number;
-}
-
-export type RerankerFn = (
-  query: string,
-  candidates: RerankCandidate[],
-  context?: RerankerContext
-) => Promise<Array<{ id: string; score: number }>> | Array<{ id: string; score: number }>;
-
 // ── Options ────────────────────────────────────────────────────────────────
 
 export interface GreyMemoryOptions {
@@ -321,15 +267,6 @@ export interface GreyMemoryOptions {
    * are swallowed so ingestion never blocks on logging.
    */
   onRelationshipDecision?: (entry: RelationshipDecisionLog) => void;
-
-  /**
-   * Optional reranker function. Called between RRF fusion and graph
-   * expansion when search() is invoked with `rerank: true`. Use any
-   * cross-encoder, BGE-reranker, Cohere/Voyage rerank API, or LLM.
-   * Recommended: a local cross-encoder for sub-100ms latency.
-   * See {@link RerankerFn} for the signature.
-   */
-  reranker?: RerankerFn;
 }
 
 /**
@@ -474,30 +411,6 @@ export interface SearchOptions {
    * @default true
    */
   timeAwareQuery?: boolean;
-
-  /**
-   * Enable the optional reranker step between RRF fusion and graph expansion.
-   * Requires a `reranker` function on the GreyMemoryOptions. No-op if no
-   * reranker was provided. @default false
-   */
-  rerank?: boolean;
-
-  /**
-   * How many post-RRF, post-filter candidates to send to the reranker.
-   * Smaller = faster but less reordering room; larger = slower but more
-   * room for the reranker to surface items the RRF order missed.
-   * @default 20
-   */
-  rerankCandidates?: number;
-
-  /**
-   * Per-candidate `text` truncation budget. Tuned for the common 512-token
-   * max-seq cross-encoders (MiniLM, BGE-reranker-base). Raise for long-
-   * context rerankers like BGE-reranker-large (8K), Cohere rerank-3 (4K),
-   * or LLM rerankers. Applied uniformly to facts and chunks.
-   * @default 512
-   */
-  rerankCandidateMaxChars?: number;
 }
 
 /**

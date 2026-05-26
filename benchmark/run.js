@@ -30,8 +30,6 @@ const SKIP_INGEST     = true                         // true = skip ingestion, u
 const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
 const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
 const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v2' ? 'v2' : 'v1')  // 'v2' = anchor + 3-tier scoring + self-check (see formatForReadingV2)
-const RERANK_ENABLED  = false                        // CP5: cross-encoder rerank between RRF and seed slicing. Off = baseline (no rerank). On = use @xenova/transformers MiniLM ms-marco model.
-const RERANK_CANDIDATES = 20                         // how many post-RRF candidates the reranker sees
 const JUDGE_DUAL      = false                        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks. Off by default: KU-10 run 2026-05-26 regressed −10pp via a state-change false-negative.
 const QUESTION_DELAY_MS = 6000                       // sleep between questions to stay under OpenAI per-minute TPM (dual judge ~triples 4o calls per Q)
 
@@ -106,10 +104,6 @@ const tokenLog = {
   judging:   { input: 0, output: 0 },
 }
 
-// Reranker has no token cost (local cross-encoder). Track latency + count
-// in a sibling log instead of polluting the dollars-from-tokens buckets.
-const rerankLog = { calls: 0, candidates: 0, ms: 0 }
-
 const sumCalls = obj => Object.values(obj).reduce((s, p) => s + (p.calls  ?? 0), 0)
 const sumIn    = obj => Object.values(obj).reduce((s, p) => s + (p.input  ?? 0), 0)
 const sumOut   = obj => Object.values(obj).reduce((s, p) => s + (p.output ?? 0), 0)
@@ -119,7 +113,6 @@ function resetTokenLog() {
   for (const p of Object.values(tokenLog.embedder))  { p.calls = 0 }
   tokenLog.answering = { input: 0, output: 0 }
   tokenLog.judging   = { input: 0, output: 0 }
-  rerankLog.calls = 0; rerankLog.candidates = 0; rerankLog.ms = 0
 }
 
 // ── providers ──────────────────────────────────────────────────────────────
@@ -170,45 +163,6 @@ const embedder = async (text, context) => {
   bucket.calls += 1
   return rawBatchedEmbedder(text)
 }
-
-// ── reranker (cross-encoder via @xenova/transformers, optional) ─────────────
-// Lazy-loaded module-level singleton. First call pays ~1.5s model download +
-// load; subsequent calls reuse warmed weights (~30–80ms for 20 candidates).
-// Only constructed when RERANK_ENABLED — the import is dynamic so users who
-// haven't `npm install @xenova/transformers` aren't impacted.
-
-let _crossEncoder = null
-const getCrossEncoder = async () => {
-  if (_crossEncoder) return _crossEncoder
-  const { pipeline } = await import('@xenova/transformers')
-  _crossEncoder = await pipeline('text-classification', 'Xenova/ms-marco-MiniLM-L-6-v2')
-  return _crossEncoder
-}
-
-const reranker = RERANK_ENABLED
-  ? async (query, candidates) => {
-      const t0 = performance.now()
-      try {
-        const ce = await getCrossEncoder()
-        // transformers.js cross-encoder API: classifier(query, passages[])
-        const passages = candidates.map(c => c.text)
-        const scored = await ce(query, passages)
-        const arr = Array.isArray(scored) ? scored : [scored]
-        const out = candidates.map((c, i) => {
-          const result = Array.isArray(arr[i]) ? arr[i][0] : arr[i]
-          return { id: c.id, score: result?.score ?? 0 }
-        })
-        rerankLog.calls += 1
-        rerankLog.candidates += candidates.length
-        rerankLog.ms += performance.now() - t0
-        return out
-      } catch (err) {
-        process.stderr.write(`\n  [warn] rerank failed: ${err.message ?? err}\n`)
-        // Don't count failed calls in rerankLog; search() falls back to RRF.
-        return []
-      }
-    }
-  : undefined
 
 const answerer = async (prompt, retries = 3) => {
   for (let attempt = 0; attempt < retries; attempt++) {
@@ -642,7 +596,6 @@ for (let i = 0; i < questions.length; i++) {
   currentQuestionId = question_id
   const memory = new Memory({
     extractor, embedder,
-    reranker,
     dir:           DB_DIR,
     container:     question_id,
     filterPrompt:  FILTER_PROMPT,
@@ -693,19 +646,13 @@ for (let i = 0; i < questions.length; i++) {
     ? questionDateNorm + 'T23:59'
     : questionDateNorm.slice(0, 10) + 'T23:59'
   const timeExtractCallsBefore = ext.time_extraction.calls
-  const rerankCallsBefore      = rerankLog.calls
-  const rerankMsBefore         = rerankLog.ms
   const retrieved = await memory.search(question, {
     topN: SEARCH_TOP_N,
     asOf,
     timeAwareQuery: TIME_AWARE_QUERY,
-    rerank:           RERANK_ENABLED,
-    rerankCandidates: RERANK_CANDIDATES,
   })
   const searchMs         = Date.now() - t1
   const timeExtractFired = ext.time_extraction.calls > timeExtractCallsBefore
-  const rerankFired      = rerankLog.calls > rerankCallsBefore
-  const rerankMsThisQ    = rerankLog.ms - rerankMsBefore
 
   // MemScore contextTok: tokens in just the retrieved-context string (not the full answering prompt).
   // Only the json-con path produces a cleanly isolable context block — see formatRetrievedContext.
@@ -715,9 +662,6 @@ for (let i = 0; i < questions.length; i++) {
     contextTokens = encodeGpt4o(contextString).length
   }
   console.log(`\n  ⏱  search:         ${searchMs.toFixed(0)}ms  (${retrieved.length} results, ctxTok ${contextTokens ?? '—'})${timeExtractFired ? `  [M_T fired: ${ext.time_extraction.input}↓/${ext.time_extraction.output}↑]` : '  [M_T skipped]'}`)
-  if (RERANK_ENABLED) {
-    console.log(`  🔀  rerank:         ${rerankFired ? `${rerankMsThisQ.toFixed(0)}ms, ${RERANK_CANDIDATES} cands` : 'skipped (filtered.length ≤ 1)'}`)
-  }
 
   // ── retrieval metrics ───────────────────────────────────────────────────
   const goldSessions     = new Set(answer_session_ids ?? [])
@@ -881,10 +825,6 @@ for (let i = 0; i < questions.length; i++) {
     search_ms:      searchMs,
     context_tokens: contextTokens,
     m_t_fired:      timeExtractFired,
-    rerank_enabled: RERANK_ENABLED,
-    rerank_fired:   rerankFired,
-    rerank_ms:      rerankFired ? rerankMsThisQ : null,
-    rerank_candidates: rerankFired ? RERANK_CANDIDATES : null,
     recall_at_5, recall_at_10, ndcg_at_5, ndcg_at_10,
     gold_sessions:      [...goldSessions],
     retrieved_sessions: rankedSessionIds,
@@ -949,7 +889,6 @@ for (const r of run.questions) {
       search_ms_mt_on_sum:  0, search_ms_mt_on_n:  0,
       search_ms_mt_off_sum: 0, search_ms_mt_off_n: 0,
       context_tokens_sum: 0, context_tokens_n: 0,
-      rerank_ms_sum: 0, rerank_ms_n: 0,
       extractor: Object.fromEntries(LLM_PHASES.map(p      => [p, { input: 0, output: 0, calls: 0 }])),
       embedder:  Object.fromEntries(EMBEDDER_PHASES.map(p => [p, { calls: 0 }])),
     }
@@ -982,9 +921,6 @@ for (const r of run.questions) {
   }
   if (r.context_tokens != null) {
     cat.context_tokens_sum += r.context_tokens; cat.context_tokens_n++
-  }
-  if (r.rerank_ms != null) {
-    cat.rerank_ms_sum += r.rerank_ms; cat.rerank_ms_n++
   }
   // phase-keyed token/call accumulation
   const t = r.tokens
@@ -1102,15 +1038,6 @@ console.log(
   `    (M_T on: ${mtOnMs}, off: ${mtOffMs})`
 )
 
-// Reranker summary — cross-encoder is local and has no $ cost, so report
-// latency only. Only print when the reranker actually fired at least once.
-if (rerankLog.calls > 0) {
-  const meanRerankMs = (rerankLog.ms / rerankLog.calls).toFixed(0)
-  console.log(
-    `  🔀 Reranker (cross-encoder): ${rerankLog.calls} calls, mean ${meanRerankMs}ms, ` +
-    `${rerankLog.candidates} total candidates scored (${(rerankLog.ms / 1000).toFixed(1)}s wall-clock)`
-  )
-}
 // ── Cost & call dominance ─────────────────────────────────────────────────
 const HAIKU_IN_PER_M  = 1
 const HAIKU_OUT_PER_M = 5
