@@ -58,11 +58,12 @@ export class Storage {
       );
 
       CREATE TABLE IF NOT EXISTS chunks (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        content     TEXT NOT NULL,
-        container   TEXT NOT NULL DEFAULT 'default',
-        session_id  TEXT,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        content      TEXT NOT NULL,
+        container    TEXT NOT NULL DEFAULT 'default',
+        session_id   TEXT,
+        content_hash TEXT,
+        created_at   TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
       CREATE TABLE IF NOT EXISTS chunk_embeddings (
@@ -353,6 +354,8 @@ export class Storage {
       CREATE INDEX IF NOT EXISTS idx_facts_docdate ON facts(container, document_date);
       CREATE INDEX IF NOT EXISTS idx_facts_expires ON facts(expires_at) WHERE expires_at IS NOT NULL;
     `);
+    // (idx_chunks_dedup is created further down, AFTER content_hash is guaranteed to exist
+    //  — on an existing DB the column isn't added until the rebuild / ALTER below.)
 
     // ── chunks table rebuild ──────────────────────────────────────────────────
     // Drop the source_role column. Round-level chunks (CP1) contain both a user
@@ -384,11 +387,12 @@ export class Storage {
 
           this.db.exec(`
             CREATE TABLE chunks (
-              id          INTEGER PRIMARY KEY AUTOINCREMENT,
-              content     TEXT NOT NULL,
-              container   TEXT NOT NULL DEFAULT 'default',
-              session_id  TEXT,
-              created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+              id           INTEGER PRIMARY KEY AUTOINCREMENT,
+              content      TEXT NOT NULL,
+              container    TEXT NOT NULL DEFAULT 'default',
+              session_id   TEXT,
+              content_hash TEXT,
+              created_at   TEXT NOT NULL DEFAULT (datetime('now'))
             );
           `);
 
@@ -424,6 +428,25 @@ export class Storage {
         this.db.pragma('foreign_keys = ON');
       }
     }
+
+    // ── content_hash column (Feature 1: dedupBySession) ───────────────────────
+    // Independent ALTER fallback: a DB already past the v0.4 chunks rebuild won't
+    // re-enter the block above, so add the column directly if it's missing. Existing
+    // rows get content_hash = NULL — correct, they were never dedup-tracked, and the
+    // partial idx_chunks_dedup excludes NULLs.
+    const chunkCols = new Set(this.db.pragma('table_info(chunks)').map(c => c.name));
+    if (!chunkCols.has('content_hash')) {
+      this.db.exec(`ALTER TABLE chunks ADD COLUMN content_hash TEXT`);
+    }
+
+    // Feature 1 (dedupBySession): partial index for fast already-ingested-round lookup.
+    // Created here — after the rebuild AND the ALTER above — so content_hash is guaranteed
+    // to exist on fresh installs, post-rebuild, and post-ALTER alike. Zero cost for the
+    // default (no-sessionId) path because of the partial predicate.
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_chunks_dedup ON chunks(container, session_id, content_hash)
+        WHERE session_id IS NOT NULL AND content_hash IS NOT NULL;
+    `);
 
     // ── chunk_embeddings rebuild ──────────────────────────────────────────────
     // add REFERENCES chunks(id) — missing from original v0.2 definition
@@ -545,20 +568,28 @@ export class Storage {
 
   // ── Chunks ─────────────────────────────────────────
 
-  saveChunk(content, sessionId = null, documentDate = null) {
-    this.db.prepare(`
-      INSERT INTO chunks (content, container, session_id, created_at)
-      VALUES (?, ?, ?, ?)
-    `).run(content, this.container, sessionId, documentDate ?? new Date().toISOString())
+  // Returns the new chunk's id (lastInsertRowid) so the caller can attribute
+  // facts/embeddings to it directly — no follow-up SELECT needed. Mirrors saveFact.
+  saveChunk(content, sessionId = null, documentDate = null, contentHash = null) {
+    const result = this.db.prepare(`
+      INSERT INTO chunks (content, container, session_id, content_hash, created_at)
+      VALUES (?, ?, ?, ?, ?)
+    `).run(content, this.container, sessionId, contentHash, documentDate ?? new Date().toISOString())
+
+    return result.lastInsertRowid
   }
 
-  getLastChunkId() {
+  // Feature 1 (dedupBySession): has a round with this content hash already been ingested
+  // under this sessionId in this container? Container-scoped, so dedup never crosses
+  // containers. Returns false unless both args are present.
+  chunkExists(sessionId, contentHash) {
+    if (sessionId == null || contentHash == null) return false
     const row = this.db.prepare(`
-      SELECT id FROM chunks
-      WHERE container = ?
-      ORDER BY id DESC LIMIT 1
-    `).get(this.container);
-    return row?.id ?? null;
+      SELECT 1 FROM chunks
+      WHERE container = ? AND session_id = ? AND content_hash = ?
+      LIMIT 1
+    `).get(this.container, sessionId, contentHash)
+    return !!row
   }
 
   saveChunkEmbedding(chunkId, vector) {

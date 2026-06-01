@@ -3,11 +3,45 @@
 // ── Core Types ─────────────────────────────────────────────────────────────
 
 /**
- * A single message in a conversation
+ * Role of a message / the source role attributed to a fact.
+ * 'document' is used internally when a raw string is added.
+ */
+export type Role = 'user' | 'assistant' | 'system' | 'document' | 'tool';
+
+/** A text content block. */
+export interface TextBlock { type: 'text'; text: string; }
+/** An image content block — ingested as a '[image]' placeholder (the URL is never stored). */
+export interface ImageBlock { type: 'image_url'; imageUrl: { url: string }; }
+/** A single content block within a structured message. */
+export type ContentBlock = TextBlock | ImageBlock;
+
+/** A tool invocation on an assistant turn. Provider-shaped; serialized into text for the extractor. */
+export interface ToolCall {
+  id?:        string;
+  name?:      string;
+  arguments?: unknown;
+  /** OpenAI-style nesting is also accepted. */
+  function?:  { name?: string; arguments?: unknown };
+}
+
+/**
+ * A single message in a conversation.
+ *
+ * `content` may be a plain string or an array of content blocks (text / image). Structured
+ * agent transcripts may also carry `tool_calls` (assistant turns) and `tool_call_id` / `name`
+ * (tool-result turns). All of these are flattened to a string at ingest — content blocks are
+ * concatenated, images become a `[image]` placeholder, and tool calls/results are folded into
+ * readable text — so older `{ role, content: string }` callers behave exactly as before.
  */
 export interface Message {
-  role:    'user' | 'assistant' | 'system' | 'document';
-  content: string;
+  role:          Role;
+  content:       string | ContentBlock[];
+  /** Tool invocations made on an assistant turn. */
+  tool_calls?:   ToolCall[];
+  /** For a tool-result turn (role:'tool'): which call it answers. */
+  tool_call_id?: string;
+  /** Tool / function name (tool-result or named turns). */
+  name?:         string;
 }
 
 /**
@@ -62,8 +96,8 @@ export interface SearchResult {
   document_date: string | null;
   event_date:    string | null;
   relation_type: RelationType;
-  /** 'user' or 'assistant' — source role of the producing message */
-  source_role:   'user' | 'assistant' | null;
+  /** source role of the producing message (user / assistant / system / tool / document) */
+  source_role:   Role | null;
   /** identifier of the session this item came from — null if the chunk had no sessionId at ingest */
   session_id:    string | null;
 }
@@ -255,6 +289,24 @@ export interface GreyMemoryOptions {
   contextualRetrieval?: boolean;
 
   /**
+   * Extraction granularity.
+   *
+   * - `'session'` (default): extract the whole conversation in one LLM call,
+   *   mapping each fact back to its round via the extractor's
+   *   `source_message_index`. Strongest cross-round reference resolution.
+   * - `'round'`: extract one round at a time, in order, with a sharp per-round
+   *   dedup seed and a running summary of earlier rounds (threaded through
+   *   `entityContext`) so cross-round references still resolve. Provenance is
+   *   exact — every fact is attributed to its own round's chunk — and the
+   *   K = V + fact chunk embedding aligns by construction. Plain string
+   *   (document) inputs always use `'session'`.
+   *
+   * Overridable per call via {@link AddOptions.extractionMode}.
+   * @default 'session'
+   */
+  extractionMode?: 'session' | 'round';
+
+  /**
    * Pass an existing better-sqlite3 Database instance.
    * Use when you want to manage the database lifecycle yourself.
    */
@@ -288,7 +340,7 @@ export interface RelationshipDecisionLog {
     memory_type:   MemoryType;
     document_date: string | null;
     event_date:    string | null;
-    source_role:   'user' | 'assistant' | null;
+    source_role:   Role | null;
   };
   /** Number of existing facts the classifier considered */
   candidate_count: number;
@@ -321,6 +373,11 @@ export interface RelationshipDecisionLog {
 export interface AddResult {
   chunksStored: number;
   factsStored:  number;
+  /** Rounds skipped because their content was already ingested under this sessionId
+   *  (only ever non-zero when `dedupBySession` is set). */
+  roundsSkipped: number;
+  /** Chunks skipped — equals `roundsSkipped` (one chunk per round); alias for clarity. */
+  chunksSkipped: number;
   llmCalls: {
     extraction:        number;
     relationship:      number;
@@ -368,8 +425,27 @@ export interface AddOptions {
    * Caller-supplied session identifier. Persisted to chunks.session_id and surfaces
    * on SearchResult.session_id, enabling per-session provenance tracking and
    * evaluation metrics (e.g. LongMemEval-style Recall@k / NDCG@k).
+   *
+   * When {@link AddOptions.dedupBySession} is set, this also becomes the dedup/upsert
+   * key — re-adding a growing conversation under the same id only ingests new rounds.
    */
   sessionId?: string | null;
+
+  /**
+   * Opt in to round-level dedup keyed by {@link AddOptions.sessionId} (requires it).
+   * When true, a round whose raw text was already ingested under the same sessionId in
+   * this container is skipped — not re-chunked, not re-embedded, not re-extracted —
+   * letting a hook re-send a whole transcript cheaply. Two rounds with identical text
+   * collide by design (content-hash dedup). Off by default → behavior is unchanged.
+   * @default false
+   */
+  dedupBySession?: boolean;
+
+  /**
+   * Override the constructor's extraction granularity for this call.
+   * See {@link GreyMemoryOptions.extractionMode}.
+   */
+  extractionMode?: 'session' | 'round';
 }
 export interface SearchOptions {
   /**

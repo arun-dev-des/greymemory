@@ -1,0 +1,10 @@
+{
+  "name": "greymemory-plugins",
+  "plugins": [
+    {
+      "name": "greymemory-cc",
+      "description": "Self-hosted memory layer for Claude Code sessions",
+      "location": "./"
+    }
+  ]
+}

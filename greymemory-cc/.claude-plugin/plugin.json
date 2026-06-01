@@ -1,0 +1,8 @@
+{
+  "name": "greymemory-cc",
+  "description": "Capture Claude Code sessions into a self-hosted greymemory DB and inject relevant memories back into context.",
+  "version": "0.1.0",
+  "author": { "name": "Arunkumar" },
+  "homepage": "https://github.com/arun-dev-des/greymemory",
+  "license": "Apache-2.0"
+}

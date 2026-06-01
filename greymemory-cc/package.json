@@ -1,0 +1,18 @@
+{
+  "name": "greymemory-cc",
+  "version": "0.1.0",
+  "description": "Claude Code plugin: capture sessions into a self-hosted greymemory DB and inject relevant memories back into context.",
+  "type": "module",
+  "private": true,
+  "license": "Apache-2.0",
+  "author": "Arunkumar",
+  "dependencies": {
+    "greymemory": "file:..",
+    "@anthropic-ai/sdk": ">=0.30.0",
+    "@modelcontextprotocol/sdk": ">=1.0.0",
+    "better-sqlite3": "^12.8.0"
+  },
+  "optionalDependencies": {
+    "openai": ">=4.0.0"
+  }
+}

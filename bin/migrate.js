@@ -193,6 +193,13 @@ try {
     }
   }
 
+  // step 3b: chunks.content_hash column (Feature 1: dedupBySession)
+  const chunkCols = new Set(db.pragma('table_info(chunks)').map(c => c.name))
+  if (!chunkCols.has('content_hash')) {
+    db.exec(`ALTER TABLE chunks ADD COLUMN content_hash TEXT`)
+    console.log('[greymemory] added column: chunks.content_hash')
+  }
+
   // step 4: backfill defaults
   db.exec(`
     UPDATE facts SET
@@ -210,6 +217,8 @@ try {
     CREATE INDEX IF NOT EXISTS idx_facts_type    ON facts(container, memory_type);
     CREATE INDEX IF NOT EXISTS idx_facts_docdate ON facts(container, document_date);
     CREATE INDEX IF NOT EXISTS idx_facts_expires ON facts(expires_at) WHERE expires_at IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS idx_chunks_dedup  ON chunks(container, session_id, content_hash)
+      WHERE session_id IS NOT NULL AND content_hash IS NOT NULL;
   `)
 
   const factCount  = db.prepare(`SELECT COUNT(*) as count FROM facts`).get().count

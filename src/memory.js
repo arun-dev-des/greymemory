@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Storage } from "./storage.js";
 import { buildExtractorPrompt, buildTimeRangeExtractionPrompt } from "./prompts.js";
 
@@ -23,11 +24,17 @@ export class Memory {
       );
     }
 
-    this.extractor     = options.extractor;
-    this.embedder      = options.embedder;
+    this.extractor           = options.extractor;
+    this.embedder            = options.embedder;
     this.filterPrompt        = options.filterPrompt       ?? '';
     this.entityContext       = options.entityContext       ?? '';
     this.contextualRetrieval = options.contextualRetrieval ?? false;
+    // Extraction granularity. 'session' (default) extracts the whole conversation
+    // in one LLM call and maps facts back to rounds via source_message_index.
+    // 'round' extracts one round at a time with a per-round dedup seed and a
+    // running summary of earlier rounds — exact provenance, K = V + fact aligned
+    // by construction. Overridable per add() via opts.extractionMode.
+    this.extractionMode      = options.extractionMode === 'round' ? 'round' : 'session';
     // Optional diagnostic hook — called once per relationship-classification
     // decision (Task 5.1). Errors thrown by the consumer are swallowed so
     // ingestion never blocks on logging.
@@ -43,9 +50,12 @@ export class Memory {
 
   // ── Add ────────────────────────────────────────────
  
-  async add(input, opts = {}) {
-    const documentDate  = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
-    const entityContext = opts.entityContext ?? this.entityContext;
+  async add(input, opts = {}) { 
+    const documentDate   = this._normalizeDate(opts.date) ?? new Date().toISOString().slice(0, 10);
+    const entityContext  = opts.entityContext ?? this.entityContext;
+    const extractionMode = opts.extractionMode === 'round' || opts.extractionMode === 'session'
+      ? opts.extractionMode
+      : this.extractionMode;
 
     // Per-add() call accounting. Counts attempts (before each await) so the
     // numbers stay accurate even when an upstream API throws. Consumers wrap
@@ -54,10 +64,17 @@ export class Memory {
     const llmCallCounts      = { extraction: 0, relationship: 0, contextualization: 0 }
     const embedderCallCounts = { chunk: 0, dedup_seed: 0, memory: 0 }
 
-    // 1. Normalize input into messages array
-    const messages = Array.isArray(input)
-      ? input
-      : [{ role: 'document', content: input }]
+    // Feature 1 (dedupBySession): opt-in round-level upsert keyed by sessionId.
+    // Off by default → behavior is byte-for-byte identical to before.
+    const dedupBySession = opts.dedupBySession === true && opts.sessionId != null
+    let roundsSkipped = 0
+
+    // 1. Normalize input into a messages array. Feature 2: content-block arrays and
+    //    tool_calls are flattened to strings here (the single chokepoint), so the rest
+    //    of the pipeline only ever sees { role, content:string }. A raw string stays a
+    //    document. isArrayInput preserves the original conversation-vs-document branch.
+    const isArrayInput = Array.isArray(input)
+    const messages = this._normalizeMessages(input)
 
     const fullConversation = messages.map(m => `${m.role}: ${m.content}`).join('\n')
 
@@ -73,13 +90,14 @@ export class Memory {
     // The chunk row no longer carries a role — a round contains both.
     //
     // Chunk EMBEDDING is deferred until after extraction (see step 5) so we
-    // can use the K = V + fact indexing-stage merge from LongMemEval §5.3.
+    // can use the K = V (user utterances) + fact indexing-stage merge from LongMemEval §5.3.
     // chunkIdToUserText holds the user-side text per round; the deferred loop
     // combines it with the facts attributed to the same round.
     let anchorChunkId = null
     const messageIndexToChunkId = {}
     const messageIndexToRole = {}
     const chunkIdToUserText = new Map()
+    const rounds = []   // { chunkId, messages: [...] } — consumed by 'round' extraction mode
 
     for (let i = 0; i < messages.length; i++) {
       messageIndexToRole[i] = messages[i].role
@@ -90,7 +108,7 @@ export class Memory {
       const cur = messages[i]
       const next = messages[i + 1]
       const paired =
-        Array.isArray(input) &&
+        isArrayInput &&
         cur.role === 'user' &&
         next?.role === 'assistant' &&
         cur.content?.trim() &&
@@ -103,7 +121,17 @@ export class Memory {
 
       const rawChunk = paired
         ? `user: ${cur.content}\nassistant: ${next.content}`
-        : (Array.isArray(input) ? `${cur.role}: ${cur.content}` : cur.content)
+        : (isArrayInput ? `${cur.role}: ${cur.content}` : cur.content)
+
+      // Feature 1: hash the RAW round (never the contextualized text). If this exact
+      // round was already ingested under the same sessionId/container, skip it entirely
+      // — no chunk, no contextualization LLM call, no extraction.
+      const contentHash = dedupBySession ? this._hashRound(rawChunk) : null
+      if (dedupBySession && this.storage.chunkExists(opts.sessionId, contentHash)) {
+        roundsSkipped++
+        i += advance
+        continue
+      }
 
       let chunkContent
       if (this.contextualRetrieval) {
@@ -113,8 +141,7 @@ export class Memory {
         chunkContent = rawChunk
       }
 
-      this.storage.saveChunk(chunkContent, opts.sessionId ?? null, documentDate)
-      const chunkId = this.storage.getLastChunkId()
+      const chunkId = this.storage.saveChunk(chunkContent, opts.sessionId ?? null, documentDate, contentHash)
 
       if (chunkId) {
         if (anchorChunkId === null) anchorChunkId = chunkId
@@ -126,115 +153,69 @@ export class Memory {
         // orphan asst /  fall back to the raw turn content (no user side) so the
         // document:      embedding still has signal. Never the CR context prefix.
         chunkIdToUserText.set(chunkId, cur.content)
+
+        // Capture the round (chunk + its 1-2 source messages) for 'round' mode.
+        rounds.push({ chunkId, messages: indexes.map(idx => messages[idx]) })
       }
 
       i += advance
     }
 
-    // 3. Now run extraction — if it returns empty, chunks are already safe
-    const inputText   = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
-    embedderCallCounts.dedup_seed++
-    const inputVector = await this.embedder(inputText, { phase: 'dedup_seed' })
-
-    //Todo: Why not Dedup by bm25search as well?
-    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
-      .filter(f => f.memory_type !== 'preference')
-
-    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
-    llmCallCounts.extraction++
-    const raw      = await this.extractor(prompt, { phase: 'extraction' })
-    const memories = this._parseExtraction(raw)
-
-    // 4. Save facts. Skipped (but chunks still get embedded below) when the
-    //    extractor returned nothing — chunks remain queryable via BM25 + the
-    //    user-side text embedding.
+    // 3-4. Extract memories and persist them. Two modes (extractionMode):
+    //   • 'session' — extract the whole conversation in ONE LLM call, then map
+    //     each fact back to its round via the extractor's source_message_index.
+    //   • 'round'   — extract one round at a time with a sharp per-round dedup
+    //     seed and a running summary of earlier rounds (fed through
+    //     entityContext) so cross-round references still resolve. Provenance is
+    //     exact (every fact belongs to its round's chunk) and K = V + fact
+    //     aligns by construction.
+    //
+    // Either way the per-memory save loop (_saveMemories) runs strictly in
+    // order: each memory's relationship classification queries the DB for
+    // candidates, so earlier-saved memories must already be persisted — it
+    // can NOT be parallelized.
     const savedThisBatch = []
-    const DEDUP_THRESHOLD = 0.92
-    const chunkIdToFacts = new Map()  // chunk_id → [factValue, ...] for K = V + fact
+    const chunkIdToFacts  = new Map()  // chunk_id → [factValue, ...] for K = V + fact
 
-    if (memories.length === 0) {
-      const inputPreview = (Array.isArray(input)
-        ? input.map(m => m.content).join(' ')
-        : input
-      ).slice(0, 300)
-      console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${inputPreview}`)
+    const saveCtx = { documentDate, savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts }
+
+    if (extractionMode === 'round' && isArrayInput) {
+      // Round mode already iterates `rounds`, which excludes any dedup-skipped rounds,
+      // so it only ever extracts new turns — no extra handling needed.
+      await this._extractByRound(rounds, { ...saveCtx, entityContext })
     } else {
-      for (const mem of memories) {
-        const {
-          key,
-          value,
-          memory_type          = 'fact',
-          event_date           = null,
-          expires_at           = null,
-          context              = null,
-          source_message_index = null,
-        } = mem
-
-        if (!key || !value) continue
-
-        // derive source_role from message index — deterministic, no LLM needed
-        const source_role = (
-          Number.isInteger(source_message_index) &&
-          messageIndexToRole[source_message_index] != null
-        )
-          ? messageIndexToRole[source_message_index]
-          : null
-
-        const resolvedChunkId = (
-          Number.isInteger(source_message_index) &&
-          messageIndexToChunkId[source_message_index] != null
-        )
-          ? messageIndexToChunkId[source_message_index]
-          : anchorChunkId
-
-        embedderCallCounts.memory++
-        const embedding = await this.embedder(value, { phase: 'memory' })
-
-        const isDuplicate = savedThisBatch.some(
-          saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
-        )
-        if (isDuplicate) continue
-
-        if (memory_type === 'preference') {
-          const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
-          if (strengthened) continue
+      // Session mode. Feature 2: the extractor must see normalized messages, never the
+      // raw input (which may carry content-block arrays / tool_calls). Feature 1: when
+      // deduping, extract ONLY the surviving rounds and re-index provenance maps to the
+      // survivor order so source_message_index still resolves.
+      let sessionInput, roleMap, chunkMap
+      if (dedupBySession && isArrayInput) {
+        const survivors = rounds.flatMap(r => r.messages)
+        const survRole  = {}
+        const survChunk = {}
+        let k = 0
+        for (const r of rounds) {
+          for (const m of r.messages) {
+            survRole[k]  = m.role
+            survChunk[k] = r.chunkId
+            k++
+          }
         }
-
-        let relationship
-        if (memory_type === 'fact' || memory_type === 'episode') {
-          llmCallCounts.relationship++
-          relationship = await this._detectRelationship(mem, embedding, documentDate)
-        } else {
-          relationship = { type: 'NEW', relatedTo: null }
-        }
-
-        const factId = this.storage.saveFact(key, value, {
-          memory_type,
-          document_date:   documentDate,
-          event_date,
-          expires_at,
-          confidence:      1.0,
-          relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
-          related_to:      relationship.relatedTo,
-          superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
-          chunk_id:        resolvedChunkId,
-          source_role,
-          metadata:        JSON.stringify(context ? { context } : {}),
-        })
-
-        if (relationship.type === 'UPDATES' && relationship.relatedTo) {
-          this.storage.supersedeFact(relationship.relatedTo, factId)
-        }
-
-        this.storage.saveEmbedding(factId, embedding)
-        savedThisBatch.push(embedding)
-
-        // collect this fact's value for the K = V + fact chunk embedding
-        if (resolvedChunkId) {
-          if (!chunkIdToFacts.has(resolvedChunkId)) chunkIdToFacts.set(resolvedChunkId, [])
-          chunkIdToFacts.get(resolvedChunkId).push(value)
-        }
+        sessionInput = survivors
+        roleMap      = survRole
+        chunkMap     = survChunk
+      } else {
+        sessionInput = isArrayInput ? messages : input
+        roleMap      = messageIndexToRole
+        chunkMap     = messageIndexToChunkId
       }
+      await this._extractBySession(sessionInput, {
+        ...saveCtx,
+        entityContext,
+        messageIndexToRole:    roleMap,
+        messageIndexToChunkId: chunkMap,
+        anchorChunkId,
+      })
     }
 
     // 5. Embed chunks with K = V + fact (LongMemEval §5.3 indexing-stage merge).
@@ -260,34 +241,23 @@ export class Memory {
       this.storage.saveChunkEmbedding(chunkId, vector)
     }
 
-    if (memories.length === 0) {
-      return {
-        chunksStored: new Set(Object.values(messageIndexToChunkId)).size,
-        factsStored:  0,
-        llmCalls: {
-          extraction:        llmCallCounts.extraction,
-          relationship:      llmCallCounts.relationship,
-          contextualization: llmCallCounts.contextualization,
-          total:             llmCallCounts.extraction + llmCallCounts.relationship + llmCallCounts.contextualization,
-        },
-        embedderCalls: {
-          chunk:      embedderCallCounts.chunk,
-          dedup_seed: embedderCallCounts.dedup_seed,
-          memory:     embedderCallCounts.memory,
-          total:      embedderCallCounts.chunk + embedderCallCounts.dedup_seed + embedderCallCounts.memory,
-        },
+    // 6. Refresh entityContext from the accumulated profile when we stored
+    //    anything new — improves reference resolution on the next add().
+    //    (When nothing was saved the profile is unchanged, so a refresh would
+    //    recompute the same value; skip it.)
+    if (savedThisBatch.length > 0) {
+      const { profile } = await this.getProfile({ asOf: documentDate })
+      const known = [...profile.static, ...profile.dynamic].slice(0, 20)
+      if (known.length > 0) {
+        this.entityContext = `Prior context: ${known.join('. ')}.`
       }
-    }
-
-    const { profile } = await this.getProfile({ asOf: documentDate })
-    const known = [...profile.static, ...profile.dynamic].slice(0, 20)
-    if (known.length > 0) {
-      this.entityContext = `Prior context: ${known.join('. ')}.`
     }
 
     return {
       chunksStored: new Set(Object.values(messageIndexToChunkId)).size,
       factsStored:  savedThisBatch.length,
+      roundsSkipped,
+      chunksSkipped: roundsSkipped,   // one chunk per round; alias for clarity
       llmCalls: {
         extraction:        llmCallCounts.extraction,
         relationship:      llmCallCounts.relationship,
@@ -300,6 +270,202 @@ export class Memory {
         memory:     embedderCallCounts.memory,
         total:      embedderCallCounts.chunk + embedderCallCounts.dedup_seed + embedderCallCounts.memory,
       },
+    }
+  }
+
+  // ── Extraction strategies (used by add) ───────────────
+  //
+  // 'session' mode: one extraction call over the whole conversation. Facts map
+  // back to rounds via the extractor's source_message_index. This is the
+  // historical default — strongest cross-round reference resolution.
+  async _extractBySession(input, ctx) {
+    const { documentDate, entityContext, embedderCallCounts, llmCallCounts } = ctx
+
+    const inputText = Array.isArray(input) ? input.map(m => m.content).join(' ') : input
+    embedderCallCounts.dedup_seed++
+    const inputVector = await this.embedder(inputText, { phase: 'dedup_seed' })
+
+    // TODO: Why not dedup by bm25search as well? (a per-input BM25 prefilter
+    // surfaces lexical near-duplicates better than this diluted whole-input vector.)
+    const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
+      .filter(f => f.memory_type !== 'preference')
+
+    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
+    llmCallCounts.extraction++
+    const raw      = await this.extractor(prompt, { phase: 'extraction' })
+    const memories = this._parseExtraction(raw)
+
+    if (memories.length === 0) {
+      const preview = (Array.isArray(input) ? input.map(m => m.content).join(' ') : input).slice(0, 300)
+      console.warn(`[greymemory] empty extraction, skipping fact save. preview: ${preview}`)
+      return
+    }
+
+    await this._saveMemories(memories, ctx)
+  }
+
+  // 'round' mode: extract one round at a time, in order. Each round gets a sharp
+  // per-round dedup seed (instead of a diluted whole-session vector) and a
+  // running summary of the facts established in earlier rounds, threaded through
+  // entityContext so the extractor can still resolve cross-round references
+  // ("the office" → Stripe). Provenance is exact — every fact belongs to its
+  // round's chunk — and K = V + fact aligns by construction.
+  //
+  // Rounds MUST stay sequential: each round's saved facts become candidates for
+  // the next round's relationship classification (see _saveMemories).
+  async _extractByRound(rounds, ctx) {
+    const { documentDate, entityContext, embedderCallCounts, llmCallCounts } = ctx
+
+    const sessionFacts = []   // resolved fact values seen so far this session — the running summary
+    let extractedAny = false
+
+    for (const round of rounds) {
+      const roundMessages = round.messages
+      const roundText = roundMessages.map(m => m.content).join(' ')
+      if (!roundText.trim()) continue
+
+      embedderCallCounts.dedup_seed++
+      const roundVector = await this.embedder(roundText, { phase: 'dedup_seed' })
+      const existingFacts = this.storage.vectorSearch(roundVector, this.storage.container, 10, documentDate)
+        .filter(f => f.memory_type !== 'preference')
+
+      const roundEntityContext = this._buildRunningContext(entityContext, sessionFacts)
+
+      // source_message_index is now 0/1 relative to this round's 1-2 messages
+      const prompt   = buildExtractorPrompt({ input: roundMessages, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext: roundEntityContext })
+      llmCallCounts.extraction++
+      const raw      = await this.extractor(prompt, { phase: 'extraction' })
+      const memories = this._parseExtraction(raw)
+
+      if (memories.length === 0) continue
+      extractedAny = true
+
+      // per-round provenance: every fact belongs to this round's chunk
+      const messageIndexToRole  = {}
+      const messageIndexToChunkId = {}
+      roundMessages.forEach((m, idx) => {
+        messageIndexToRole[idx]  = m.role
+        messageIndexToChunkId[idx] = round.chunkId
+      })
+
+      await this._saveMemories(memories, {
+        ...ctx,
+        messageIndexToRole,
+        messageIndexToChunkId,
+        anchorChunkId: round.chunkId,
+      })
+
+      for (const mem of memories) {
+        if (mem?.value) sessionFacts.push(mem.value)
+      }
+    }
+
+    if (!extractedAny) {
+      console.warn('[greymemory] empty extraction (round mode), no facts saved.')
+    }
+  }
+
+  // Folds the facts established in earlier rounds into the entityContext string
+  // so the extractor can resolve cross-round references without a separate
+  // summarization call. Capped to bound prompt growth on long sessions.
+  _buildRunningContext(base, sessionFacts) {
+    if (sessionFacts.length === 0) return base
+    const recent  = sessionFacts.slice(-20)
+    const summary = `Established earlier in this session:\n- ${recent.join('\n- ')}`
+    return base ? `${base}\n\n${summary}` : summary
+  }
+
+  // Sequential per-memory save loop shared by both extraction modes: embed →
+  // in-batch dedup → strengthen (preferences) or classify relationship
+  // (facts/episodes) → saveFact / supersede → saveEmbedding, collecting per-chunk
+  // fact values for the K = V + fact merge.
+  //
+  // Sequential by contract: _detectRelationship looks up candidates from the DB,
+  // so earlier-saved memories (this batch AND earlier rounds/sessions) must
+  // already be persisted. Mutates ctx.savedThisBatch and ctx.chunkIdToFacts and
+  // bumps the call counters.
+  async _saveMemories(memories, ctx) {
+    const {
+      documentDate, messageIndexToRole, messageIndexToChunkId, anchorChunkId,
+      savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts,
+    } = ctx
+    const DEDUP_THRESHOLD = 0.92
+
+    for (const mem of memories) {
+      const {
+        key,
+        value,
+        memory_type          = 'fact',
+        event_date           = null,
+        expires_at           = null,
+        context              = null,
+        source_message_index = null,
+      } = mem
+
+      if (!key || !value) continue
+
+      // derive source_role from message index — deterministic, no LLM needed
+      const source_role = (
+        Number.isInteger(source_message_index) &&
+        messageIndexToRole[source_message_index] != null
+      )
+        ? messageIndexToRole[source_message_index]
+        : null
+
+      const resolvedChunkId = (
+        Number.isInteger(source_message_index) &&
+        messageIndexToChunkId[source_message_index] != null
+      )
+        ? messageIndexToChunkId[source_message_index]
+        : anchorChunkId
+
+      embedderCallCounts.memory++
+      const embedding = await this.embedder(value, { phase: 'memory' })
+
+      const isDuplicate = savedThisBatch.some(
+        saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD
+      )
+      if (isDuplicate) continue
+
+      if (memory_type === 'preference') {
+        const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
+        if (strengthened) continue
+      }
+
+      let relationship
+      if (memory_type === 'fact' || memory_type === 'episode') {
+        llmCallCounts.relationship++
+        relationship = await this._detectRelationship(mem, embedding, documentDate)
+      } else {
+        relationship = { type: 'NEW', relatedTo: null }
+      }
+
+      const factId = this.storage.saveFact(key, value, {
+        memory_type,
+        document_date:   documentDate,
+        event_date,
+        expires_at,
+        confidence:      1.0,
+        relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
+        related_to:      relationship.relatedTo,
+        superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
+        chunk_id:        resolvedChunkId,
+        source_role,
+        metadata:        JSON.stringify(context ? { context } : {}),
+      })
+
+      if (relationship.type === 'UPDATES' && relationship.relatedTo) {
+        this.storage.supersedeFact(relationship.relatedTo, factId)
+      }
+
+      this.storage.saveEmbedding(factId, embedding)
+      savedThisBatch.push(embedding)
+
+      // collect this fact's value for the K = V + fact chunk embedding
+      if (resolvedChunkId) {
+        if (!chunkIdToFacts.has(resolvedChunkId)) chunkIdToFacts.set(resolvedChunkId, [])
+        chunkIdToFacts.get(resolvedChunkId).push(value)
+      }
     }
   }
 
@@ -1318,6 +1484,70 @@ Return ONLY valid JSON, no explanation:
     return { afterDate: after, beforeDate: before }
   }
 
+  // ── Message normalization (Feature 2: structured message support) ─────────
+  //
+  // The single chokepoint that turns rich messages into the { role, content:string }
+  // shape the rest of the pipeline assumes. Accepts a raw string (→ one 'document'
+  // message) or a Message[] whose content may be a string OR an array of content
+  // blocks, and whose assistant/tool turns may carry tool_calls / tool_call_id.
+  // Everything is folded to a string; nothing throws.
+
+  // content → string. String passes through untouched (back-compat fast path).
+  // Content-block arrays: text blocks concatenated; images → '[image]' placeholder
+  // (never the URL); unknown blocks → '[unsupported content]'. Anything else → ''.
+  _normalizeContent(content) {
+    if (typeof content === 'string') return content
+    if (Array.isArray(content)) {
+      const parts = content.map(block => {
+        if (!block || typeof block !== 'object') return ''
+        if (block.type === 'text')  return typeof block.text === 'string' ? block.text : ''
+        if (block.type === 'image_url' || block.type === 'image') return '[image]'
+        return '[unsupported content]'
+      }).filter(Boolean)
+      return parts.join('\n')
+    }
+    return ''
+  }
+
+  // Render an assistant turn's tool_calls as compact text the extractor can read,
+  // with no provider branching. Tolerates either {name, arguments} or the OpenAI
+  // {function:{name, arguments}} shape.
+  _serializeToolCalls(toolCalls) {
+    if (!Array.isArray(toolCalls) || toolCalls.length === 0) return ''
+    return toolCalls.map(tc => {
+      const name = tc?.name ?? tc?.function?.name ?? 'tool'
+      let args
+      try { args = JSON.stringify(tc?.arguments ?? tc?.function?.arguments ?? {}) } catch { args = null }
+      return args != null ? `[tool_call name=${name} args=${args}]` : `[tool_call name=${name}]`
+    }).join('\n')
+  }
+
+  // input → normalized Message[] (every .content is a string). A raw string becomes a
+  // single 'document' message. tool_calls fold into assistant content; tool results
+  // (role:'tool') get a labelled prefix so the extractor knows what returned.
+  _normalizeMessages(input) {
+    const raw = Array.isArray(input) ? input : [{ role: 'document', content: input }]
+    return raw.map(m => {
+      const role = m?.role ?? 'user'
+      let content = this._normalizeContent(m?.content)
+      if (role === 'tool') {
+        const name = m?.name ?? 'tool'
+        content = content ? `[tool result name=${name}] ${content}` : `[tool result name=${name}]`
+      } else if (role === 'assistant' && m?.tool_calls) {
+        const calls = this._serializeToolCalls(m.tool_calls)
+        if (calls) content = content ? `${content}\n${calls}` : calls
+      }
+      return { role, content }
+    })
+  }
+
+  // sha256 of a round's RAW text — the dedup key for Feature 1 (dedupBySession).
+  // Hashing the raw (pre-contextualization) round keeps re-adds matching even when
+  // contextualRetrieval rewrites the stored chunk.
+  _hashRound(text) {
+    return createHash('sha256').update(String(text), 'utf8').digest('hex')
+  }
+
   // normalize a date input to an ISO string — preserving only absolute truths
   // strips day names in parens (derivable), keeps time only if present in input
   // returns null when input is missing or unparseable — never invents data
@@ -1333,17 +1563,26 @@ Return ONLY valid JSON, no explanation:
       return d.toISOString().replace('Z', '').replace(/\.\d{3}$/, '')
     }
  
-    // strip day names in parens — (Sat), (Tue) etc — derivable from date, not new info
+    // strip day names in parens — (Sat), (Tue) etc — derivable from date, not new info.
+    // NOTE: this leaves a DOUBLE interior space, e.g. "2023/05/20 (Sat) 02:21" ->
+    // "2023/05/20  02:21". The time separators below are [T\s]+ (not a single [T ])
+    // so that artifact stays on the literal, timezone-naive path instead of falling
+    // through to the Date() fallback, which would local->UTC-shift it (rolling the
+    // calendar day on non-UTC hosts). The LongMemEval dataset uses exactly this format.
     const cleaned = String(input).trim().replace(/\([^)]*\)/g, '').trim()
- 
+
     // match from most to least specific — only capture what's actually present
- 
-    // YYYY/MM/DD HH:MM:SS or YYYY-MM-DD HH:MM:SS
-    let m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T ](\d{2}):(\d{2}):(\d{2})/)
+
+    // YYYY/MM/DD HH:MM:SS or YYYY-MM-DD HH:MM:SS.
+    // Un-anchored at the end on purpose: a trailing zone marker (Z / +05:30 / .123)
+    // is simply not captured, keeping the literal wall-clock digits verbatim.
+    let m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T\s]+(\d{2}):(\d{2}):(\d{2})/)
     if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}`
- 
-    // YYYY/MM/DD HH:MM or ISO YYYY-MM-DDTHH:MM
-    m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T ](\d{2}):(\d{2})$/)
+
+    // YYYY/MM/DD HH:MM or ISO YYYY-MM-DDTHH:MM. Keeps the $ anchor (rejects trailing
+    // garbage) but tolerates an OPTIONAL trailing zone marker so zoned minute inputs
+    // ("...T02:21Z") stay literal — consistent with the seconds branch above.
+    m = cleaned.match(/^(\d{4})[\/\-\.](\d{2})[\/\-\.](\d{2})[T\s]+(\d{2}):(\d{2})(?:Z|[+\-]\d{2}:?\d{2})?$/)
     if (m) return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}`
  
     // YYYY/MM/DD or YYYY-MM-DD or YYYY.MM.DD
@@ -1358,14 +1597,21 @@ Return ONLY valid JSON, no explanation:
     m = cleaned.match(/^(\d{4})$/)
     if (m) return m[1]
  
-    // natural language — try Date constructor as last resort
+    // natural language — last resort. Read LOCAL wall-clock components and format
+    // manually. toISOString() here would apply a local->UTC shift, rolling the day
+    // ("June 30, 2023" -> "2023-06-29") and the hour on non-UTC machines, which would
+    // violate the timezone-naive contract every regex branch above follows.
     const parsed = new Date(cleaned)
     if (!isNaN(parsed.getTime())) {
-      const hasTime = /\d{1,2}:\d{2}/.test(cleaned)
-      if (hasTime) return parsed.toISOString().slice(0, 16).replace('T', 'T')
-      return parsed.toISOString().slice(0, 10)
+      const pad = (n) => String(n).padStart(2, '0')
+      const datePart = `${parsed.getFullYear()}-${pad(parsed.getMonth() + 1)}-${pad(parsed.getDate())}`
+      if (!/\d{1,2}:\d{2}/.test(cleaned)) return datePart
+      const time = `${pad(parsed.getHours())}:${pad(parsed.getMinutes())}`
+      // preserve seconds only when the input actually carried them
+      if (/\d{1,2}:\d{2}:\d{2}/.test(cleaned)) return `${datePart}T${time}:${pad(parsed.getSeconds())}`
+      return `${datePart}T${time}`
     }
- 
+
     return null
   }
  
