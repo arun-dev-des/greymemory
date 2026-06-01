@@ -6,6 +6,10 @@
   "private": true,
   "license": "Apache-2.0",
   "author": "Arunkumar",
+  "scripts": {
+    "test": "node test/plugin.test.mjs",
+    "test:integration": "node test/integration.test.mjs"
+  },
   "dependencies": {
     "greymemory": "file:..",
     "@anthropic-ai/sdk": ">=0.30.0",

@@ -84,6 +84,38 @@ so the plugin uses them directly:
 the long-lived MCP server) touch the same file — greymemory's `Storage` sets no pragmas, so
 this is required here, not optional.
 
+## Testing
+
+Three tiers, cheapest first:
+
+```bash
+npm test               # Tier 1 — unit (lib logic). Zero deps: no install, no key, no Ollama.
+npm run test:integration   # Tier 2 — drives the real hook scripts + MCP server, OFFLINE.
+```
+
+- **Tier 1** ([test/plugin.test.mjs](test/plugin.test.mjs)) covers the pure logic — transcript
+  mapping (tool_use/tool_result/images/thinking/injected-context), the cursor watermark, and
+  container resolution. Imports only node built-ins, so it runs anywhere (this is the CI gate).
+- **Tier 2** ([test/integration.test.mjs](test/integration.test.mjs)) spawns the actual
+  `hooks/capture-worker.mjs`, `hooks/retrieve.mjs`, and `mcp/server.mjs` with the exact payloads
+  Claude Code sends, using the **offline `stub` providers** — so it verifies the real I/O
+  contract, DB writes, structured mapping, retrieval injection, MCP tools, and dedup with no API
+  key and no Ollama. Needs `npm install` first (better-sqlite3 + greymemory).
+- **Tier 3 — live in Claude Code:** install the plugin
+  (`/plugin marketplace add <path-to greymemory-cc>` → `/plugin install greymemory-cc@greymemory-plugins`)
+  with `ANTHROPIC_API_KEY` + Ollama, have a conversation, then check the DB grew, run
+  `/grey-search`, and confirm SessionStart injection on a new session. `claude --debug` shows
+  hooks firing.
+
+**Provider knobs** (used by Tier 2 and for offline/local runs):
+
+| Env | Values | Default |
+|-----|--------|---------|
+| `GREYMEMORY_EXTRACTOR` | `anthropic` \| `stub` | `anthropic` |
+| `GREYMEMORY_EMBEDDER` | `ollama` \| `openai` \| `stub` | `ollama` |
+
+`stub` is deterministic and offline; it's gated behind the env and never active by default.
+
 ## Layout
 
 ```

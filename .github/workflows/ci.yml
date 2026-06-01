@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── library ──────────────────────────────────────────────
+      - name: Install library deps
+        run: npm install --no-audit --no-fund
+
+      - name: Type-check (tsc --noEmit)
+        run: npx tsc --noEmit
+
+      - name: Library feature tests
+        run: |
+          node "test files/test-task-3-dedup.js"
+          node "test files/test-task-4-structured.js"
+
+      # ── greymemory-cc plugin ─────────────────────────────────
+      - name: Install plugin deps
+        working-directory: greymemory-cc
+        run: npm install --no-audit --no-fund
+
+      - name: Plugin unit tests
+        working-directory: greymemory-cc
+        run: npm test
+
+      - name: Plugin integration tests (offline — stub extractor + embedder)
+        working-directory: greymemory-cc
+        run: npm run test:integration

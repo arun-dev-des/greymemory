@@ -14,7 +14,24 @@ import Memory from "greymemory";
 const _cache = new Map(); // container -> Memory
 
 // extractor: receives a prompt string, returns a raw string (greymemory parses it). Required.
+// GREYMEMORY_EXTRACTOR selects the provider: "anthropic" (default) or "stub".
 function makeExtractor() {
+  const provider = process.env.GREYMEMORY_EXTRACTOR || "anthropic";
+
+  // Offline/test seam — deterministic, no network, no API key. Gated behind an explicit env;
+  // never active in normal use (default is anthropic). Used by the integration tests and for
+  // running the plugin fully offline.
+  if (provider === "stub") {
+    const canned = process.env.GREYMEMORY_STUB_EXTRACTION ||
+      '[{"key":"stub_memory","value":"stubbed memory from the test extractor","source_message_index":0}]';
+    return async (_prompt, ctx) => {
+      if (ctx?.phase === "relationship")   return '{"type":"NEW"}';
+      if (ctx?.phase === "time_extraction") return "{}";
+      if (ctx?.phase === "contextualization") return "[CTX] stubbed.";
+      return canned; // extraction
+    };
+  }
+
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const model = process.env.GREYMEMORY_EXTRACTOR_MODEL || "claude-haiku-4-5-20251001";
   return async (prompt) => {
@@ -29,8 +46,22 @@ function makeExtractor() {
 
 // embedder: receives text, returns number[]. Required. Async because the OpenAI branch
 // dynamically imports an optional dependency.
+// GREYMEMORY_EMBEDDER: "ollama" (default), "openai", or "stub" (deterministic, offline).
 async function makeEmbedder() {
   const provider = process.env.GREYMEMORY_EMBEDDER || "ollama";
+
+  if (provider === "stub") {
+    // Deterministic 32-dim hash embedder — offline, no Ollama. For tests / offline runs.
+    return async (text) => {
+      const s = String(text), v = new Array(32);
+      for (let d = 0; d < 32; d++) {
+        let h = (d * 7919) ^ 0x9e3779b9;
+        for (let i = 0; i < s.length; i++) h = ((h * 131) + s.charCodeAt(i)) | 0;
+        v[d] = ((h & 0xffff) / 0xffff) - 0.5;
+      }
+      return v;
+    };
+  }
 
   if (provider === "openai") {
     const { default: OpenAI } = await import("openai");
