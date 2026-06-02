@@ -29,6 +29,7 @@ const SEARCH_TOP_N    = 10
 const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
 const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
 const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
+const EXTRACTION_MODE = 'session'                    // A/B (indexing): 'session' = one extraction per conversation | 'round' = per-round extraction with running summary + exact provenance
 const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v2' ? 'v2' : 'v1')  // 'v2' = anchor + 3-tier scoring + self-check (see formatForReadingV2)
 const JUDGE_DUAL      = false                        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks. Off by default: KU-10 run 2026-05-26 regressed −10pp via a state-change false-negative.
 const QUESTION_DELAY_MS = 6000                       // sleep between questions to stay under OpenAI per-minute TPM (dual judge ~triples 4o calls per Q)
@@ -596,10 +597,11 @@ for (let i = 0; i < questions.length; i++) {
   currentQuestionId = question_id
   const memory = new Memory({
     extractor, embedder,
-    dir:           DB_DIR,
-    container:     question_id,
-    filterPrompt:  FILTER_PROMPT,
-    entityContext: INITIAL_ENTITY_CONTEXT,
+    dir:            DB_DIR,
+    container:      question_id,
+    filterPrompt:   FILTER_PROMPT,
+    entityContext:  INITIAL_ENTITY_CONTEXT,
+    extractionMode: EXTRACTION_MODE,
     onRelationshipDecision,
   })
 

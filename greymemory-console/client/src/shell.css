@@ -1,0 +1,95 @@
+/* shell.css — owns ONLY the sidebar + main layout and the one shared reset.
+ *
+ * Per-surface theming lives in viz/styles.css (scoped under .surface-viz) and
+ * diag/styles.css (scoped under .surface-diag). Nothing here sets colors/fonts
+ * on body so neither surface's theme leaks into the other. */
+
+* { box-sizing: border-box; }
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  /* Neutral shell backdrop; surfaces paint their own area on top. */
+  background: #06080b;
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+.console-root {
+  display: flex;
+  height: 100vh;
+  width: 100vw;
+  overflow: hidden;
+}
+
+/* ── Sidebar ────────────────────────────────────────────────────────────── */
+.console-sidebar {
+  width: 200px;
+  flex: 0 0 200px;
+  background: #0a0c10;
+  border-right: 1px solid rgba(255, 255, 255, 0.08);
+  display: flex;
+  flex-direction: column;
+  padding: 18px 12px;
+  gap: 4px;
+  z-index: 10;
+}
+
+.console-brand {
+  font-family: 'Instrument Serif', Georgia, serif;
+  font-size: 22px;
+  letter-spacing: 0.5px;
+  color: rgba(235, 240, 245, 0.95);
+  padding: 4px 8px 18px;
+}
+
+.console-nav-item {
+  display: block;
+  padding: 9px 12px;
+  border-radius: 7px;
+  color: rgba(200, 210, 220, 0.7);
+  text-decoration: none;
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  transition: background 0.12s, color 0.12s;
+}
+
+.console-nav-item:hover {
+  background: rgba(255, 255, 255, 0.04);
+  color: rgba(235, 240, 245, 0.95);
+}
+
+.console-nav-item.active {
+  background: rgba(95, 209, 224, 0.12);
+  color: #5fd1e0;
+}
+
+.console-sidebar-foot {
+  margin-top: auto;
+  padding: 8px;
+  font-size: 10px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  color: rgba(200, 210, 220, 0.3);
+}
+
+/* ── Main / surfaces ────────────────────────────────────────────────────── */
+.console-main {
+  flex: 1;
+  min-width: 0;
+  position: relative;   /* anchor for the surfaces' inset:0 */
+  overflow: hidden;
+}
+
+.surface-viz,
+.surface-diag {
+  position: absolute;
+  inset: 0;
+}
+
+.surface-viz  { overflow: hidden; }  /* viz fills its area with a fixed canvas */
+.surface-diag { overflow: auto;   }  /* diag scrolls its tabular content      */
