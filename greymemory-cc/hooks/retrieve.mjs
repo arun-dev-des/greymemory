@@ -7,11 +7,13 @@
 import { readStdin, writeOutput, argOf, resolveDataDir } from "../lib/io.mjs";
 import { getMemory } from "../lib/memory.mjs";
 import { resolveContainer } from "../lib/container.mjs";
+import { loadConfig } from "../lib/config.mjs";
 
 const mode = argOf("--mode") || "prompt";
 const dataDir = resolveDataDir(argOf("--data"));
 const input = await readStdin(); // { cwd, prompt, session_id, ... }
 const { cwd, prompt } = input;
+const { maxContextMemories, maxProfileItems } = loadConfig(dataDir);
 
 function renderResults(results) {
   // search() can return chunk-only seeds where memory/memory_type are null — fall back to the
@@ -33,7 +35,8 @@ try {
 
   if (mode === "session-start") {
     const { profile } = await memory.getProfile();
-    const lines = [...(profile.static ?? []), ...(profile.dynamic ?? [])];
+    let lines = [...(profile.static ?? []), ...(profile.dynamic ?? [])];
+    if (maxProfileItems > 0) lines = lines.slice(0, maxProfileItems); // 0 = inject all (default)
     body = lines.map((l) => `- ${l}`).join("\n");
   } else {
     if (!prompt || prompt.trim().length < 3) {
@@ -42,7 +45,7 @@ try {
     }
     // timeAwareQuery:false — true would fire an extra extractor LLM call on every prompt,
     // adding latency/cost to a blocking hook. Reserve time-aware expansion for grey_search.
-    const results = await memory.search(prompt, { topN: 8, timeAwareQuery: false });
+    const results = await memory.search(prompt, { topN: maxContextMemories, timeAwareQuery: false });
     body = renderResults(results);
   }
 

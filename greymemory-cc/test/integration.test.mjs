@@ -139,9 +139,10 @@ async function main() {
     });
     ok(cap.code === 0, "worker exits 0 (coding mode)");
     const db = new Database(path.join(DATA2, "itest2", "greymemory.db"), { readonly: true });
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%[tool result name=Bash ok]%'") === 1,
-      "GREYMEMORY_CAPTURE_TOOLS=Bash -> Bash result folded into a chunk");
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%ok passed%'") === 1, "tool output text captured");
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%Ran: npm test (SUCCESS)%'") === 1,
+      "GREYMEMORY_CAPTURE_TOOLS=Bash -> 'Ran: npm test (SUCCESS)' folded into a chunk");
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%ok passed%'") === 0,
+      "raw tool stdout NOT captured (only the action + status)");
     db.close();
     fs.rmSync(DATA2, { recursive: true, force: true });
   }

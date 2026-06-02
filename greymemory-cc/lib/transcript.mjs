@@ -18,10 +18,11 @@
 // Why dropping tools is safe (conversational mode): the assistant's text answer already
 // distills the tool output.
 //
-// OPT-IN (coding-agent mode): pass { captureTools: [...] } to fold a compact one-line
-// summary of results from those tools into the assistant turn - mirroring Supermemory's
-// captureTools allowlist (Edit/Write/Bash/Task). OFF by default - output is byte-for-byte
-// identical to conversational mode.
+// OPT-IN (coding-agent mode): pass { captureTools: [...] } to fold a compact, tool-aware
+// one-liner for those tools into the assistant turn (Edit -> 'Edited <file>: "old" → "new"',
+// Write -> 'Created <file> (N chars)', Bash -> 'Ran: <cmd> (SUCCESS/FAILED)', Task ->
+// 'Spawned agent: <desc>'; other tools -> a tagged result snippet). Mirrors Supermemory's
+// captureTools allowlist. OFF by default - output is byte-for-byte the conversational stream.
 
 const IDE_TAG = /<(ide_[a-z_]+)>[\s\S]*?<\/\1>/g;
 
@@ -89,14 +90,45 @@ function toolResultText(block) {
   return "";
 }
 
+// Compact, searchable one-liner for a captured tool call (Supermemory-style), built from the
+// tool_use INPUT plus the result status -- far more useful in memory than a raw result dump.
+// Unknown tools fall back to a tagged snippet of their result text.
+function summarizeToolUse(name, input, resultText, isError) {
+  const snip = (s, n) => {
+    const t = String(s ?? "").replace(/\s+/g, " ").trim();
+    return t.length > n ? t.slice(0, n) + "…" : t;
+  };
+  const file = input?.file_path ?? input?.path ?? "file";
+  switch (name) {
+    case "Edit":
+    case "MultiEdit":
+      return input?.old_string != null || input?.new_string != null
+        ? `Edited ${file}: "${snip(input.old_string, 40)}" → "${snip(input.new_string, 40)}"`
+        : `Edited ${file}`;
+    case "Write": {
+      const len = typeof input?.content === "string" ? input.content.length : 0;
+      return `Created ${file} (${len} chars)`;
+    }
+    case "Bash":
+      return `Ran: ${snip(input?.command, 120)} (${isError ? "FAILED" : "SUCCESS"})`;
+    case "Task":
+      return `Spawned agent: ${snip(input?.description ?? input?.subagent_type, 80)}`;
+    default: {
+      const r = snip(resultText, TOOL_RESULT_CAP);
+      const status = isError ? "error" : "ok";
+      return r ? `[tool result name=${name} ${status}] ${r}` : `[tool result name=${name} ${status}]`;
+    }
+  }
+}
+
 /**
  * Convert Claude Code transcript entries to a clean, strictly-alternating message stream.
  *
  * @param {object[]} entries  parsed JSONL entries (e.g. from readNewEntries)
  * @param {object} [opts]
- * @param {string[]} [opts.captureTools]  tool names whose results should be folded into the
- *        assistant turn as a compact "[tool result name=... ok|error] ..." line. Default []
- *        (drop all results - conversational mode). Set e.g. ["Edit","Write","Bash","Task"]
+ * @param {string[]} [opts.captureTools]  tool names whose calls should be folded into the
+ *        assistant turn as a compact, tool-aware one-liner (see summarizeToolUse). Default []
+ *        (drop all tool turns - conversational mode). Set e.g. ["Edit","Write","Bash","Task"]
  *        for coding-agent capture.
  * @returns {{role:'user'|'assistant', content:string}[]}  strictly alternating, ready for add()
  */
@@ -111,12 +143,12 @@ export function entriesToMessages(entries, opts = {}) {
 
   // 1a. (coding mode only) map tool_use_id -> tool name from assistant tool_use blocks,
   //     so a tool_result (which carries only tool_use_id) can be matched to its tool.
-  const idToName = new Map();
+  const idToUse = new Map();
   if (captureResults) {
     for (const r of conv) {
       if (r.type !== "assistant") continue;
       for (const b of blocksOf(r.message)) {
-        if (b?.type === "tool_use" && b.id) idToName.set(b.id, b.name);
+        if (b?.type === "tool_use" && b.id) idToUse.set(b.id, { name: b.name, input: b.input ?? {} });
       }
     }
   }
@@ -148,12 +180,9 @@ export function entriesToMessages(entries, opts = {}) {
         const lines = [];
         for (const b of blocksOf(r.message)) {
           if (b?.type !== "tool_result") continue;
-          const name = idToName.get(b.tool_use_id) ?? "tool";
-          if (!captureSet.has(name)) continue; // skip non-allowlisted tools
-          const txt = toolResultText(b).replace(/\s+/g, " ").trim().slice(0, TOOL_RESULT_CAP);
-          const status = b.is_error ? "error" : "ok";
-          if (txt) lines.push(`[tool result name=${name} ${status}] ${txt}`);
-          else lines.push(`[tool result name=${name} ${status}]`);
+          const use = idToUse.get(b.tool_use_id) ?? { name: "tool", input: {} };
+          if (!captureSet.has(use.name)) continue; // skip non-allowlisted tools
+          lines.push(summarizeToolUse(use.name, use.input, toolResultText(b), b.is_error === true));
         }
         logical.push({ role: "tool_result", text: lines.join("\n") });
       } else {

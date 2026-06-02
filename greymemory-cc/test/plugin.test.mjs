@@ -67,29 +67,39 @@ console.log("\n[transcript] pure injected / notice rows are dropped");
     `ide-only + interrupt notice dropped, real prompt kept (got ${m.length} msgs)`);
 }
 
-// captureTools (opt-in coding-agent mode): allowlisted tool results fold into the assistant
-// turn; everything else is dropped; OFF by default.
-console.log("\n[transcript] captureTools (opt-in)");
+// captureTools (opt-in coding-agent mode): allowlisted tool calls fold a compact, tool-aware
+// one-liner (Edited/Created/Ran/Spawned) into the assistant turn; everything else is dropped.
+console.log("\n[transcript] captureTools (opt-in, tool-aware)");
 {
   const entries = [
-    { type: "user", message: { role: "user", content: "fix it" } },
+    { type: "user", message: { role: "user", content: "do the thing" } },
     { type: "assistant", message: { role: "assistant", id: "a1", content: [
-      { type: "text", text: "editing" },
-      { type: "tool_use", id: "e1", name: "Edit", input: {} },
-      { type: "tool_use", id: "r1", name: "Read", input: {} },
+      { type: "text", text: "working" },
+      { type: "tool_use", id: "e1", name: "Edit", input: { file_path: "src/auth.ts", old_string: "const a = 1", new_string: "const a = 2" } },
+      { type: "tool_use", id: "w1", name: "Write", input: { file_path: "src/new.ts", content: "0123456789" } },
+      { type: "tool_use", id: "b1", name: "Bash", input: { command: "npm test" } },
+      { type: "tool_use", id: "t1", name: "Task", input: { description: "explore codebase", subagent_type: "Explore" } },
+      { type: "tool_use", id: "r1", name: "Read", input: { file_path: "secret.txt" } },
     ] } },
     { type: "user", message: { role: "user", content: [
-      { type: "tool_result", tool_use_id: "e1", content: [{ type: "text", text: "applied 1 edit" }] },
+      { type: "tool_result", tool_use_id: "e1", content: [{ type: "text", text: "applied" }] },
+      { type: "tool_result", tool_use_id: "w1", content: [{ type: "text", text: "wrote" }] },
+      { type: "tool_result", tool_use_id: "b1", content: [{ type: "text", text: "boom" }], is_error: true },
+      { type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "agent done" }] },
       { type: "tool_result", tool_use_id: "r1", content: "secret file contents" },
     ] } },
     { type: "assistant", message: { role: "assistant", id: "a2", content: [{ type: "text", text: "done" }] } },
   ];
   const conv = entriesToMessages(entries);
-  ok(conv.length === 2 && conv[1].content === "editing\n\ndone", "default mode drops all tool results");
-  const coding = entriesToMessages(entries, { captureTools: ["Edit", "Write", "Bash", "Task"] });
-  const asst = coding.find((x) => x.role === "assistant").content;
-  ok(/\[tool result name=Edit ok\] applied 1 edit/.test(asst), "allowlisted Edit result folded in");
-  ok(!/secret file contents/.test(asst), "non-allowlisted Read result excluded");
+  ok(conv.length === 2 && conv[1].content === "working\n\ndone", "default mode drops all tool results");
+
+  const asst = entriesToMessages(entries, { captureTools: ["Edit", "Write", "Bash", "Task"] })
+    .find((x) => x.role === "assistant").content;
+  ok(asst.includes('Edited src/auth.ts: "const a = 1" → "const a = 2"'), "Edit -> 'Edited <file>: old → new'");
+  ok(asst.includes("Created src/new.ts (10 chars)"), "Write -> 'Created <file> (N chars)'");
+  ok(asst.includes("Ran: npm test (FAILED)"), "Bash -> 'Ran: <cmd> (FAILED)' from is_error");
+  ok(asst.includes("Spawned agent: explore codebase"), "Task -> 'Spawned agent: <description>'");
+  ok(!/secret/.test(asst), "non-allowlisted Read excluded (input + result)");
 }
 
 console.log("\n[transcript] degenerate inputs never throw");
@@ -159,27 +169,35 @@ console.log("\n[container] resolveContainer");
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 
-// ---------------------------- user config (captureTools opt-in) ----------------------------
-console.log("\n[config] loadConfig -- captureTools is opt-in");
+// ---------------------------- user config (captureTools + injection caps) ----------------------------
+console.log("\n[config] loadConfig -- captureTools opt-in + injection caps");
 {
   const dataDir = tmp("gmcc-config");
   fs.mkdirSync(dataDir, { recursive: true });
-  const prev = process.env.GREYMEMORY_CAPTURE_TOOLS;
-  delete process.env.GREYMEMORY_CAPTURE_TOOLS;
+  const envKeys = ["GREYMEMORY_CAPTURE_TOOLS", "GREYMEMORY_MAX_CONTEXT_MEMORIES", "GREYMEMORY_MAX_PROFILE_ITEMS"];
+  const saved = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
+  for (const k of envKeys) delete process.env[k];
 
-  ok(loadConfig(dataDir).captureTools.length === 0, "default: captureTools off (conversational)");
+  const d = loadConfig(dataDir);
+  ok(d.captureTools.length === 0, "default: captureTools off (conversational)");
+  ok(d.maxContextMemories === 8 && d.maxProfileItems === 0, "default caps: 8 context, 0 profile (= all)");
 
-  fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify({ captureTools: ["Edit", "Bash"] }));
-  ok(JSON.stringify(loadConfig(dataDir).captureTools) === '["Edit","Bash"]', "settings.json captureTools honored");
+  fs.writeFileSync(path.join(dataDir, "settings.json"),
+    JSON.stringify({ captureTools: ["Edit", "Bash"], maxContextMemories: 5, maxProfileItems: 3 }));
+  const s = loadConfig(dataDir);
+  ok(JSON.stringify(s.captureTools) === '["Edit","Bash"]', "settings.json captureTools honored");
+  ok(s.maxContextMemories === 5 && s.maxProfileItems === 3, "settings.json injection caps honored");
 
   process.env.GREYMEMORY_CAPTURE_TOOLS = "Write,Task";
-  ok(JSON.stringify(loadConfig(dataDir).captureTools) === '["Write","Task"]', "env overrides settings.json");
+  process.env.GREYMEMORY_MAX_CONTEXT_MEMORIES = "12";
+  const e = loadConfig(dataDir);
+  ok(JSON.stringify(e.captureTools) === '["Write","Task"]', "env overrides captureTools");
+  ok(e.maxContextMemories === 12 && e.maxProfileItems === 3, "env overrides context cap; profile cap kept from settings.json");
 
   process.env.GREYMEMORY_CAPTURE_TOOLS = "off";
   ok(loadConfig(dataDir).captureTools.length === 0, "env 'off' disables capture");
 
-  if (prev !== undefined) process.env.GREYMEMORY_CAPTURE_TOOLS = prev;
-  else delete process.env.GREYMEMORY_CAPTURE_TOOLS;
+  for (const k of envKeys) { if (saved[k] !== undefined) process.env[k] = saved[k]; else delete process.env[k]; }
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 

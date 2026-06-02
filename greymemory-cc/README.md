@@ -58,7 +58,9 @@ Then, in Claude Code:
 | `OPENAI_EMBED_MODEL` | no | `text-embedding-3-small` | OpenAI embedding model |
 | `GREYMEMORY_EXTRACTOR_MODEL` | no | `claude-haiku-4-5-20251001` | Anthropic model for extraction |
 | `GREYMEMORY_CONTAINER` | no | derived from git | Force a container tag |
-| `GREYMEMORY_CAPTURE_TOOLS` | no | — | Coding-agent capture: comma-separated tools whose results to fold in, e.g. `Edit,Write,Bash,Task`. `off`/`none` disables. See below. |
+| `GREYMEMORY_CAPTURE_TOOLS` | no | — | Coding-agent capture: comma-separated tools whose calls to fold in, e.g. `Edit,Write,Bash,Task`. `off`/`none` disables. See below. |
+| `GREYMEMORY_MAX_CONTEXT_MEMORIES` | no | `8` | Memories searched + injected per prompt. |
+| `GREYMEMORY_MAX_PROFILE_ITEMS` | no | `0` | Profile lines injected at SessionStart; `0` = all. |
 
 The default embedder is **local Ollama** (free, keeps retrieval latency low). Pull the model
 once: `ollama pull mxbai-embed-large`.
@@ -72,12 +74,29 @@ allowlist them via **`captureTools`** — either the `GREYMEMORY_CAPTURE_TOOLS` 
 `~/.greymemory-cc/settings.json` by default):
 
 ```json
-{ "captureTools": ["Edit", "Write", "Bash", "Task"] }
+{
+  "captureTools": ["Edit", "Write", "Bash", "Task"],
+  "maxContextMemories": 8,
+  "maxProfileItems": 0
+}
 ```
 
 Resolution: built-in default (off) → `settings.json` → `GREYMEMORY_CAPTURE_TOOLS` (env wins; set
-it to `off` to force-disable). When on, each allowlisted tool's result is folded into that turn's
-assistant text as a compact `[tool result name=… ok|error] …` line.
+it to `off` to force-disable). When on, each allowlisted tool **call** is folded into that turn's
+assistant text as a compact, tool-aware one-liner:
+
+| Tool | Captured as |
+|------|-------------|
+| `Edit` | `Edited <file>: "<old…>" → "<new…>"` |
+| `Write` | `Created <file> (<N> chars)` |
+| `Bash` | `Ran: <command> (SUCCESS/FAILED)` |
+| `Task` | `Spawned agent: <description>` |
+| other | `[tool result name=<tool> ok\|error] <result…>` |
+
+**Retrieval caps:** `maxContextMemories` (default 8) bounds how many memories are searched and
+injected per prompt; `maxProfileItems` (default 0 = all) caps the profile injected at
+SessionStart. Both live in the same `settings.json` / env (`GREYMEMORY_MAX_CONTEXT_MEMORIES`,
+`GREYMEMORY_MAX_PROFILE_ITEMS`).
 
 ## Status & caveats
 
