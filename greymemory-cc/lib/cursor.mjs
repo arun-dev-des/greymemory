@@ -3,7 +3,7 @@
 // "don't reprocess"; the library's planned `dedupBySession` is the server-side safety net.
 import fs from "node:fs";
 import path from "node:path";
-import { readJsonl } from "./transcript.mjs";
+import { readJsonl } from "./io.mjs";
 
 const trackerDir = (dataDir) => path.join(dataDir, "trackers");
 const trackerFile = (dataDir, sessionId) => path.join(trackerDir(dataDir), `${sessionId}.txt`);

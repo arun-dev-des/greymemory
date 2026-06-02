@@ -33,9 +33,9 @@ const ENV = {
 let failed = 0;
 const ok = (c, m) => { console.log((c ? "  ok — " : "  FAIL: ") + m); if (!c) failed = 1; };
 
-function run(scriptRelPath, { args = [], stdin = null } = {}) {
+function run(scriptRelPath, { args = [], stdin = null, env = ENV } = {}) {
   return new Promise((resolve) => {
-    const p = spawn("node", [path.join(ROOT, scriptRelPath), ...args], { env: ENV });
+    const p = spawn("node", [path.join(ROOT, scriptRelPath), ...args], { env });
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
@@ -83,12 +83,19 @@ async function main() {
   ok(fs.existsSync(DB_PATH), "per-container DB created");
   {
     const db = new Database(DB_PATH, { readonly: true });
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks") === 4, `4 round-chunks stored (got ${countOf(db, "SELECT COUNT(*) c FROM chunks")})`);
+    const chunks = countOf(db, "SELECT COUNT(*) c FROM chunks");
+    // Prose/conversational default: the fixture's 2 user prompts -> 2 round-chunks. The
+    // tool_use/tool_result round collapses to its distilled assistant text; raw tool plumbing
+    // is dropped (captureTools is opt-in -- see lib/transcript.mjs).
+    ok(chunks === 2, `2 conversational round-chunks stored (got ${chunks})`);
     ok(countOf(db, "SELECT COUNT(*) c FROM facts") >= 1, "facts stored (stub extractor)");
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunk_embeddings") === 4, "chunk embeddings stored");
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%[tool result name=Bash]%'") === 1, "tool result mapped into a chunk");
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%[tool_call name=Bash%'") === 1, "tool_call folded into a chunk");
-    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content_hash IS NOT NULL") === 4, "all chunks content-hashed (dedup key)");
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunk_embeddings") === chunks, "every chunk embedded");
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content_hash IS NOT NULL") === chunks, "all chunks content-hashed (dedup key)");
+    // assistant answer survives even though its tool_use/tool_result are dropped:
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%Tests passed.%'") === 1, "assistant answer captured (tool turn distilled to text)");
+    // default mode must NOT leak raw tool plumbing (tool_use input / tool_result) into memory:
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%tool result%' OR content LIKE '%tool_call%' OR content LIKE '%npm test%'") === 0,
+      "no raw tool_use / tool_result / command leaks (default mode)");
     db.close();
   }
 
@@ -121,6 +128,23 @@ async function main() {
   });
   const after = (() => { const db = new Database(DB_PATH, { readonly: true }); const c = countOf(db, "SELECT COUNT(*) c FROM chunks"); db.close(); return c; })();
   ok(cap2.code === 0 && after === before, `re-run added no chunks (${before} → ${after})`);
+
+  console.log("\n[capture:coding] captureTools opt-in folds tool results into memory");
+  {
+    const DATA2 = fs.mkdtempSync(path.join(os.tmpdir(), "gmcc-itest2-"));
+    const ENV2 = { ...ENV, GREYMEMORY_DATA: DATA2, GREYMEMORY_CONTAINER: "itest2", GREYMEMORY_CAPTURE_TOOLS: "Bash" };
+    const cap = await run("hooks/capture-worker.mjs", {
+      args: [JSON.stringify({ session_id: "s2", transcript_path: TX, cwd: ROOT, dataDir: DATA2 })],
+      env: ENV2,
+    });
+    ok(cap.code === 0, "worker exits 0 (coding mode)");
+    const db = new Database(path.join(DATA2, "itest2", "greymemory.db"), { readonly: true });
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%[tool result name=Bash ok]%'") === 1,
+      "GREYMEMORY_CAPTURE_TOOLS=Bash -> Bash result folded into a chunk");
+    ok(countOf(db, "SELECT COUNT(*) c FROM chunks WHERE content LIKE '%ok passed%'") === 1, "tool output text captured");
+    db.close();
+    fs.rmSync(DATA2, { recursive: true, force: true });
+  }
 
   fs.rmSync(DATA, { recursive: true, force: true });
   console.log(failed ? "\n✗ integration tests FAILED" : "\n✓ all integration tests passed");

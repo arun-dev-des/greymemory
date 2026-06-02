@@ -58,21 +58,39 @@ Then, in Claude Code:
 | `OPENAI_EMBED_MODEL` | no | `text-embedding-3-small` | OpenAI embedding model |
 | `GREYMEMORY_EXTRACTOR_MODEL` | no | `claude-haiku-4-5-20251001` | Anthropic model for extraction |
 | `GREYMEMORY_CONTAINER` | no | derived from git | Force a container tag |
+| `GREYMEMORY_CAPTURE_TOOLS` | no | — | Coding-agent capture: comma-separated tools whose results to fold in, e.g. `Edit,Write,Bash,Task`. `off`/`none` disables. See below. |
 
 The default embedder is **local Ollama** (free, keeps retrieval latency low). Pull the model
 once: `ollama pull mxbai-embed-large`.
 
+### Capture mode — conversational vs coding-agent
+
+By default capture is **conversational**: only prompts and answers are stored; tool calls and
+their outputs are dropped (the answer already distills them). To also capture what tools *did*,
+allowlist them via **`captureTools`** — either the `GREYMEMORY_CAPTURE_TOOLS` env var above, or a
+`settings.json` in the plugin's data dir (`${CLAUDE_PLUGIN_DATA}/settings.json`, or
+`~/.greymemory-cc/settings.json` by default):
+
+```json
+{ "captureTools": ["Edit", "Write", "Bash", "Task"] }
+```
+
+Resolution: built-in default (off) → `settings.json` → `GREYMEMORY_CAPTURE_TOOLS` (env wins; set
+it to `off` to force-disable). When on, each allowlisted tool's result is folded into that turn's
+assistant text as a compact `[tool result name=… ok|error] …` line.
+
 ## Status & caveats
 
-Both of the library features this plugin was designed around are now live (greymemory ≥ 0.4),
-so the plugin uses them directly:
+How capture behaves, and the safety net around it:
 
-1. **Structured tool fidelity.** [`lib/transcript.mjs`](lib/transcript.mjs) emits structured
-   messages — assistant `tool_use` → `tool_calls`, and CC tool results (recorded under
-   `role:'user'`) are lifted into dedicated `{ role:'tool', tool_call_id, name }` messages.
-   The library folds `tool_calls` into the assistant text and prefixes results with
-   `[tool result name=…]`, and tags `source_role:'tool'`. Images become an `[image]`
-   placeholder (never the URL); thinking blocks are dropped.
+1. **Conversational by default; tool capture is opt-in.** [`lib/transcript.mjs`](lib/transcript.mjs)
+   flattens the transcript into a clean, strictly-alternating `{ role, content }[]` stream of
+   rounds, keeping only what was *said*: the user's prompt (with `<ide_*>` context and
+   injected/notice/error rows stripped) and the assistant's text answer. `tool_use`, raw
+   `tool_result` dumps, thinking, and images are dropped — the text answer already distills the
+   tool output. Set **`captureTools`** (see [Configuration](#configuration-env)) to additionally
+   fold a compact `[tool result name=… ok|error] …` line for the named tools into the assistant
+   turn (coding-agent capture). Off by default.
 2. **Server-side dedup.** [`hooks/capture-worker.mjs`](hooks/capture-worker.mjs) passes
    `dedupBySession: true`, so re-reading a growing transcript never reprocesses old rounds.
    This is belt-and-suspenders with the **UUID watermark cursor** ([`lib/cursor.mjs`](lib/cursor.mjs)):
@@ -94,12 +112,13 @@ npm run test:integration   # Tier 2 — drives the real hook scripts + MCP serve
 ```
 
 - **Tier 1** ([test/plugin.test.mjs](test/plugin.test.mjs)) covers the pure logic — transcript
-  mapping (tool_use/tool_result/images/thinking/injected-context), the cursor watermark, and
-  container resolution. Imports only node built-ins, so it runs anywhere (this is the CI gate).
+  mapping (round pairing, ide-context stripping, injected-row dropping, captureTools folding),
+  the cursor watermark, container resolution, and config (`captureTools` opt-in). Imports only
+  node built-ins, so it runs anywhere (this is the CI gate).
 - **Tier 2** ([test/integration.test.mjs](test/integration.test.mjs)) spawns the actual
   `hooks/capture-worker.mjs`, `hooks/retrieve.mjs`, and `mcp/server.mjs` with the exact payloads
   Claude Code sends, using the **offline `stub` providers** — so it verifies the real I/O
-  contract, DB writes, structured mapping, retrieval injection, MCP tools, and dedup with no API
+  contract, DB writes, conversational + opt-in tool capture, retrieval injection, MCP tools, and dedup with no API
   key and no Ollama. Needs `npm install` first (better-sqlite3 + greymemory).
 - **Tier 3 — live in Claude Code:** install the plugin
   (`/plugin marketplace add <path-to greymemory-cc>` → `/plugin install greymemory-cc@greymemory-plugins`)
@@ -121,7 +140,7 @@ npm run test:integration   # Tier 2 — drives the real hook scripts + MCP serve
 ```
 .claude-plugin/   plugin.json + marketplace.json
 hooks/            hooks.json, retrieve.mjs, capture.mjs, capture-worker.mjs
-lib/              memory.mjs, transcript.mjs, cursor.mjs, container.mjs, io.mjs
+lib/              memory.mjs, transcript.mjs, cursor.mjs, container.mjs, config.mjs, io.mjs
 mcp/              server.mjs, forget-cli.mjs
 commands/         grey-search.md, grey-save.md, grey-forget.md
 .mcp.json         wires the stdio MCP server

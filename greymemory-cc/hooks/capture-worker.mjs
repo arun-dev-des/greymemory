@@ -7,6 +7,7 @@ import { getMemory } from "../lib/memory.mjs";
 import { resolveContainer } from "../lib/container.mjs";
 import { readNewEntries, advanceCursor } from "../lib/cursor.mjs";
 import { entriesToMessages } from "../lib/transcript.mjs";
+import { loadConfig } from "../lib/config.mjs";
 
 const payload = JSON.parse(process.argv[2] ?? "{}");
 const { session_id, transcript_path, cwd, dataDir } = payload;
@@ -17,7 +18,10 @@ try {
   const { entries, lastUuid } = readNewEntries(transcript_path, session_id, dataDir);
   if (entries.length === 0) process.exit(0);
 
-  const messages = entriesToMessages(entries);
+  // captureTools is user opt-in (settings.json / GREYMEMORY_CAPTURE_TOOLS); default [] keeps
+  // capture conversational (tool plumbing dropped). See lib/config.mjs.
+  const { captureTools } = loadConfig(dataDir);
+  const messages = entriesToMessages(entries, { captureTools });
   if (messages.length > 0) {
     const container = resolveContainer(cwd, dataDir);
     const memory = await getMemory({ cwd, container, dataDir });
