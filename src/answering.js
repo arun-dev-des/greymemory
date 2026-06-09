@@ -165,6 +165,13 @@ Answer:`
 function _buildContextItems(results, topN) {
   const topResults = results.slice(0, topN)
 
+  // Capture retrieval/rerank order BEFORE the chronological sort below. The
+  // chronological sort aids temporal reasoning but otherwise discards the
+  // relevance signal; `relevance_rank` (1 = best match) preserves it so the
+  // reader can break ties toward the more relevant item.
+  const relevanceRankByRef = new Map()
+  topResults.forEach((r, i) => relevanceRankByRef.set(r, i + 1))
+
   // chronological sort — null document_date pushed to the end
   const sorted = [...topResults].sort((a, b) => {
     const da = a.document_date ?? '9999-12-31'
@@ -196,6 +203,7 @@ function _buildContextItems(results, topN) {
 
     const base = {
       index:         items.length + 1,
+      relevance_rank: relevanceRankByRef.get(r) ?? null,
       memory:        r.memory ?? null,
       chunk:         (r.chunk && r.chunk !== r.memory) ? r.chunk : null,
       type:          r.memory_type ?? null,
@@ -296,7 +304,10 @@ export function formatForReading({
   topN = 10,
   // eslint-disable-next-line no-unused-vars
   asOf = null,
-  version = 'v1',
+  // CoN v2 (anchors + 3-tier scoring + self-check) is the default: it fixed a
+  // 47–58% gold-memory false-negative rate that v1's binary relevant/not-relevant
+  // tagging produced (benchmark runs 2026-05-25/26). Pass version:'v1' to opt out.
+  version = 'v2',
 }) {
   if (version === 'v2') {
     return formatForReadingV2({ question, questionDate, results, profile, topN })

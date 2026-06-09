@@ -269,6 +269,21 @@ export interface GreyMemoryOptions {
   filterPrompt?: string;
 
   /**
+   * Optional override for the extraction-phase prompt. When provided, this builder is called
+   * instead of the built-in prompt for the EXTRACTION phase only (relationship,
+   * contextualization and time-extraction keep their built-in prompts). Lets a consumer supply
+   * a domain-specific extractor prompt (e.g. a coding-session prompt) without forking the library.
+   * The returned string must instruct the model to emit greymemory's JSON memory array.
+   */
+  extractorPrompt?: (opts: {
+    input: string | Message[];
+    existingFacts: { key: string; value: string; memory_type: MemoryType }[];
+    documentDate: string;
+    filterPrompt?: string;
+    entityContext?: string;
+  }) => string;
+
+  /**
    * Per-container context about who this memory belongs to.
    * Used as the seed for reference resolution during extraction.
    * Automatically enriched after each add() call from the accumulated profile.
@@ -487,6 +502,47 @@ export interface SearchOptions {
    * @default true
    */
   timeAwareQuery?: boolean;
+  /**
+   * Rerank the candidate pool against the query before slicing seeds, using the
+   * user-supplied extractor LLM (phase `'rerank'`). RRF fusion ranks by
+   * rank-position, not relevance; reranking rescores candidates against the
+   * actual question. Fail-open: any error leaves the RRF order untouched.
+   * @default false
+   */
+  rerank?: boolean;
+  /**
+   * Pluggable custom reranker. Receives the query and the candidate texts and
+   * returns an array of candidate indices ordered most→least relevant. Overrides
+   * the built-in LLM reranker. Lets you drop in a cross-encoder (Cohere/bge/
+   * Voyage) without forking. Fail-open on throw.
+   */
+  reranker?: ((query: string, candidates: string[]) => Promise<number[]> | number[]) | null;
+  /**
+   * Expand the query into paraphrases (extractor phase `'query_expansion'`) and
+   * union the candidate sets — raises recall on multi-session/temporal questions.
+   * `true` → 3 variants; pass a number for a different count.
+   * @default false
+   */
+  multiQuery?: boolean | number;
+  /**
+   * Raise the effective `topN` for aggregation/count questions ("how many",
+   * "total", "every"…), whose evidence is spread across many sessions.
+   * @default false
+   */
+  adaptiveAggregation?: boolean;
+  /**
+   * Demote results beyond this many per session to the end of the list before
+   * the seed slice (never drops). Protects multi-session recall from a single
+   * chatty session monopolising the seed budget. null = no cap.
+   * @default null
+   */
+  maxPerSession?: number | null;
+  /**
+   * Candidate count fetched and fused before filtering + reranking. Decoupled
+   * from `topN` so type/date filters can't starve the seed slice.
+   * @default max(topN*4, 40)
+   */
+  candidatePool?: number | null;
 }
 
 /**

@@ -27,6 +27,12 @@ export class Memory {
     this.extractor           = options.extractor;
     this.embedder            = options.embedder;
     this.filterPrompt        = options.filterPrompt       ?? '';
+    // Optional override: a custom extraction-prompt builder. When set, replaces
+    // buildExtractorPrompt for the EXTRACTION phase only (relationship / contextualization /
+    // time-extraction keep their built-in prompts). Lets a consumer (e.g. the Claude Code
+    // plugin) supply a domain-specific extractor prompt without forking the library. It must
+    // instruct the model to emit greymemory's JSON memory array.
+    this.extractorPrompt     = typeof options.extractorPrompt === 'function' ? options.extractorPrompt : null;
     this.entityContext       = options.entityContext       ?? '';
     this.contextualRetrieval = options.contextualRetrieval ?? false;
     // Extraction granularity. 'session' (default) extracts the whole conversation
@@ -290,7 +296,7 @@ export class Memory {
     const existingFacts = this.storage.vectorSearch(inputVector, this.storage.container, 10, documentDate)
       .filter(f => f.memory_type !== 'preference')
 
-    const prompt   = buildExtractorPrompt({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
+    const prompt   = (this.extractorPrompt ?? buildExtractorPrompt)({ input, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext })
     llmCallCounts.extraction++
     const raw      = await this.extractor(prompt, { phase: 'extraction' })
     const memories = this._parseExtraction(raw)
@@ -332,7 +338,7 @@ export class Memory {
       const roundEntityContext = this._buildRunningContext(entityContext, sessionFacts)
 
       // source_message_index is now 0/1 relative to this round's 1-2 messages
-      const prompt   = buildExtractorPrompt({ input: roundMessages, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext: roundEntityContext })
+      const prompt   = (this.extractorPrompt ?? buildExtractorPrompt)({ input: roundMessages, existingFacts, documentDate, filterPrompt: this.filterPrompt, entityContext: roundEntityContext })
       llmCallCounts.extraction++
       const raw      = await this.extractor(prompt, { phase: 'extraction' })
       const memories = this._parseExtraction(raw)
@@ -489,6 +495,13 @@ export class Memory {
       expandedLimit  = 10,        // max additional facts from graph traversal
       expandDepth    = 5,         // max EXTENDS hops to walk
       timeAwareQuery = true,      // LongMemEval §5.4: auto-extract a date range from the query
+      // ── recall / precision levers (all default-off; gated for opt-in) ──
+      rerank         = false,     // LLM-as-reranker over the candidate pool before the seed slice
+      reranker       = null,      // optional pluggable reranker fn (query, candidateTexts[]) => orderedIndices[]
+      multiQuery     = false,     // expand the query into N paraphrases and union candidates (true → 3, or pass a number)
+      adaptiveAggregation = false,// raise effective topN for aggregation/count questions ("how many", "total"…)
+      maxPerSession  = null,      // demote results beyond N per session before the seed slice (protects MR diversity)
+      candidatePool  = null,      // candidate count fetched/fused before filtering+rerank (default max(topN*4, 40))
     } = typeof options === 'number' ? { topN: options } : options;
 
     // ── normalize asOf ──
@@ -512,15 +525,35 @@ export class Memory {
       effectiveBefore = auto.beforeDate;
     }
 
-    // ── core retrieval ──
-    const queryVector = await this.embedder(query, { phase: 'query' });
-    const rawResults  = this.storage.hybridSearch(
-      query,           // raw text for BM25
-      queryVector,     // embedding for vector search
-      this.storage.container,  // e.g. "852ce960"
-      topN * 3,        // overfetch factor: 30 candidates for topN=10
-      asOfNorm,        // temporal cutoff
-    );
+    // ── adaptive topN for aggregation/count questions ──
+    // Aggregation questions ("how many", "total", "every") need evidence from
+    // multiple sessions; a fixed small topN starves them. Raise the effective
+    // seed budget for these only when opted in.
+    const effectiveTopN = (adaptiveAggregation && this._isAggregationQuery(query))
+      ? Math.min(topN * 2, 30)
+      : topN;
+
+    // Candidate pool fetched/fused BEFORE filters + rerank. Decoupled from the
+    // seed budget so type/date filters can't starve the final slice (a gold
+    // fact ranked just past topN used to never enter the pool).
+    const pool = candidatePool ?? Math.max(effectiveTopN * 4, 40);
+
+    // ── core retrieval (single query, or multi-query union) ──
+    let rawResults;
+    if (multiQuery) {
+      const n = typeof multiQuery === 'number' ? multiQuery : 3;
+      const variants = await this._expandQuery(query, n);
+      rawResults = await this._multiQuerySearch([query, ...variants], this.storage.container, pool, asOfNorm);
+    } else {
+      const queryVector = await this.embedder(query, { phase: 'query' });
+      rawResults = this.storage.hybridSearch(
+        query,           // raw text for BM25
+        queryVector,     // embedding for vector search
+        this.storage.container,
+        pool,            // candidate pool (decoupled from topN)
+        asOfNorm,        // temporal cutoff
+      );
+    }
 
     // ── apply filters ──
     let filtered = rawResults;
@@ -542,18 +575,44 @@ export class Memory {
       filtered = filtered.filter(r => r._type === 'chunk' || !r.expires_at || r.expires_at > expiryCutoff);
     }
 
+    // Time-range filter (CP3). FAIL-OPEN on a null event_date: many legitimate
+    // facts carry no event_date ("ongoing state with no start", "vague past" —
+    // see buildExtractorPrompt STEP 3). The old predicate `r.event_date && …`
+    // dropped every null-event_date fact the moment any bound was active —
+    // including auto-extracted CP3 ranges — silently tanking temporal /
+    // multi-session recall (the feature meant to ADD recall was removing it).
+    // Now we only exclude a fact when it HAS an event_date OUTSIDE the range;
+    // null event_date is kept and left to the reranker/reader to judge.
     if (effectiveAfter) {
-      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date >= effectiveAfter));
+      filtered = filtered.filter(r => r._type === 'chunk' || !r.event_date || r.event_date >= effectiveAfter);
     }
 
     if (effectiveBefore) {
-      filtered = filtered.filter(r => r._type === 'chunk' || (r.event_date && r.event_date <= effectiveBefore));
+      filtered = filtered.filter(r => r._type === 'chunk' || !r.event_date || r.event_date <= effectiveBefore);
     }
 
-    // ── slice seed budget (new boundary) ──
-    // Seeds are the topN best matches by RRF score from core retrieval.
+    // ── rerank the filtered pool before slicing seeds ──
+    // The single biggest precision lever greymemory lacked: RRF fusion ranks by
+    // rank-position, not query-relevance. A reranker rescores the candidate pool
+    // against the actual question. Reuses the user's extractor LLM (no new
+    // dependency); a custom `reranker` fn can be plugged in instead. Fail-open:
+    // any error leaves the RRF order untouched.
+    if (reranker || rerank) {
+      filtered = await this._rerankResults(query, filtered, { reranker, topN: effectiveTopN });
+    }
+
+    // ── per-session diversity cap ──
+    // Demote (don't drop) results beyond `maxPerSession` from any one session so
+    // a single chatty session can't monopolise the seed slice — protects
+    // multi-session recall where evidence is spread across sessions.
+    if (maxPerSession) {
+      filtered = this._capPerSession(filtered, maxPerSession);
+    }
+
+    // ── slice seed budget ──
+    // Seeds are the best matches (reranked when enabled) from core retrieval.
     // Expansion pulls in additional context but does not compete for these slots.
-    const seedResults = filtered.slice(0, topN);
+    const seedResults = filtered.slice(0, effectiveTopN);
 
     // ── graph expansion (UPDATED) ──
     let expanded = []
@@ -571,8 +630,9 @@ export class Memory {
         })
         expanded = rawExpanded.filter(({ fact }) => {
           if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
-          if (effectiveAfter  && (!fact.event_date || fact.event_date <  effectiveAfter))  return false
-          if (effectiveBefore && (!fact.event_date || fact.event_date >  effectiveBefore)) return false
+          // fail-open on null event_date — see the seed-filter note in search()
+          if (effectiveAfter  && fact.event_date && fact.event_date <  effectiveAfter)  return false
+          if (effectiveBefore && fact.event_date && fact.event_date >  effectiveBefore) return false
           return true
         })
 
@@ -590,8 +650,9 @@ export class Memory {
         })
         history = rawHistory.filter(({ fact }) => {
           if (memoryTypes && !memoryTypes.includes(fact.memory_type)) return false
-          if (effectiveAfter  && (!fact.event_date || fact.event_date <  effectiveAfter))  return false
-          if (effectiveBefore && (!fact.event_date || fact.event_date >  effectiveBefore)) return false
+          // fail-open on null event_date — see the seed-filter note in search()
+          if (effectiveAfter  && fact.event_date && fact.event_date <  effectiveAfter)  return false
+          if (effectiveBefore && fact.event_date && fact.event_date >  effectiveBefore) return false
           // is_latest filter NOT applied — history facts are by definition is_latest=0
           // asOf filter NOT applied — we want history relative to the seed, not asOf
           return true
@@ -629,6 +690,141 @@ export class Memory {
     // This ordering mirrors confidence: highest-relevance first, then context,
     // then version chain. The answerer reads top-down.
     return [...seedShaped, ...expandedShaped, ...historyShaped]
+  }
+
+  // ── Retrieval helpers (multi-query / rerank / adaptive topN) ──────────────
+
+  // Heuristic: does the question ask for an aggregate (count / sum / "every")?
+  // Used by adaptiveAggregation to widen the seed budget for multi-session
+  // questions whose evidence is spread across many sessions.
+  _isAggregationQuery(query) {
+    return /\bhow many\b|\bhow much\b|\bhow long\b|\bhow often\b|\btotal\b|\baltogether\b|\ball of\b|\bevery\b|\beach (?:time|of|day|week|month)\b|\bnumber of\b|\bcount\b|\blist (?:all|every)\b|\bin total\b/i.test(query || '');
+  }
+
+  // The text a candidate contributes to reranking / query-expansion context.
+  _candidateText(r) {
+    if (!r) return '';
+    if (r._type === 'chunk') return r.content ?? '';
+    return r.value ?? r.memory ?? '';
+  }
+
+  // CP3+ multi-query expansion. Asks the extractor LLM for N diverse paraphrases
+  // of the question (the wording the user might have used when the fact was
+  // first stated). Returns [] on any failure — caller falls back to single query.
+  async _expandQuery(query, n = 3) {
+    if (typeof query !== 'string' || !query.trim()) return [];
+    const prompt = `You expand a search query into ${n} alternative phrasings to improve recall over a long-term memory store of past conversations.
+Return ONLY a JSON array of ${n} strings: diverse paraphrases a user might have used when the relevant information was originally stated. Do NOT answer the question — only rephrase it. Vary vocabulary and framing; keep each self-contained.
+
+Question: ${query}
+
+JSON array:`;
+    try {
+      const raw = await this.extractor(prompt, { phase: 'query_expansion' });
+      let text = String(raw ?? '').trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+      let parsed;
+      try { parsed = JSON.parse(text); }
+      catch { const m = text.match(/\[[\s\S]*\]/); if (m) { try { parsed = JSON.parse(m[0]); } catch {} } }
+      if (!Array.isArray(parsed)) return [];
+      return parsed
+        .filter(s => typeof s === 'string' && s.trim() && s.trim().toLowerCase() !== query.trim().toLowerCase())
+        .slice(0, n);
+    } catch { return []; }
+  }
+
+  // Run hybridSearch for each query variant and union the candidate sets,
+  // keeping the best (max) RRF score per item. Re-applies the fact-covers-chunk
+  // dedup across the union (hybridSearch only dedups within a single call).
+  async _multiQuerySearch(queryVariants, container, pool, asOfNorm) {
+    const merged = new Map();  // _key → result (with best rrf seen)
+    for (const q of queryVariants) {
+      const qv  = await this.embedder(q, { phase: 'query' });
+      const res = this.storage.hybridSearch(q, qv, container, pool, asOfNorm);
+      for (const r of res) {
+        const prev = merged.get(r._key);
+        if (!prev || (r.rrf ?? 0) > (prev.rrf ?? 0)) merged.set(r._key, r);
+      }
+    }
+    const all = [...merged.values()].sort((a, b) => (b.rrf ?? 0) - (a.rrf ?? 0));
+    const coveredChunkIds = new Set(
+      all.filter(r => r._type === 'fact' && r.chunk_id).map(r => r.chunk_id)
+    );
+    return all.filter(r => !(r._type === 'chunk' && coveredChunkIds.has(r.chunk_id)));
+  }
+
+  // LLM-as-reranker. Rescores the top of the candidate pool against the actual
+  // question and returns the pool reordered most→least relevant, with the long
+  // tail appended unchanged. A custom `reranker(query, texts[]) => indices[]`
+  // fn overrides the built-in LLM path. Always fail-open to the input order.
+  async _rerankResults(query, results, { reranker = null, topN = 10 } = {}) {
+    if (!Array.isArray(results) || results.length <= 1) return results;
+    const RERANK_POOL = Math.min(results.length, Math.max(30, topN * 3));
+    const pool = results.slice(0, RERANK_POOL);
+    const tail = results.slice(RERANK_POOL);
+
+    const applyOrder = (idxs) => {
+      const reordered = [];
+      const seen = new Set();
+      for (const i of idxs) {
+        if (Number.isInteger(i) && i >= 0 && i < pool.length && !seen.has(i)) {
+          seen.add(i);
+          reordered.push(pool[i]);
+        }
+      }
+      // fail-open: append pool items the reranker omitted, original order kept
+      for (let i = 0; i < pool.length; i++) if (!seen.has(i)) reordered.push(pool[i]);
+      return [...reordered, ...tail];
+    };
+
+    // pluggable cross-encoder / external reranker
+    if (typeof reranker === 'function') {
+      try {
+        const order = await reranker(query, pool.map(r => this._candidateText(r)));
+        if (Array.isArray(order) && order.length) return applyOrder(order.map(Number));
+      } catch { /* fall through to fail-open */ }
+      return results;
+    }
+
+    // built-in LLM-as-reranker over the user's extractor seam (phase:'rerank')
+    const listing = pool
+      .map((r, i) => `[${i + 1}] ${this._candidateText(r).replace(/\s+/g, ' ').slice(0, 240)}`)
+      .join('\n');
+    const prompt = `You are a relevance reranker for a long-term memory search system.
+Rank the candidates by how useful each is for answering the question.
+
+Question: ${query}
+
+Candidates:
+${listing}
+
+Return ONLY a JSON array of candidate numbers, ordered MOST to LEAST relevant.
+Drop numbers that are clearly irrelevant. Example: [3, 1, 8]`;
+    try {
+      const raw = await this.extractor(prompt, { phase: 'rerank' });
+      let text = String(raw ?? '').trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+      let order;
+      try { order = JSON.parse(text); }
+      catch { const m = text.match(/\[[\s\S]*\]/); if (m) { try { order = JSON.parse(m[0]); } catch {} } }
+      if (!Array.isArray(order) || order.length === 0) return results;
+      return applyOrder(order.map(n => Number(n) - 1));  // 1-based → 0-based
+    } catch { return results; }
+  }
+
+  // Demote results beyond `maxPer` from any single session to the end of the
+  // list (never drops — preserves recall, just rebalances the seed slice).
+  _capPerSession(results, maxPer) {
+    if (!Array.isArray(results) || !maxPer) return results;
+    const counts = new Map();
+    const kept = [];
+    const overflow = [];
+    for (const r of results) {
+      const sid = r?.session_id ?? null;
+      if (sid == null) { kept.push(r); continue; }
+      const c = counts.get(sid) ?? 0;
+      if (c < maxPer) { counts.set(sid, c + 1); kept.push(r); }
+      else overflow.push(r);
+    }
+    return [...kept, ...overflow];
   }
 
   // ── Get Memories ──────────────────────────────────────

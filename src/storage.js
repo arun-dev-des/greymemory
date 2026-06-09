@@ -707,6 +707,8 @@ export class Storage {
         ${expiresClause}
     `).all({ container, asOf });
 
+    this._assertEmbeddingDim(queryVector, rows)
+
     const scored = rows
       .map(row => ({
         id:            row.fact_id,
@@ -748,8 +750,9 @@ export class Storage {
     const vectorResults = this.vectorSearch(queryVector, container, topN * 2, asOf);
 
     // ── chunk-level search (fallback for sessions with no extracted facts) ──
-    const chunkBm25    = this.chunkBm25Search(query, container, topN * 2)
-    const chunkVector  = this.chunkVectorSearch(queryVector, container, topN * 2)
+    // asOf now threaded through so chunk channels respect time-travel too.
+    const chunkBm25    = this.chunkBm25Search(query, container, topN * 2, asOf)
+    const chunkVector  = this.chunkVectorSearch(queryVector, container, topN * 2, asOf)
 
     // RRF fusion — keyed by fact id to preserve full fact data
     // RRF fusion — namespace keys to avoid id collisions between facts and chunks
@@ -837,11 +840,17 @@ export class Storage {
 
   // ── Chunk Search ───────────────────────────────────
 
-  chunkBm25Search(query, container, topN = 10) {
+  chunkBm25Search(query, container, topN = 10, asOf = null) {
     const ftsQuery = query
       .trim()
       .split(/\s+/)
       .join(' OR ')
+
+    // asOf time-travel: chunks carry their session date in created_at. Without
+    // this, the chunk channels surfaced future sessions during time-travel —
+    // a leak the fact channels already guarded against.
+    const asOfClause = asOf ? `AND c.created_at <= @asOf` : ``
+    const params = asOf ? { query: ftsQuery, container, topN, asOf } : { query: ftsQuery, container, topN }
 
     let rows = []
     try {
@@ -852,9 +861,10 @@ export class Storage {
         JOIN chunks c ON chunks_fts.rowid = c.id
         WHERE chunks_fts MATCH @query
           AND c.container = @container
+          ${asOfClause}
         ORDER BY score
         LIMIT @topN
-      `).all({ query: ftsQuery, container, topN })
+      `).all(params)
     } catch {}
 
     return rows.map((r, index) => ({
@@ -867,13 +877,18 @@ export class Storage {
     }))
   }
 
-  chunkVectorSearch(queryVector, container, topN = 10) {
+  chunkVectorSearch(queryVector, container, topN = 10, asOf = null) {
+    const asOfClause = asOf ? `AND c.created_at <= @asOf` : ``
+    const params = asOf ? { container, asOf } : { container }
     const rows = this.db.prepare(`
       SELECT ce.chunk_id, ce.vector, c.content, c.created_at, c.session_id
       FROM chunk_embeddings ce
       JOIN chunks c ON ce.chunk_id = c.id
       WHERE ce.container = @container
-    `).all({ container })
+        ${asOfClause}
+    `).all(params)
+
+    this._assertEmbeddingDim(queryVector, rows)
 
     const scored = rows
       .map(row => ({
@@ -887,6 +902,26 @@ export class Storage {
       .slice(0, topN)
 
     return scored.map((r, index) => ({ ...r, rank: index + 1 }))
+  }
+
+  // Embedding-dimension guard. _cosineSimilarity silently returns 0 when two
+  // vectors differ in length, so swapping the embedder (different model →
+  // different dim) after memories were written makes EVERY score 0 — search
+  // returns garbage with no error. Catch it loudly at query time by comparing
+  // the query vector's dim against the first stored vector. Cheap (one parse),
+  // fail-loud, and names the likely cause. Empty result sets are a no-op.
+  _assertEmbeddingDim(queryVector, rows) {
+    if (!queryVector || !rows || rows.length === 0) return;
+    let storedDim;
+    try { storedDim = JSON.parse(rows[0].vector).length; } catch { return; }
+    if (queryVector.length !== storedDim) {
+      throw new Error(
+        `[greymemory] embedding dimension mismatch: query vector has ${queryVector.length} dims ` +
+        `but stored vectors have ${storedDim}. The embedder almost certainly changed since these ` +
+        `memories were written. Re-ingest with the current embedder, or restore the original one. ` +
+        `(Cosine over mismatched dims silently returns 0, which would corrupt search results.)`
+      );
+    }
   }
 
   _cosineSimilarity(a, b) {

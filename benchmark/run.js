@@ -21,20 +21,43 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // ── config ─────────────────────────────────────────────────────────────────
 
-const LIMIT           = true                         // true = use PER_CATEGORY | null = all 500
-const PER_CATEGORY    = 10                            // questions per category
-const CATEGORY_FILTER = ['knowledge-update']         // null = all categories
-const QUESTION_ID     = null                         // set to a question_id to run a single question
-const SEARCH_TOP_N    = 10
-const SKIP_INGEST     = true                         // true = skip ingestion, use existing DB
-const TIME_AWARE_QUERY = true                        // CP3 (LongMemEval §5.4): auto-extract date range from query
-const READING_MODE    = 'json-con'                   // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
-const EXTRACTION_MODE = 'session'                    // A/B (indexing): 'session' = one extraction per conversation | 'round' = per-round extraction with running summary + exact provenance
-const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v2' ? 'v2' : 'v1')  // 'v2' = anchor + 3-tier scoring + self-check (see formatForReadingV2)
-const JUDGE_DUAL      = false                        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks. Off by default: KU-10 run 2026-05-26 regressed −10pp via a state-change false-negative.
-const QUESTION_DELAY_MS = 6000                       // sleep between questions to stay under OpenAI per-minute TPM (dual judge ~triples 4o calls per Q)
+// All knobs are env-overridable so multiple configs can be scripted without
+// editing this file (the value after the comma is the default). Pass e.g.
+//   RERANK=1 CON_PROMPT_VERSION=v2 SKIP_INGEST=true node benchmark/run.js
+const envBool = (k, def) => process.env[k] == null || process.env[k] === '' ? def : /^(1|true|yes|on)$/i.test(process.env[k])
+const envNum  = (k, def) => process.env[k] == null || process.env[k] === '' ? def : (Number.isFinite(+process.env[k]) ? +process.env[k] : def)
+const envStr  = (k, def) => process.env[k] == null || process.env[k] === '' ? def : process.env[k]
+const envList = (k, def) => process.env[k] == null || process.env[k] === '' ? def : (process.env[k] === 'all' ? null : process.env[k].split(',').map(s => s.trim()).filter(Boolean))
 
-const DB_DIR      = path.join(__dirname, '.greymemory-bench-ku10-validation')
+const LIMIT           = envBool('LIMIT', true)              // true = use PER_CATEGORY | null = all 500
+const PER_CATEGORY    = envNum('PER_CATEGORY', 10)          // questions per category
+const CATEGORY_FILTER = envList('CATEGORY_FILTER', ['knowledge-update'])  // CATEGORY_FILTER=all → all categories
+const QUESTION_ID     = envStr('QUESTION_ID', null)        // set to a question_id to run a single question
+const SEARCH_TOP_N    = envNum('SEARCH_TOP_N', 10)
+const SKIP_INGEST     = envBool('SKIP_INGEST', true)       // true = skip ingestion, use existing DB
+const TIME_AWARE_QUERY = envBool('TIME_AWARE_QUERY', true) // CP3 (LongMemEval §5.4): auto-extract date range from query
+const READING_MODE    = envStr('READING_MODE', 'json-con') // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
+const EXTRACTION_MODE = envStr('EXTRACTION_MODE', 'session')// A/B (indexing): 'session' = one extraction per conversation | 'round' = per-round (EXPENSIVE: N calls/session)
+const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v1' ? 'v1' : 'v2')  // 'v2' (default) = anchor + 3-tier scoring + self-check (see formatForReadingV2); set CON_PROMPT_VERSION=v1 to opt out
+const JUDGE_DUAL      = envBool('JUDGE_DUAL', false)        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks.
+const QUESTION_DELAY_MS = envNum('QUESTION_DELAY_MS', 6000) // sleep between questions to stay under OpenAI per-minute TPM
+
+// ── retrieval levers (Phase 1; gated, default OFF → identical retrieval to before) ──
+const RERANK          = envBool('RERANK', false)           // LLM-as-reranker over the candidate pool
+const MULTI_QUERY     = process.env.MULTI_QUERY == null || process.env.MULTI_QUERY === '' ? false
+                      : (/^(1|true|yes|on)$/i.test(process.env.MULTI_QUERY) ? true
+                      : (Number.isFinite(+process.env.MULTI_QUERY) ? +process.env.MULTI_QUERY : false))
+const ADAPTIVE_AGG    = envBool('ADAPTIVE_AGG', false)      // raise topN for aggregation/count questions
+const MAX_PER_SESSION = process.env.MAX_PER_SESSION == null || process.env.MAX_PER_SESSION === '' ? null
+                      : (Number.isFinite(+process.env.MAX_PER_SESSION) ? +process.env.MAX_PER_SESSION : null)
+
+// USE_FIXED_IDS=true (default) pins the reproducible 10-KU set below. Set
+// USE_FIXED_IDS=false to use the per-category selection (deterministic: first
+// PER_CATEGORY by question_id), e.g. CATEGORY_FILTER=all PER_CATEGORY=1 for a
+// 1-question-per-category smoke.
+const USE_FIXED_IDS   = envBool('USE_FIXED_IDS', true)
+
+const DB_DIR      = process.env.DB_DIR ? path.resolve(process.env.DB_DIR) : path.join(__dirname, '.greymemory-bench-ku10-validation')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
 const RESULTS_DIR = path.join(__dirname, 'results')
 
@@ -93,6 +116,8 @@ const tokenLog = {
     contextualization: { input: 0, output: 0, calls: 0 },
     derivation:        { input: 0, output: 0, calls: 0 },
     time_extraction:   { input: 0, output: 0, calls: 0 },
+    rerank:            { input: 0, output: 0, calls: 0 },  // Phase 1: LLM-as-reranker
+    query_expansion:   { input: 0, output: 0, calls: 0 },  // Phase 1: multi-query expansion
   },
   embedder: {
     chunk:      { calls: 0 },
@@ -503,19 +528,21 @@ if (QUESTION_ID) {
     'd7c942c3', '71315a70', '89941a93', 'ce6d2d27', '9ea5eabc',
   ]
 
-  if (FIXED_IDS.length > 0) {
+  if (USE_FIXED_IDS && FIXED_IDS.length > 0) {
     questions = questions.filter(q => FIXED_IDS.includes(q.question_id))
   } else if (LIMIT) {
+    // Deterministic per-category selection (first PER_CATEGORY by question_id) —
+    // reproducible, unlike the old Math.random shuffle. CATEGORY_FILTER=all +
+    // PER_CATEGORY=1 + USE_FIXED_IDS=false → one question per category.
     const byCategory = {}
     for (const q of questions) {
       const cat = q.question_type
       if (!byCategory[cat]) byCategory[cat] = []
       byCategory[cat].push(q)
     }
-    questions = Object.values(byCategory).flatMap(qs => {
-      const shuffled = qs.sort(() => Math.random() - 0.5)
-      return shuffled.slice(0, PER_CATEGORY)
-    })
+    questions = Object.values(byCategory).flatMap(qs =>
+      qs.sort((a, b) => a.question_id.localeCompare(b.question_id)).slice(0, PER_CATEGORY)
+    )
   }
 
   console.log(`[benchmark] selected ${questions.length} questions (${PER_CATEGORY} random per category):`)
@@ -557,6 +584,16 @@ const run = {
     tokens_format:   'v2-phase-keyed',  // see questions[].tokens shape
     judge_format:    'paper-official-v1',  // LongMemEval per-type prompts (./judge-prompts.js)
     con_prompt_version: CON_PROMPT_VERSION,
+    skip_ingest:     SKIP_INGEST,
+    extraction_mode: EXTRACTION_MODE,
+    time_aware_query: TIME_AWARE_QUERY,
+    reading_mode:    READING_MODE,
+    judge_dual:      JUDGE_DUAL,
+    rerank:          RERANK,
+    multi_query:     MULTI_QUERY,
+    adaptive_agg:    ADAPTIVE_AGG,
+    max_per_session: MAX_PER_SESSION,
+    db_dir:          path.basename(DB_DIR),
   },
   summary:   {},
   questions: [],
@@ -651,7 +688,11 @@ for (let i = 0; i < questions.length; i++) {
   const retrieved = await memory.search(question, {
     topN: SEARCH_TOP_N,
     asOf,
-    timeAwareQuery: TIME_AWARE_QUERY,
+    timeAwareQuery:      TIME_AWARE_QUERY,
+    rerank:              RERANK,
+    multiQuery:          MULTI_QUERY,
+    adaptiveAggregation: ADAPTIVE_AGG,
+    maxPerSession:       MAX_PER_SESSION,
   })
   const searchMs         = Date.now() - t1
   const timeExtractFired = ext.time_extraction.calls > timeExtractCallsBefore
@@ -837,6 +878,8 @@ for (let i = 0; i < questions.length; i++) {
         contextualization: { ...ext.contextualization },
         derivation:        { ...ext.derivation },
         time_extraction:   { ...ext.time_extraction },
+        rerank:            { ...ext.rerank },
+        query_expansion:   { ...ext.query_expansion },
         total: { input: sumIn(ext), output: sumOut(ext), calls: sumCalls(ext) },
       },
       embedder: {
@@ -874,7 +917,7 @@ for (let i = 0; i < questions.length; i++) {
 
 // ── summary ────────────────────────────────────────────────────────────────
 
-const LLM_PHASES      = ['extraction', 'relationship', 'contextualization', 'derivation']
+const LLM_PHASES      = ['extraction', 'relationship', 'contextualization', 'derivation', 'rerank', 'query_expansion']
 const EMBEDDER_PHASES = ['chunk', 'dedup_seed', 'memory', 'query', 'derivation']
 
 const byCat = {}

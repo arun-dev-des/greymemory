@@ -68,14 +68,27 @@ function fill(template, fields) {
   ).join('')
 }
 
-export function buildJudgePrompt({ questionType, isAbstention, question, answer, response }) {
+export function buildJudgePrompt({ questionType, isAbstention, question, answer, response, sourceChunks = null }) {
   let template
   if (isAbstention)                                      template = ABSTENTION
   else if (questionType === 'temporal-reasoning')        template = TEMPORAL
   else if (questionType === 'knowledge-update')          template = KNOWLEDGE_UPDATE
   else if (questionType === 'single-session-preference') template = PREFERENCE
   else                                                   template = STANDARD  // SSU, SSA, MS
-  return fill(template, { question, answer, response })
+  const base = fill(template, { question, answer, response })
+
+  // supermemory-style A/B treatment arm. When sourceChunks is null/empty the
+  // prompt is BYTE-IDENTICAL to the vendored paper template (paper-comparable
+  // baseline). When chunks are supplied (the CoN-filtered relevant set), append
+  // a clearly-delimited Source Context block so the judge can verify the
+  // model's answer against the raw conversation it was drawn from.
+  // Previously this parameter was silently dropped — the treatment arm was
+  // identical to baseline and the JUDGE_DUAL A/B measured nothing.
+  if (Array.isArray(sourceChunks) && sourceChunks.length > 0) {
+    const block = sourceChunks.map((c, i) => `[${i + 1}] ${String(c).trim()}`).join('\n\n')
+    return `${base}\n\nFor additional verification, here is the source conversation context the response was drawn from. Use it only to confirm whether the response is supported; the correctness criteria above are unchanged.\n\nSource Context:\n${block}`
+  }
+  return base
 }
 
 // Verdict parser — official methodology: case-insensitive substring match on "yes".
