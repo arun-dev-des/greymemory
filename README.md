@@ -52,6 +52,19 @@ Tested against [LongMemEval](https://arxiv.org/abs/2410.10813) — the standard 
 
 ---
 
+## Visualize your memory graph
+
+![greymemory's memory graph — 218 memories from a LongMemEval run, showing fact/preference/episode nodes linked by EXTENDS, UPDATES, and source-chunk edges](assets/memory-graph.png)
+
+The bundled **greymemory-console** renders your memory graph live over the same SQLite — nodes coloured by type (fact / preference / episode / raw chunk), edges by relation (`EXTENDS`, `UPDATES`, `DERIVES`, source-chunk), plus a time scrubber and live hybrid search. The capture above is a real 218-memory container from a LongMemEval run.
+
+```bash
+cd greymemory-console && npm run install:all && npm run dev
+#   → http://localhost:5173
+```
+
+---
+
 ## Quick start
 
 ```bash
