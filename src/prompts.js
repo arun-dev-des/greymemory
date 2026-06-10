@@ -11,31 +11,13 @@
  * @param {string} [opts.filterPrompt] what to index and what to skip
  * @param {string} [opts.entityContext] who this memory belongs to
  */
-export function buildExtractorPrompt({
-  input,
-  existingFacts = [],
-  documentDate,
-  filterPrompt = '',
-  entityContext = '',
-}) {
-  const isConversation = Array.isArray(input)
-  const inputLabel     = isConversation ? 'CONVERSATION' : 'DOCUMENT'
-  const inputBody      = isConversation
-    ? JSON.stringify(input, null, 2)
-    : input
-
-  return `You are a memory extraction system for an AI agent.
-Session date: ${documentDate}
-${filterPrompt ? `
---- FILTER INSTRUCTIONS ---
-${filterPrompt}
-Apply strictly. Do not extract content marked as skip.
----` : ''}
-${entityContext ? `
---- ENTITY CONTEXT ---
-${entityContext}
-Use this to resolve ambiguous references in the conversation.
----` : ''}
+// Static instruction block — byte-IDENTICAL across every extraction call, so a
+// consumer can send it as an Anthropic prompt-cache prefix (Task 8.2; see the
+// extractor in benchmark/run.js). All per-call dynamic content (session date,
+// filter, entity context, the input, existing memories) lives in the dynamic
+// suffix appended by buildExtractorPrompt — it must NEVER appear in here, or the
+// prefix stops being stable and the cache never hits.
+export const EXTRACTOR_STATIC_PREFIX = `You are a memory extraction system for an AI agent.
 
 STEP 1 — RESOLVE ALL AMBIGUITY
 
@@ -113,7 +95,7 @@ Apply the stranger test to every memory before extracting it:
 Resolve all of the following before extracting:
 - Pronouns → actual names
 - Vague references → specific names and places
-- Relative dates → approximate real dates (session date is ${documentDate})
+- Relative dates → approximate real dates (use the session date given in SESSION CONTEXT below)
 - Implicit subjects → explicit
 - Incomplete descriptions → add missing context from the conversation
 - Assistant statements → make the assistant the explicit subject
@@ -252,11 +234,9 @@ Rules:
 
 STEP 3 — TEMPORAL GROUNDING
 
-Session date: ${documentDate}
-
 For every memory set these three fields:
 
-document_date: always ${documentDate} — when this conversation happened
+document_date: always the session date (given in SESSION CONTEXT below) — when this conversation happened
 
 event_date: when the event actually occurred or will occur — NOT the session date
   This is the most important field for temporal reasoning. Extract it carefully.
@@ -266,7 +246,7 @@ event_date: when the event actually occurred or will occur — NOT the session d
       "I started at Stripe on February 1st 2023" → event_date: "2023-02-01"
   - Month + year → use the month
       "I joined in February 2023" → event_date: "2023-02"
-  - Relative to session date → calculate from ${documentDate}
+  - Relative to session date → calculate from the session date given below
       "I started last month" (session: 2023-05-20) → event_date: "2023-04"
       "I joined two years ago" (session: 2023-05-20) → event_date: "2021-05"
       "I started last Monday" (session: 2023-05-20) → event_date: "2023-05-15"
@@ -307,7 +287,38 @@ KEY NAMING RULES — the key is a short generic concept identifier, not a descri
     "context":     "one sentence explaining why this is worth remembering",
     "source_message_index": "0-based index of the source message in a conversation, or null"
   }
-]
+]`
+
+// Per-call dynamic suffix: session context + the input + existing memories.
+// Kept strictly AFTER the static prefix so the prefix stays byte-identical and
+// cacheable. The session date is restated here (it left the prefix).
+function buildExtractorDynamicSuffix({
+  input,
+  existingFacts = [],
+  documentDate,
+  filterPrompt = '',
+  entityContext = '',
+}) {
+  const isConversation = Array.isArray(input)
+  const inputLabel     = isConversation ? 'CONVERSATION' : 'DOCUMENT'
+  const inputBody      = isConversation
+    ? JSON.stringify(input, null, 2)
+    : input
+
+  return `--- SESSION CONTEXT ---
+Session date: ${documentDate}
+${filterPrompt ? `
+--- FILTER INSTRUCTIONS ---
+${filterPrompt}
+Apply strictly. Do not extract content marked as skip.
+---` : ''}
+${entityContext ? `
+--- ENTITY CONTEXT ---
+${entityContext}
+Use this to resolve ambiguous references in the conversation.
+---` : ''}
+
+For every memory: document_date = ${documentDate}; compute event_date relative to ${documentDate} per STEP 3.
 
 ${inputLabel}:
 ${inputBody}
@@ -325,6 +336,19 @@ Do NOT extract:
 
 ${existingFacts.slice(0, 20).map(f => `- [${f.memory_type}] ${f.value}`).join('\n')}
 ` : ''}`
+}
+
+/**
+ * Full extraction prompt = stable static prefix + per-call dynamic suffix.
+ *
+ * The returned string ALWAYS begins with {@link EXTRACTOR_STATIC_PREFIX}, so a
+ * consumer that wants Anthropic prompt caching can split on that boundary and
+ * mark the prefix block `cache_control: { type: 'ephemeral' }` (the static
+ * block is large enough to cache and identical across calls — ~90% input-token
+ * saving on the repeated portion, which dominates round-mode ingest cost).
+ */
+export function buildExtractorPrompt(opts) {
+  return `${EXTRACTOR_STATIC_PREFIX}\n\n${buildExtractorDynamicSuffix(opts)}`
 }
 
 /**

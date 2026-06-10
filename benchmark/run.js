@@ -14,6 +14,7 @@ import { fileURLToPath } from 'url'
 import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
 import { formatForReading, formatRetrievedContext } from '../src/answering.js'
+import { EXTRACTOR_STATIC_PREFIX } from '../src/prompts.js'
 import { encode as encodeGpt4o } from 'gpt-tokenizer/model/gpt-4o'
 import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
@@ -39,6 +40,7 @@ const TIME_AWARE_QUERY = envBool('TIME_AWARE_QUERY', true) // CP3 (LongMemEval �
 const READING_MODE    = envStr('READING_MODE', 'json-con') // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
 const EXTRACTION_MODE = envStr('EXTRACTION_MODE', 'session')// A/B (indexing): 'session' = one extraction per conversation | 'round' = per-round (EXPENSIVE: N calls/session)
 const BATCH_RELATIONSHIPS = envBool('BATCH_RELATIONSHIPS', false)  // Task 8.1: classify a batch's relationships in ONE call (cuts the dominant ingest cost; makes round-mode affordable)
+const PROMPT_CACHE        = envBool('PROMPT_CACHE', true)          // Task 8.2: send the static extraction prefix as an Anthropic prompt-cache block (~90% input-token cut on the repeated portion). Pure cost optimization — identical content to the model.
 const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v1' ? 'v1' : 'v2')  // 'v2' (default) = anchor + 3-tier scoring + self-check (see formatForReadingV2); set CON_PROMPT_VERSION=v1 to opt out
 const JUDGE_DUAL      = envBool('JUDGE_DUAL', false)        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks.
 const QUESTION_DELAY_MS = envNum('QUESTION_DELAY_MS', 6000) // sleep between questions to stay under OpenAI per-minute TPM
@@ -146,7 +148,7 @@ const sumIn    = obj => Object.values(obj).reduce((s, p) => s + (p.input  ?? 0),
 const sumOut   = obj => Object.values(obj).reduce((s, p) => s + (p.output ?? 0), 0)
 
 function resetTokenLog() {
-  for (const p of Object.values(tokenLog.extractor)) { p.input = 0; p.output = 0; p.calls = 0 }
+  for (const p of Object.values(tokenLog.extractor)) { p.input = 0; p.output = 0; p.calls = 0; p.cache_read = 0; p.cache_write = 0 }
   for (const p of Object.values(tokenLog.embedder))  { p.calls = 0 }
   tokenLog.answering = { input: 0, output: 0 }
   tokenLog.judging   = { input: 0, output: 0 }
@@ -157,6 +159,20 @@ function resetTokenLog() {
 const extractor = async (prompt, context, retries = 4) => {
   const phase  = context?.phase ?? 'extraction'
   const bucket = tokenLog.extractor[phase] ?? tokenLog.extractor.extraction
+
+  // Task 8.2 — prompt caching. The extraction prompt always begins with the
+  // stable EXTRACTOR_STATIC_PREFIX (~3k tokens, identical every call). Send it
+  // as a separate cache_control block so repeated calls read it at ~0.1x.
+  // Identical content reaches the model either way — purely a billing/latency win.
+  const useCache = PROMPT_CACHE && phase === 'extraction'
+    && typeof prompt === 'string' && prompt.startsWith(EXTRACTOR_STATIC_PREFIX)
+  const content = useCache
+    ? [
+        { type: 'text', text: EXTRACTOR_STATIC_PREFIX, cache_control: { type: 'ephemeral' } },
+        { type: 'text', text: prompt.slice(EXTRACTOR_STATIC_PREFIX.length) },
+      ]
+    : prompt
+
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
       method:  'POST',
@@ -168,7 +184,7 @@ const extractor = async (prompt, context, retries = 4) => {
       body: JSON.stringify({
         model:      'claude-haiku-4-5-20251001',
         max_tokens: 8192,
-        messages:   [{ role: 'user', content: prompt }],
+        messages:   [{ role: 'user', content }],
       }),
     })
     const data = await res.json()
@@ -184,8 +200,10 @@ const extractor = async (prompt, context, retries = 4) => {
       }
     }
     if (data.error) throw new Error(`Anthropic: ${data.error.message}`)
-    bucket.input  += data.usage?.input_tokens  ?? 0
-    bucket.output += data.usage?.output_tokens ?? 0
+    bucket.input       += data.usage?.input_tokens               ?? 0
+    bucket.output      += data.usage?.output_tokens              ?? 0
+    bucket.cache_read   = (bucket.cache_read  ?? 0) + (data.usage?.cache_read_input_tokens     ?? 0)
+    bucket.cache_write  = (bucket.cache_write ?? 0) + (data.usage?.cache_creation_input_tokens ?? 0)
     bucket.calls  += 1
     return data.content[0].text.trim()
   }
@@ -653,6 +671,7 @@ const run = {
     skip_ingest:     SKIP_INGEST,
     extraction_mode: EXTRACTION_MODE,
     batch_relationships: BATCH_RELATIONSHIPS,
+    prompt_cache:    PROMPT_CACHE,
     time_aware_query: TIME_AWARE_QUERY,
     reading_mode:    READING_MODE,
     judge_dual:      JUDGE_DUAL,
@@ -743,6 +762,11 @@ for (let i = 0; i < questions.length; i++) {
     console.log(`  🔢  haiku — derivation:        ${ext.derivation.calls} calls, ${ext.derivation.input.toLocaleString()} in / ${ext.derivation.output.toLocaleString()} out`)
   }
   console.log(`  🔢  haiku — total:             ${totalHaikuCalls} calls, ${totalHaikuIn.toLocaleString()} in / ${totalHaikuOut.toLocaleString()} out`)
+  const cacheRead  = Object.values(ext).reduce((s, p) => s + (p.cache_read  ?? 0), 0)
+  const cacheWrite = Object.values(ext).reduce((s, p) => s + (p.cache_write ?? 0), 0)
+  if (cacheRead || cacheWrite) {
+    console.log(`  💾  prompt cache — read ${cacheRead.toLocaleString()} tok (billed 0.1×) / write ${cacheWrite.toLocaleString()} tok (1.25×)`)
+  }
   console.log(`  📐  embedder calls — chunk/dedup/memory/query/derivation: ${emb.chunk.calls}/${emb.dedup_seed.calls}/${emb.memory.calls}/${emb.query.calls}/${emb.derivation.calls}  (total ${sumCalls(emb)})`)
 
   // ── search ──────────────────────────────────────────────────────────────
@@ -899,7 +923,13 @@ for (let i = 0; i < questions.length; i++) {
   // ── cost breakdown ────────────────────────────────────────────────────────
   const HAIKU_IN_PER_M  = 1    // $ per million input tokens
   const HAIKU_OUT_PER_M = 5
-  const costFor = b => (b.input * HAIKU_IN_PER_M + b.output * HAIKU_OUT_PER_M) / 1_000_000
+  // cache writes bill at 1.25x input, cache reads at 0.1x (Anthropic prompt caching)
+  const costFor = b => (
+    b.input * HAIKU_IN_PER_M +
+    (b.cache_write ?? 0) * HAIKU_IN_PER_M * 1.25 +
+    (b.cache_read  ?? 0) * HAIKU_IN_PER_M * 0.1 +
+    b.output * HAIKU_OUT_PER_M
+  ) / 1_000_000
 
   const haikuExtractionCost = costFor(ext.extraction)
   const haikuRelationCost   = costFor(ext.relationship)
@@ -1154,7 +1184,12 @@ console.log(
 // ── Cost & call dominance ─────────────────────────────────────────────────
 const HAIKU_IN_PER_M  = 1
 const HAIKU_OUT_PER_M = 5
-const phaseCost = b => (b.input * HAIKU_IN_PER_M + b.output * HAIKU_OUT_PER_M) / 1_000_000
+const phaseCost = b => (
+  b.input * HAIKU_IN_PER_M +
+  (b.cache_write ?? 0) * HAIKU_IN_PER_M * 1.25 +
+  (b.cache_read  ?? 0) * HAIKU_IN_PER_M * 0.1 +
+  b.output * HAIKU_OUT_PER_M
+) / 1_000_000
 
 const llmCostTotal = LLM_PHASES.reduce((s, p) => s + phaseCost(llmTotal[p]), 0)
 

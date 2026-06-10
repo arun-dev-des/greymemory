@@ -849,3 +849,31 @@ export function formatForReadingV2(
  * const contextTokens = encode(context).length
  */
 export function formatRetrievedContext(results: SearchResult[], topN?: number): string;
+
+/**
+ * The static, per-call-invariant instruction block of the extraction prompt.
+ * `buildExtractorPrompt()` always returns a string that begins with this exact
+ * value, followed by the per-call dynamic suffix. Consumers that want Anthropic
+ * prompt caching can split the returned prompt on this boundary and mark the
+ * prefix block `cache_control: { type: 'ephemeral' }` — it is large (~3k tokens)
+ * and identical across calls, so caching cuts the repeated input-token cost
+ * (~90% on the cached portion), which dominates round-mode ingestion.
+ */
+export const EXTRACTOR_STATIC_PREFIX: string;
+
+/** Options for buildExtractorPrompt(). */
+export interface ExtractorPromptOptions {
+  input: string | Message[];
+  existingFacts?: { key?: string; value: string; memory_type: MemoryType }[];
+  documentDate: string;
+  filterPrompt?: string;
+  entityContext?: string;
+}
+
+/**
+ * Build the full extraction prompt (static prefix + dynamic suffix). The result
+ * always starts with {@link EXTRACTOR_STATIC_PREFIX}. This is the same builder
+ * the library uses internally; exposed for consumers who wrap the extractor
+ * (e.g. to enable prompt caching) or supply a custom `extractorPrompt`.
+ */
+export function buildExtractorPrompt(options: ExtractorPromptOptions): string;

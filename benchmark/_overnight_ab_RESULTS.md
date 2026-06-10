@@ -84,3 +84,36 @@ otherwise be facts/round × rounds. With batching they cap at ~1/round, so the
 1/session). The next lever to make round-mode genuinely cheap is therefore
 **Task 8.2 — prompt-cache the static extraction instruction block** (~90% input-
 token cut on the repeated portion), not more relationship batching.
+
+---
+
+## Task 8.2 — prompt-cache the extraction prefix (infra correct; INACTIVE on Haiku)
+
+Restructured `buildExtractorPrompt` so the static instruction block leads
+(exported as `EXTRACTOR_STATIC_PREFIX`, ~2977 tokens) and all per-call dynamic
+content (session date, entity context, input, existing memories) trails. The
+runner splits on the prefix and marks it `cache_control: ephemeral`; cost
+accounting now folds cache-read (0.1×) / cache-write (1.25×) tokens.
+
+**Finding (verified):** caching does NOT engage on **Claude Haiku 4.5** — its
+minimum cacheable prefix is **4096 tokens** (per Anthropic prompt-caching docs),
+and our prefix is ~2977. Below the minimum, Anthropic silently declines to cache
+(`cache_creation_input_tokens: 0`, full-price input). `cache_control` itself is
+GA (no beta header needed); the only blocker is prefix size.
+
+Restructured prompt verified to still extract correctly (3/3 facts, "last month"
+→ event_date 2023-04 — temporal grounding intact after the reorder).
+
+**Net:** the infrastructure is correct and zero-harm when inactive (it just bills
+normally). It ACTIVATES automatically when either (a) the extraction prefix grows
+past 4096 tokens, or (b) the extractor runs on a model with a lower cache minimum
+(Sonnet 4.6 / Fable 5 = 2048; Sonnet 4.5 = 1024). On the current Haiku 4.5
+extractor it is a no-op.
+
+**Activation options (user choice):**
+1. Leave as forward-infra — no Haiku cost change today (recommended: no prompt risk).
+2. Expand the static prefix past 4096 tokens with genuinely-useful extraction
+   examples (also serves Phase 3 extraction-coverage) → activates caching, ~7× cheaper
+   prefix on round-mode ingest. Needs the gpt-4o quality A/B (blocked on OpenAI key).
+3. Run extraction on Sonnet 4.6 (2048 min) → caching engages, but Sonnet input is
+   3× Haiku — only wins if cache hit-rate is very high.
