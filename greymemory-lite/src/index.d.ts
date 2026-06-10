@@ -79,10 +79,11 @@ export interface GreyMemoryOptions {
 
 export interface AddOptions {
   /**
-   * Session date, ISO-ish ("2026-06-10", "2023/05/20 (Sat) 02:21", Date).
-   * Defaults to today. Unparseable values fall back to today.
+   * Session date: ISO-ish string ("2026-06-10", "2023/05/20 (Sat) 02:21"),
+   * Date, or epoch milliseconds. Defaults to today. Unparseable values fall
+   * back to today.
    */
-  date?: string | Date;
+  date?: string | Date | number;
   /** Provenance + dedup key for one conversation. */
   sessionId?: string;
   /**
@@ -113,8 +114,11 @@ export interface SearchOptions {
   afterDate?: string;
   /** Only facts whose event_date <= this (facts with no event_date pass). */
   beforeDate?: string;
-  /** Temporal cutoff: facts/chunks recorded after this date are invisible. */
-  asOf?: string;
+  /**
+   * Temporal cutoff: facts/chunks recorded after this date are invisible.
+   * ISO-ish string, Date, or epoch ms; an unparseable value throws.
+   */
+  asOf?: string | Date | number;
 }
 
 export interface SearchResult {
@@ -156,7 +160,7 @@ export interface GetProfileOptions {
   q?: string;
   topN?: number;
   /** Compute the profile relative to this date instead of today. */
-  asOf?: string;
+  asOf?: string | Date | number;
 }
 
 export interface GetProfileResult {

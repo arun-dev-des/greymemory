@@ -94,7 +94,8 @@ Databases are **not** interchangeable between the two packages. Lite refuses to 
 - **WAL + busy_timeout are set automatically** — multiple processes (hooks, MCP servers) can share one memory DB.
 - Ingestion is sequential and costs one extraction call per round (~$0.01 per long session on a Haiku-class model). Run it off the hot path; `dedupBySession` makes re-ingestion idempotent.
 - `topN` should scale with your answering model: ~5 for small local models, 10–25 for GPT-4o/Claude-class readers (LongMemEval §5.2).
-- Dates: pass ISO-ish strings (`"2026-06-10"`, `"2023/05/20 (Sat) 02:21"`) or `Date` objects. Anything else falls back to today.
+- Dates: pass ISO-ish strings (`"2026-06-10"`, `"2023/05/20 (Sat) 02:21"`), `Date` objects, or epoch milliseconds. An unparseable `add()` date falls back to today; an unparseable `search()` `asOf` throws (silently ignoring an explicit cutoff would leak records).
+- `dedupBySession` identity is the whole round. One known edge: if a re-added conversation *completes* a previously-trailing user turn (orphan `user:` round → now a `user+assistant` pair), both versions are stored — a benign near-duplicate, deduplicated downstream by retrieval ranking.
 
 ## License
 

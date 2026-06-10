@@ -92,12 +92,10 @@ export class Memory {
     // same-role turns) become single-turn rounds. A raw string input becomes
     // a single document round.
     //
-    // Chunk EMBEDDING is deferred until after extraction (step 4) for the
-    // K = V + fact indexing-stage merge (§5.3). chunkIdToUserText holds the
-    // user-side text per round; the deferred loop combines it with the facts
-    // attributed to the same round.
-    const chunkIdToUserText = new Map();
-    const rounds = [];   // { chunkId, messages: [...] }
+    // Each round's chunk EMBEDDING happens right after that round's extraction
+    // (K = V + fact indexing-stage merge, §5.3) — see _extractByRound. The
+    // user-side text travels on the round object.
+    const rounds = [];   // { chunkId, messages: [...], userText, contentHash }
 
     let i = 0;
     while (i < messages.length) {
@@ -119,8 +117,12 @@ export class Memory {
         ? `user: ${cur.content}\nassistant: ${next.content}`
         : (isArrayInput ? `${cur.role}: ${cur.content}` : cur.content);
 
-      // Hash the RAW round. If this exact round was already ingested under the
-      // same sessionId/container, skip it entirely — no chunk, no extraction.
+      // Hash the RAW round. If this exact round was already FULLY ingested
+      // under the same sessionId/container, skip it entirely — no chunk, no
+      // extraction. The hash is written only after the round's whole pipeline
+      // completes (see _extractByRound), so a crash mid-add() leaves the chunk
+      // durable but unhashed and a retry RESUMES it — reusing the existing row
+      // instead of skipping or duplicating it.
       const contentHash = dedupBySession ? this._hashRound(rawChunk) : null;
       if (dedupBySession && this.storage.chunkExists(opts.sessionId, contentHash)) {
         roundsSkipped++;
@@ -128,50 +130,33 @@ export class Memory {
         continue;
       }
 
-      const chunkId = this.storage.saveChunk(rawChunk, opts.sessionId ?? null, documentDate, contentHash);
+      const chunkId =
+        (dedupBySession ? this.storage.findIncompleteChunk(opts.sessionId, rawChunk) : null) ??
+        this.storage.saveChunk(rawChunk, opts.sessionId ?? null, documentDate, null);
 
       if (chunkId) {
-        // user-side text for K = V + fact (§5.3 — user-side only)
-        // paired:        user turn of the round
-        // orphan user:   the turn content
-        // orphan asst /  fall back to the raw turn content (no user side) so
-        // document:      the embedding still has signal
-        chunkIdToUserText.set(chunkId, cur.content);
-        rounds.push({ chunkId, messages: indexes.map(idx => messages[idx]) });
+        // userText: the user-side text for K = V + fact (§5.3 — user-side only).
+        // paired: user turn; orphan user: the turn; orphan assistant/document:
+        // the raw turn content (no user side) so the embedding still has signal.
+        rounds.push({
+          chunkId,
+          messages: indexes.map(idx => messages[idx]),
+          userText: cur.content,
+          contentHash,
+        });
       }
 
       i += advance;
     }
 
-    // 3. Extract one round at a time, in order, and persist the facts.
+    // 3. Process rounds in order: extract → persist facts → embed the chunk
+    //    (K = V + fact) → mark the round ingested.
     const savedThisBatch = [];
     const chunkIdToFacts = new Map();  // chunk_id → [factValue, ...] for K = V + fact
 
     await this._extractByRound(rounds, {
       documentDate, savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts,
     });
-
-    // 4. Embed chunks with K = V + fact (§5.3 indexing-stage merge). Runs
-    //    unconditionally — even on empty extraction, chunks get a user-side
-    //    embedding.
-    const USER_TEXT_CAP       = 4000;  // chars — paper §5.3 dilution control
-    const MAX_FACTS_PER_CHUNK = 50;
-
-    for (const [chunkId, userText] of chunkIdToUserText) {
-      const facts = (chunkIdToFacts.get(chunkId) ?? []).slice(0, MAX_FACTS_PER_CHUNK);
-      const trimmedUserText = userText.slice(0, USER_TEXT_CAP);
-
-      const parts = [];
-      if (trimmedUserText) parts.push(trimmedUserText);
-      if (facts.length)    parts.push(`Facts:\n- ${facts.join("\n- ")}`);
-
-      const embeddingInput = parts.join("\n\n");
-      if (!embeddingInput.trim()) continue;  // defensive guard; shouldn't fire
-
-      embedderCallCounts.chunk++;
-      const vector = await this.embedder(embeddingInput, { phase: "chunk" });
-      this.storage.saveChunkEmbedding(chunkId, vector);
-    }
 
     return {
       chunksStored:  rounds.length,
@@ -231,32 +216,64 @@ export class Memory {
       const raw      = await this.extractor(prompt, { phase: "extraction" });
       const memories = this._parseExtraction(raw);
 
-      if (memories.length === 0) continue;
-      extractedAny = true;
+      if (memories.length > 0) {
+        extractedAny = true;
 
-      // per-round provenance: every fact belongs to this round's chunk
-      const messageIndexToRole    = {};
-      const messageIndexToChunkId = {};
-      roundMessages.forEach((m, idx) => {
-        messageIndexToRole[idx]    = m.role;
-        messageIndexToChunkId[idx] = round.chunkId;
-      });
+        // per-round provenance: every fact belongs to this round's chunk
+        const messageIndexToRole    = {};
+        const messageIndexToChunkId = {};
+        roundMessages.forEach((m, idx) => {
+          messageIndexToRole[idx]    = m.role;
+          messageIndexToChunkId[idx] = round.chunkId;
+        });
 
-      await this._saveMemories(memories, {
-        ...ctx,
-        messageIndexToRole,
-        messageIndexToChunkId,
-        anchorChunkId: round.chunkId,
-      });
+        await this._saveMemories(memories, {
+          ...ctx,
+          messageIndexToRole,
+          messageIndexToChunkId,
+          anchorChunkId: round.chunkId,
+        });
 
-      for (const mem of memories) {
-        if (mem?.value) sessionFacts.push(mem.value);
+        for (const mem of memories) {
+          if (mem?.value) sessionFacts.push(mem.value);
+        }
       }
+
+      // K = V + fact chunk embedding — runs even on empty extraction so the
+      // chunk still gets a user-side vector.
+      await this._embedChunk(round, ctx.chunkIdToFacts, ctx.embedderCallCounts);
+
+      // Round fully processed — only NOW is it marked ingested for
+      // dedupBySession. (A crash between _saveMemories and here means a retry
+      // re-extracts this round — duplicate facts are possible but benign;
+      // the reverse ordering would risk a chunk with no vector forever.)
+      if (round.contentHash) this.storage.setChunkHash(round.chunkId, round.contentHash);
     }
 
     if (rounds.length > 0 && !extractedAny) {
       console.warn("[greymemory-lite] empty extraction, no facts saved.");
     }
+  }
+
+  // Embed one round's chunk as K = V + fact (§5.3 indexing-stage merge):
+  // user-side text merged with the facts extracted from that round.
+  async _embedChunk(round, chunkIdToFacts, embedderCallCounts) {
+    const USER_TEXT_CAP       = 4000;  // chars — paper §5.3 dilution control
+    const MAX_FACTS_PER_CHUNK = 50;
+
+    const facts = (chunkIdToFacts.get(round.chunkId) ?? []).slice(0, MAX_FACTS_PER_CHUNK);
+    const trimmedUserText = (round.userText ?? "").slice(0, USER_TEXT_CAP);
+
+    const parts = [];
+    if (trimmedUserText) parts.push(trimmedUserText);
+    if (facts.length)    parts.push(`Facts:\n- ${facts.join("\n- ")}`);
+
+    const embeddingInput = parts.join("\n\n");
+    if (!embeddingInput.trim()) return;  // defensive guard; shouldn't fire
+
+    embedderCallCounts.chunk++;
+    const vector = await this.embedder(embeddingInput, { phase: "chunk" });
+    this.storage.saveChunkEmbedding(round.chunkId, vector);
   }
 
   // Folds the facts established in earlier rounds into a context string so the
@@ -346,10 +363,18 @@ export class Memory {
     } = typeof options === "number" ? { topN: options } : options;
     // Unknown options are deliberately ignored.
 
-    // normalize asOf to end-of-day so same-day records stay visible
+    // normalize asOf to end-of-day so same-day records stay visible.
+    // Fail-loud on an unparseable value: silently ignoring an explicit
+    // temporal cutoff would leak records the caller asked to hide.
     let asOfNorm = null;
     if (asOf) {
-      const normalized = this._normalizeDate(asOf) ?? asOf;
+      const normalized = this._normalizeDate(asOf);
+      if (!normalized) {
+        throw new Error(
+          `[greymemory-lite] unparseable asOf value: ${JSON.stringify(asOf)} — ` +
+          `pass an ISO-ish date string ("2026-06-10"), a Date, or epoch milliseconds.`
+        );
+      }
       asOfNorm = normalized.includes("T") ? normalized : `${normalized}T23:59:59`;
     }
 
@@ -379,13 +404,21 @@ export class Memory {
     // carry no event_date ("ongoing state with no start", "vague past" — see
     // the extraction prompt STEP 3). Excluding them when a bound is active
     // silently tanks recall — only exclude a fact whose event_date is KNOWN
-    // to fall outside the range; the reader judges the rest.
+    // to fall outside the range; the reader judges the rest. Partial-precision
+    // event_dates ("2026-04") that OVERLAP a bound's period (the bound starts
+    // with them) also fail open for the same reason.
     if (afterDate) {
-      filtered = filtered.filter(r => r._type === "chunk" || !r.event_date || r.event_date >= afterDate);
+      filtered = filtered.filter(r =>
+        r._type === "chunk" || !r.event_date ||
+        r.event_date >= afterDate || afterDate.startsWith(r.event_date)
+      );
     }
 
     if (beforeDate) {
-      filtered = filtered.filter(r => r._type === "chunk" || !r.event_date || r.event_date <= beforeDate);
+      filtered = filtered.filter(r =>
+        r._type === "chunk" || !r.event_date ||
+        r.event_date <= beforeDate || beforeDate.startsWith(r.event_date)
+      );
     }
 
     // ── shape and return ──
@@ -465,7 +498,7 @@ export class Memory {
     const profile = { static: staticFacts, dynamic: dynamicFacts };
 
     if (q) {
-      const results = await this.search(q, { topN });
+      const results = await this.search(q, { topN, asOf });
       return { profile, results };
     }
 
@@ -481,7 +514,8 @@ export class Memory {
 
     if (!results[0]) return null;
 
-    // yesterday — expires_at < today means immediately excluded everywhere
+    // yesterday — expiry is inclusive of the expires_at day, so an expires_at
+    // before today is excluded everywhere immediately
     const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
     this.storage.expireFact(results[0].id, yesterday);
 
@@ -509,13 +543,19 @@ export class Memory {
       return Array.isArray(parsed) ? parsed : [];
     } catch {}
 
-    // try extracting just the JSON array — LLMs sometimes add reasoning around it
-    const arrayMatch = text.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-      try {
-        const parsed = JSON.parse(arrayMatch[0]);
-        return Array.isArray(parsed) ? parsed : [];
-      } catch {}
+    // try extracting just the JSON array — LLMs sometimes add prose around it,
+    // and that prose may itself contain brackets ("[note]"), so try each '['
+    // as a candidate start against the last ']' as the end (max 10 attempts).
+    const lastClose = text.lastIndexOf("]");
+    if (lastClose !== -1) {
+      let start = text.indexOf("[");
+      for (let attempts = 0; start !== -1 && start < lastClose && attempts < 10; attempts++) {
+        try {
+          const parsed = JSON.parse(text.slice(start, lastClose + 1));
+          if (Array.isArray(parsed)) return parsed;
+        } catch {}
+        start = text.indexOf("[", start + 1);
+      }
     }
 
     // suppress warning for intentional empty responses
@@ -594,14 +634,20 @@ export class Memory {
   // in the input, and never timezone-shifts literal wall-clock digits. Returns
   // null when input is missing or unparseable — never invents data.
   //
-  // Accepted: Date instances, 'YYYY-MM-DD', 'YYYY/MM/DD HH:MM[:SS]' (incl. the
-  // LongMemEval '2023/05/20 (Sat) 02:21' form), ISO datetimes. Anything else
-  // (epoch numbers, natural language) → null → caller falls back to today.
+  // Accepted: Date instances, epoch milliseconds, 'YYYY-MM-DD',
+  // 'YYYY/MM/DD HH:MM[:SS]' (incl. the LongMemEval '2023/05/20 (Sat) 02:21'
+  // form), ISO datetimes. Anything else (natural language) → null —
+  // add()/getProfile() fall back to today; search() fails loud.
   _normalizeDate(input) {
     if (input === null || input === undefined || input === "") return null;
     if (input instanceof Date) {
       if (isNaN(input.getTime())) return null;
       return input.toISOString().replace("Z", "").replace(/\.\d{3}$/, "");
+    }
+    if (typeof input === "number") {
+      const d = new Date(input);
+      if (isNaN(d.getTime())) return null;
+      return d.toISOString().replace("Z", "").replace(/\.\d{3}$/, "");
     }
 
     // strip day names in parens — (Sat), (Tue) etc — derivable from the date,

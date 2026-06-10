@@ -68,6 +68,10 @@ export class Storage {
         value TEXT NOT NULL
       );
 
+      -- Stamped BEFORE the facts table exists so a concurrent process that
+      -- sees facts always sees the version row too (no spurious guard throw).
+      INSERT OR REPLACE INTO greymemory_meta (key, value) VALUES ('schema_version', '${SCHEMA_VERSION}');
+
       CREATE TABLE IF NOT EXISTS facts (
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         key           TEXT    NOT NULL,
@@ -164,11 +168,6 @@ export class Storage {
       CREATE INDEX IF NOT EXISTS idx_chunks_dedup  ON chunks(container, session_id, content_hash)
         WHERE session_id IS NOT NULL AND content_hash IS NOT NULL;
     `);
-
-    this.db.prepare(`
-      INSERT INTO greymemory_meta (key, value) VALUES ('schema_version', ?)
-      ON CONFLICT(key) DO UPDATE SET value = excluded.value
-    `).run(SCHEMA_VERSION);
   }
 
   // ── Vector encoding ─────────────────────────────────
@@ -186,13 +185,16 @@ export class Storage {
   // ── Facts ──────────────────────────────────────────
 
   loadFacts(asOf = null) {
-    // expires check relative to asOf when time-travelling, today otherwise —
-    // ensures episodes valid at asOf are included even if expired today
-    const expiresCheck = asOf
-      ? `AND (expires_at IS NULL OR expires_at > ?)`
-      : `AND (expires_at IS NULL OR expires_at > datetime('now'))`;
-
-    const params = asOf ? [this.container, asOf] : [this.container];
+    // Expiry is day-granular and INCLUSIVE of the expires_at day: the
+    // extraction prompt mandates date-only values that mean "expires AFTER
+    // this day" ("meeting at 3pm today" → expires_at = today). A bare
+    // string comparison against a datetime would expire them a day early.
+    // With asOf, both checks run relative to that date instead of today —
+    // episodes valid then stay visible, and facts recorded later disappear.
+    const clauses = asOf
+      ? `AND (expires_at IS NULL OR expires_at >= date(@asOf))
+         AND (document_date IS NULL OR document_date <= @asOf)`
+      : `AND (expires_at IS NULL OR expires_at >= date('now'))`;
 
     return this.db
       .prepare(`
@@ -201,11 +203,11 @@ export class Storage {
           memory_type, document_date, event_date, expires_at,
           chunk_id, source_role, created_at, updated_at
         FROM facts
-        WHERE container = ?
-          ${expiresCheck}
+        WHERE container = @container
+          ${clauses}
         ORDER BY created_at ASC
       `)
-      .all(...params);
+      .all(asOf ? { container: this.container, asOf } : { container: this.container });
   }
 
   saveFact(key, value, opts = {}) {
@@ -272,9 +274,29 @@ export class Storage {
     return result.lastInsertRowid;
   }
 
-  // dedupBySession: has a round with this content hash already been ingested
-  // under this sessionId in this container? Container-scoped, so dedup never
-  // crosses containers. Returns false unless both args are present.
+  // dedupBySession companion pieces. A round only gets its content_hash AFTER
+  // its whole pipeline (extraction + facts + chunk embedding) completed — so a
+  // crash mid-add() leaves the chunk durable but unhashed, and a retry RESUMES
+  // it (reusing the row via findIncompleteChunk) instead of skipping or
+  // duplicating it.
+
+  findIncompleteChunk(sessionId, content) {
+    if (sessionId == null) return null;
+    const row = this.db.prepare(`
+      SELECT id FROM chunks
+      WHERE container = ? AND session_id = ? AND content_hash IS NULL AND content = ?
+      LIMIT 1
+    `).get(this.container, sessionId, content);
+    return row?.id ?? null;
+  }
+
+  setChunkHash(chunkId, contentHash) {
+    this.db.prepare(`UPDATE chunks SET content_hash = ? WHERE id = ?`).run(contentHash, chunkId);
+  }
+
+  // dedupBySession: has a round with this content hash already been FULLY
+  // ingested under this sessionId in this container? Container-scoped, so
+  // dedup never crosses containers. Returns false unless both args are present.
   chunkExists(sessionId, contentHash) {
     if (sessionId == null || contentHash == null) return false;
     const row = this.db.prepare(`
@@ -325,11 +347,12 @@ export class Storage {
   // asOf is a plain temporal cutoff: facts recorded after asOf are invisible.
   // (No version predicate — lite has no supersession; the reader resolves
   // contradictions from the chronologically sorted results.)
+  // Expiry is day-granular and inclusive of the expires_at day — see loadFacts.
   _factPredicates(asOf) {
     const asOfClause = asOf ? `AND f.document_date <= @asOf` : ``;
     const expiresClause = asOf
-      ? `AND (f.expires_at IS NULL OR f.expires_at > @asOf)`
-      : `AND (f.expires_at IS NULL OR f.expires_at > datetime('now'))`;
+      ? `AND (f.expires_at IS NULL OR f.expires_at >= date(@asOf))`
+      : `AND (f.expires_at IS NULL OR f.expires_at >= date('now'))`;
     return `${asOfClause}\n        ${expiresClause}`;
   }
 
@@ -337,28 +360,34 @@ export class Storage {
     const ftsQuery = this._ftsQuery(query);
     if (!ftsQuery) return [];
 
-    const rows = this.db.prepare(`
-      SELECT
-        f.id,
-        f.key,
-        f.value,
-        f.memory_type,
-        f.document_date,
-        f.event_date,
-        f.expires_at,
-        f.chunk_id,
-        f.source_role,
-        c.session_id AS session_id,
-        bm25(facts_fts) AS score
-      FROM facts_fts
-      JOIN facts f ON facts_fts.rowid = f.id
-      LEFT JOIN chunks c ON c.id = f.chunk_id
-      WHERE facts_fts MATCH @query
-        AND f.container = @container
-        ${this._factPredicates(asOf)}
-      ORDER BY score
-      LIMIT @topN
-    `).all({ query: ftsQuery, container, topN, asOf });
+    let rows = [];
+    try {
+      rows = this.db.prepare(`
+        SELECT
+          f.id,
+          f.key,
+          f.value,
+          f.memory_type,
+          f.document_date,
+          f.event_date,
+          f.expires_at,
+          f.chunk_id,
+          f.source_role,
+          c.session_id AS session_id,
+          bm25(facts_fts) AS score
+        FROM facts_fts
+        JOIN facts f ON facts_fts.rowid = f.id
+        LEFT JOIN chunks c ON c.id = f.chunk_id
+        WHERE facts_fts MATCH @query
+          AND f.container = @container
+          ${this._factPredicates(asOf)}
+        ORDER BY score
+        LIMIT @topN
+      `).all({ query: ftsQuery, container, topN, asOf });
+    } catch (e) {
+      // _ftsQuery quoting should make this unreachable; degrade loudly, not silently
+      console.warn("[greymemory-lite] fact BM25 channel error:", e?.message ?? e);
+    }
 
     return rows.map((r, index) => ({
       id:            r.id,
@@ -432,8 +461,9 @@ export class Storage {
         ORDER BY score
         LIMIT @topN
       `).all(params);
-    } catch {
-      // last-resort guard; _ftsQuery quoting should make this unreachable
+    } catch (e) {
+      // _ftsQuery quoting should make this unreachable; degrade loudly, not silently
+      console.warn("[greymemory-lite] chunk BM25 channel error:", e?.message ?? e);
     }
 
     return rows.map((r, index) => ({
@@ -569,11 +599,14 @@ export class Storage {
   // ── Clear ──────────────────────────────────────────
 
   clear() {
-    // delete child rows before parents — embeddings/chunk_embeddings have FK
-    // references to facts/chunks
-    this.db.prepare(`DELETE FROM embeddings WHERE container = ?`).run(this.container);
-    this.db.prepare(`DELETE FROM chunk_embeddings WHERE container = ?`).run(this.container);
-    this.db.prepare(`DELETE FROM facts WHERE container = ?`).run(this.container);
-    this.db.prepare(`DELETE FROM chunks WHERE container = ?`).run(this.container);
+    // all-or-nothing: a crash between DELETEs must not leave facts without
+    // their embeddings (invisible to the vector channel). Child rows go
+    // before parents — embeddings/chunk_embeddings have FK references.
+    this.db.transaction(() => {
+      this.db.prepare(`DELETE FROM embeddings WHERE container = ?`).run(this.container);
+      this.db.prepare(`DELETE FROM chunk_embeddings WHERE container = ?`).run(this.container);
+      this.db.prepare(`DELETE FROM facts WHERE container = ?`).run(this.container);
+      this.db.prepare(`DELETE FROM chunks WHERE container = ?`).run(this.container);
+    })();
   }
 }
