@@ -59,3 +59,28 @@ R@10 = 100% everywhere, both configs.
 2. **Do NOT blindly scale ingest** — relationship calls make a 90-question session-mode ingest ~$50+. Implement Task 8.1 (batch relationship) first, OR persist one all-category DB and reuse it (SKIP_INGEST) across configs.
 3. **Gate rerank to MS/TR** (where recall is the bottleneck) rather than all categories; re-measure NDCG/accuracy at n≥15/category.
 4. Larger n (≥15/category) is required for any accuracy claim — current n saturates.
+
+---
+
+## Task 8.1 — batched relationship classification (validated)
+
+Same question (001be529, 51 sessions, session-mode), batching OFF vs ON:
+
+| | extraction calls | relationship calls | correct | Haiku $/q (approx) |
+|---|---|---|---|---|
+| baseline (per-fact) | 51 | **139** | yes | ~$0.61 |
+| batched (1/batch) | 51 | **27** | yes | ~$0.50 |
+
+- **Relationship calls −80.6%** (139→27; 27 = sessions that had ≥1 existing
+  candidate — sessions with none skip the LLM entirely). Correctness held; R@10 100%.
+- **But total $ only −18% in session-mode** — because **extraction dominates**
+  (51 large-prompt calls, ~6.5k input tok each). Batching removes the
+  relationship *multiplier*, which is small relative to extraction here.
+
+### Implication for round-mode
+Batching matters most for **round-mode**, where relationship calls would
+otherwise be facts/round × rounds. With batching they cap at ~1/round, so the
+*remaining* round-mode premium is the extra **extraction** calls (1/round vs
+1/session). The next lever to make round-mode genuinely cheap is therefore
+**Task 8.2 — prompt-cache the static extraction instruction block** (~90% input-
+token cut on the repeated portion), not more relationship batching.
