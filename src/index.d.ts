@@ -322,6 +322,17 @@ export interface GreyMemoryOptions {
   extractionMode?: 'session' | 'round';
 
   /**
+   * Classify a whole extraction batch's relationships in ONE LLM call instead
+   * of one call per fact (the dominant ingestion cost). Cross-batch causality
+   * is unaffected — each batch is still classified against the accumulated DB —
+   * so in `'round'` mode (one batch per round) cross-round UPDATES/EXTENDS are
+   * fully preserved. Only WITHIN-batch new-vs-new supersession is deferred
+   * (rare; session-mode only). Overridable per call via {@link AddOptions.batchRelationships}.
+   * @default false
+   */
+  batchRelationships?: boolean;
+
+  /**
    * Pass an existing better-sqlite3 Database instance.
    * Use when you want to manage the database lifecycle yourself.
    */
@@ -461,6 +472,12 @@ export interface AddOptions {
    * See {@link GreyMemoryOptions.extractionMode}.
    */
   extractionMode?: 'session' | 'round';
+
+  /**
+   * Override the constructor's batched-relationship setting for this call.
+   * See {@link GreyMemoryOptions.batchRelationships}.
+   */
+  batchRelationships?: boolean;
 }
 export interface SearchOptions {
   /**

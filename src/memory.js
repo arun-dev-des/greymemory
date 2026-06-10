@@ -41,6 +41,14 @@ export class Memory {
     // running summary of earlier rounds — exact provenance, K = V + fact aligned
     // by construction. Overridable per add() via opts.extractionMode.
     this.extractionMode      = options.extractionMode === 'round' ? 'round' : 'session';
+    // Task 8.1 — batch relationship classification. When true, ALL of an
+    // extraction batch's facts are classified in ONE LLM call instead of one
+    // call per fact (the dominant ingest cost). Cross-batch causality is
+    // unaffected: each batch is still classified against the accumulated DB, so
+    // in round-mode (one batch per round) cross-round supersession is fully
+    // preserved. Only WITHIN-batch new-vs-new supersession is deferred — rare,
+    // and in round-mode a batch is a single round. Default off; overridable per add().
+    this.batchRelationships  = options.batchRelationships === true;
     // Optional diagnostic hook — called once per relationship-classification
     // decision (Task 5.1). Errors thrown by the consumer are swallowed so
     // ingestion never blocks on logging.
@@ -62,6 +70,7 @@ export class Memory {
     const extractionMode = opts.extractionMode === 'round' || opts.extractionMode === 'session'
       ? opts.extractionMode
       : this.extractionMode;
+    const batchRelationships = opts.batchRelationships ?? this.batchRelationships;
 
     // Per-add() call accounting. Counts attempts (before each await) so the
     // numbers stay accurate even when an upstream API throws. Consumers wrap
@@ -183,7 +192,7 @@ export class Memory {
     const savedThisBatch = []
     const chunkIdToFacts  = new Map()  // chunk_id → [factValue, ...] for K = V + fact
 
-    const saveCtx = { documentDate, savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts }
+    const saveCtx = { documentDate, savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts, batchRelationships }
 
     if (extractionMode === 'round' && isArrayInput) {
       // Round mode already iterates `rounds`, which excludes any dedup-skipped rounds,
@@ -391,6 +400,9 @@ export class Memory {
   // already be persisted. Mutates ctx.savedThisBatch and ctx.chunkIdToFacts and
   // bumps the call counters.
   async _saveMemories(memories, ctx) {
+    // Task 8.1 — one classification call per batch instead of one per fact.
+    if (ctx.batchRelationships) return this._saveMemoriesBatched(memories, ctx)
+
     const {
       documentDate, messageIndexToRole, messageIndexToChunkId, anchorChunkId,
       savedThisBatch, chunkIdToFacts, llmCallCounts, embedderCallCounts,
@@ -473,6 +485,191 @@ export class Memory {
         chunkIdToFacts.get(resolvedChunkId).push(value)
       }
     }
+  }
+
+  // ── Batched save path (Task 8.1) ────────────────────────────────────────
+  //
+  // Same contract as the per-fact loop above, but classifies the WHOLE batch's
+  // fact/episode relationships in ONE LLM call. Pre-pass: embed → in-batch
+  // cosine dedup → preferences (strengthen-or-save). Then one classification
+  // call over the surviving fact/episodes against the accumulated-DB candidate
+  // pool. Then a sequential save pass (so K=V+fact and savedThisBatch stay
+  // identical to the per-fact path).
+  //
+  // Cross-batch causality is intact — candidates come from the live DB, which
+  // already holds every earlier batch/session/round. In round-mode each round
+  // is its own batch, so cross-round UPDATES/EXTENDS are fully preserved. Only
+  // WITHIN-batch new-vs-new supersession is deferred (rare; session-mode only,
+  // since a round-mode batch is a single round).
+  async _saveMemoriesBatched(memories, ctx) {
+    const { documentDate, savedThisBatch, chunkIdToFacts, embedderCallCounts, llmCallCounts } = ctx
+    const DEDUP_THRESHOLD = 0.92
+
+    const pending = []  // fact/episode survivors awaiting classification
+    for (const mem of memories) {
+      const { key, value, memory_type = 'fact' } = mem
+      if (!key || !value) continue
+
+      embedderCallCounts.memory++
+      const embedding = await this.embedder(value, { phase: 'memory' })
+
+      if (savedThisBatch.some(saved => this._cosineSimilarity(embedding, saved) > DEDUP_THRESHOLD)) continue
+
+      const { source_role, resolvedChunkId } = this._resolveProvenance(mem, ctx)
+
+      if (memory_type === 'preference') {
+        const strengthened = this._strengthenPreference(mem.key, mem.value, embedding, documentDate)
+        if (strengthened) continue
+        // new preference — preferences never UPDATE/EXTEND, save directly as NEW
+        this._persistFact(mem, embedding, { type: 'NEW', relatedTo: null }, source_role, resolvedChunkId, ctx)
+        continue
+      }
+
+      pending.push({ mem, embedding, source_role, resolvedChunkId })
+    }
+
+    if (pending.length === 0) return
+
+    const classifications = await this._classifyRelationshipsBatch(pending, documentDate, llmCallCounts)
+
+    // sequential save pass — order preserved so provenance/K=V+fact match the loop path
+    for (let i = 0; i < pending.length; i++) {
+      const { mem, embedding, source_role, resolvedChunkId } = pending[i]
+      const c = classifications[i] ?? { type: 'NEW', relatedTo: null }
+      const relatedTo = c.relatedTo ?? null
+      const type = (relatedTo != null && (c.type === 'UPDATES' || c.type === 'EXTENDS')) ? c.type : 'NEW'
+      const relationship = { type, relatedTo: type === 'NEW' ? null : relatedTo }
+      this._persistFact(mem, embedding, relationship, source_role, resolvedChunkId, ctx)
+    }
+  }
+
+  // Classify a whole batch of new fact/episode memories against the existing-DB
+  // candidate pool in ONE LLM call. Candidates = union of each item's same-key
+  // facts + top-5 vector neighbours (capped). Returns an array aligned to
+  // `pending`: { type, relatedTo:<existing fact id|null> }. Fail-open to all-NEW.
+  // Skips the LLM entirely when there are no existing candidates.
+  async _classifyRelationshipsBatch(pending, documentDate, llmCallCounts) {
+    const allNew = () => pending.map(() => ({ type: 'NEW', relatedTo: null }))
+
+    // gather candidate existing facts
+    const candById = new Map()
+    const sameKeyStmt = this.storage.db.prepare(`
+      SELECT id, key, value, memory_type, document_date, event_date, source_role
+      FROM facts
+      WHERE key = ? AND container = ? AND is_latest = 1
+        AND (expires_at IS NULL OR expires_at > ?)
+    `)
+    for (const { mem, embedding } of pending) {
+      for (const f of sameKeyStmt.all(mem.key, this.storage.container, documentDate)) candById.set(f.id, f)
+      for (const f of this.storage.vectorSearch(embedding, this.storage.container, 5, documentDate)) {
+        if (!candById.has(f.id)) candById.set(f.id, f)
+      }
+    }
+    const candidates = [...candById.values()].slice(0, 40)
+    if (candidates.length === 0) return allNew()  // nothing to relate to → all NEW, no LLM call
+
+    const newBlock = pending.map(({ mem }, i) =>
+      `${i + 1}. "${mem.value}" [${mem.memory_type ?? 'fact'}] [source: ${mem.source_role ?? 'user'}]${mem.event_date ? ` [event: ${mem.event_date}]` : ''}`
+    ).join('\n')
+    const existingBlock = candidates.map(f =>
+      `[ID:${f.id}] "${f.value}" [${f.memory_type}] [source: ${f.source_role ?? 'user'}] [recorded: ${f.document_date ?? 'unknown'}]${f.event_date ? ` [event: ${f.event_date}]` : ''}`
+    ).join('\n')
+
+    const prompt = `You are a memory relationship classifier. For EACH new memory, classify its relationship to the MOST RELEVANT existing memory.
+
+NEW MEMORIES (recorded: ${documentDate ?? 'unknown'}):
+${newBlock}
+
+EXISTING MEMORIES:
+${existingBlock}
+
+Priority order: UPDATES > EXTENDS > NEW
+
+UPDATES — the new memory contradicts and replaces an existing one. ONLY for SINGULAR attributes — concepts where a person can have only ONE value at a time (employer, location, role/title, relationship status, education level). Even if worded differently, if it describes the SAME singular attribute with a DIFFERENT value → UPDATES.
+  Do NOT use UPDATES for list-like/additive concepts (recommendations, suggestions, options, steps, examples) — each is independent. For assistant facts (source: assistant), default to EXTENDS or NEW unless the same specific item is explicitly contradicted.
+
+EXTENDS — the new memory adds detail WITHOUT replacing an existing one (the existing memory stays 100% true).
+
+NEW — no meaningful relationship to any existing memory.
+
+Return ONLY a JSON array, one object per new memory, in order:
+[{"new": 1, "type": "UPDATES|EXTENDS|NEW", "relatedTo": <existing ID or null>}, ...]`
+
+    let llmRaw = null
+    try {
+      llmCallCounts.relationship++
+      llmRaw = await this.extractor(prompt, { phase: 'relationship' })
+      let text = String(llmRaw).trim().replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
+      let parsed
+      try { parsed = JSON.parse(text) }
+      catch { const m = text.match(/\[[\s\S]*\]/); parsed = m ? JSON.parse(m[0]) : null }
+      if (!Array.isArray(parsed)) return allNew()
+
+      const validIds = new Set(candidates.map(c => c.id))
+      const byNew = new Map()
+      for (const o of parsed) {
+        const n = Number(o?.new)
+        if (Number.isInteger(n)) byNew.set(n, o)
+      }
+
+      return pending.map(({ mem }, i) => {
+        const o = byNew.get(i + 1)
+        const type = ['UPDATES', 'EXTENDS', 'NEW'].includes(o?.type) ? o.type : 'NEW'
+        const relatedTo = (type !== 'NEW' && validIds.has(o?.relatedTo)) ? o.relatedTo : null
+        const decision = { type: relatedTo == null ? 'NEW' : type, relatedTo }
+        this._logRelationshipDecision({ mem, documentDate, candidates, decision, reason: 'llm_batch', llmRaw })
+        return decision
+      })
+    } catch {
+      return allNew()
+    }
+  }
+
+  // Provenance for a memory: deterministic source_role + chunk id from the
+  // extractor's source_message_index (falls back to the batch's anchor chunk).
+  _resolveProvenance(mem, ctx) {
+    const { messageIndexToRole, messageIndexToChunkId, anchorChunkId } = ctx
+    const smi = mem.source_message_index
+    const source_role = (Number.isInteger(smi) && messageIndexToRole[smi] != null)
+      ? messageIndexToRole[smi] : null
+    const resolvedChunkId = (Number.isInteger(smi) && messageIndexToChunkId[smi] != null)
+      ? messageIndexToChunkId[smi] : anchorChunkId
+    return { source_role, resolvedChunkId }
+  }
+
+  // Persist one classified fact/episode: saveFact (+ supersede on UPDATES) +
+  // saveEmbedding, and collect its value for the chunk's K=V+fact embedding.
+  // Shared by the batched save path; mirrors the per-fact loop exactly.
+  _persistFact(mem, embedding, relationship, source_role, resolvedChunkId, ctx) {
+    const { documentDate, savedThisBatch, chunkIdToFacts } = ctx
+    const { key, value, memory_type = 'fact', event_date = null, expires_at = null, context = null } = mem
+
+    const factId = this.storage.saveFact(key, value, {
+      memory_type,
+      document_date:   documentDate,
+      event_date,
+      expires_at,
+      confidence:      1.0,
+      relation_type:   relationship.type !== 'NEW' ? relationship.type : null,
+      related_to:      relationship.relatedTo,
+      superseded_from: relationship.type === 'UPDATES' ? relationship.relatedTo : null,
+      chunk_id:        resolvedChunkId,
+      source_role,
+      metadata:        JSON.stringify(context ? { context } : {}),
+    })
+
+    if (relationship.type === 'UPDATES' && relationship.relatedTo) {
+      this.storage.supersedeFact(relationship.relatedTo, factId)
+    }
+
+    this.storage.saveEmbedding(factId, embedding)
+    savedThisBatch.push(embedding)
+
+    if (resolvedChunkId) {
+      if (!chunkIdToFacts.has(resolvedChunkId)) chunkIdToFacts.set(resolvedChunkId, [])
+      chunkIdToFacts.get(resolvedChunkId).push(value)
+    }
+    return factId
   }
 
   // ── Search ─────────────────────────────────────────

@@ -38,6 +38,7 @@ const SKIP_INGEST     = envBool('SKIP_INGEST', true)       // true = skip ingest
 const TIME_AWARE_QUERY = envBool('TIME_AWARE_QUERY', true) // CP3 (LongMemEval §5.4): auto-extract date range from query
 const READING_MODE    = envStr('READING_MODE', 'json-con') // CP4 (§5.5): 'json-con' = JSON + Chain-of-Note | 'legacy' = pre-Task-4 prose
 const EXTRACTION_MODE = envStr('EXTRACTION_MODE', 'session')// A/B (indexing): 'session' = one extraction per conversation | 'round' = per-round (EXPENSIVE: N calls/session)
+const BATCH_RELATIONSHIPS = envBool('BATCH_RELATIONSHIPS', false)  // Task 8.1: classify a batch's relationships in ONE call (cuts the dominant ingest cost; makes round-mode affordable)
 const CON_PROMPT_VERSION = (process.env.CON_PROMPT_VERSION === 'v1' ? 'v1' : 'v2')  // 'v2' (default) = anchor + 3-tier scoring + self-check (see formatForReadingV2); set CON_PROMPT_VERSION=v1 to opt out
 const JUDGE_DUAL      = envBool('JUDGE_DUAL', false)        // A/B: judge each answer TWICE — once without chunks (paper-comparable), once with deduped CoN-filtered source chunks.
 const QUESTION_DELAY_MS = envNum('QUESTION_DELAY_MS', 6000) // sleep between questions to stay under OpenAI per-minute TPM
@@ -651,6 +652,7 @@ const run = {
     con_prompt_version: CON_PROMPT_VERSION,
     skip_ingest:     SKIP_INGEST,
     extraction_mode: EXTRACTION_MODE,
+    batch_relationships: BATCH_RELATIONSHIPS,
     time_aware_query: TIME_AWARE_QUERY,
     reading_mode:    READING_MODE,
     judge_dual:      JUDGE_DUAL,
@@ -704,6 +706,7 @@ for (let i = 0; i < questions.length; i++) {
     filterPrompt:   FILTER_PROMPT,
     entityContext:  INITIAL_ENTITY_CONTEXT,
     extractionMode: EXTRACTION_MODE,
+    batchRelationships: BATCH_RELATIONSHIPS,
     onRelationshipDecision,
   })
 
