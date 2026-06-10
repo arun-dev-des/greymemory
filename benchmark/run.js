@@ -57,6 +57,16 @@ const MAX_PER_SESSION = process.env.MAX_PER_SESSION == null || process.env.MAX_P
 // 1-question-per-category smoke.
 const USE_FIXED_IDS   = envBool('USE_FIXED_IDS', true)
 
+// Answerer / judge provider. Default 'openai' + gpt-4o keeps results
+// paper-comparable to supermemory's published numbers. Set ANSWERER_PROVIDER /
+// JUDGE_PROVIDER = 'anthropic' to fall back to Claude (e.g. when the OpenAI key
+// is unavailable) — useful for INTERNAL A/B (judge held constant across runs)
+// but NOT directly comparable to gpt-4o-judged numbers.
+const ANSWERER_PROVIDER = envStr('ANSWERER_PROVIDER', 'openai')
+const ANSWERER_MODEL    = envStr('ANSWERER_MODEL', ANSWERER_PROVIDER === 'anthropic' ? 'claude-sonnet-4-6' : 'gpt-4o')
+const JUDGE_PROVIDER    = envStr('JUDGE_PROVIDER', 'openai')
+const JUDGE_MODEL       = envStr('JUDGE_MODEL', JUDGE_PROVIDER === 'anthropic' ? 'claude-haiku-4-5-20251001' : 'gpt-4o')
+
 const DB_DIR      = process.env.DB_DIR ? path.resolve(process.env.DB_DIR) : path.join(__dirname, '.greymemory-bench-ku10-validation')
 const DATA_FILE   = path.join(__dirname, 'data', 'longmemeval_s_cleaned.json')
 const RESULTS_DIR = path.join(__dirname, 'results')
@@ -143,28 +153,42 @@ function resetTokenLog() {
 
 // ── providers ──────────────────────────────────────────────────────────────
 
-const extractor = async (prompt, context) => {
+const extractor = async (prompt, context, retries = 4) => {
   const phase  = context?.phase ?? 'extraction'
   const bucket = tokenLog.extractor[phase] ?? tokenLog.extractor.extraction
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method:  'POST',
-    headers: {
-      'Content-Type':      'application/json',
-      'x-api-key':         process.env.ANTHROPIC_API_KEY,
-      'anthropic-version': '2023-06-01',
-    },
-    body: JSON.stringify({
-      model:      'claude-haiku-4-5-20251001',
-      max_tokens: 8192,
-      messages:   [{ role: 'user', content: prompt }],
-    }),
-  })
-  const data = await res.json()
-  if (data.error) throw new Error(`Anthropic: ${data.error.message}`)
-  bucket.input  += data.usage?.input_tokens  ?? 0
-  bucket.output += data.usage?.output_tokens ?? 0
-  bucket.calls  += 1
-  return data.content[0].text.trim()
+  for (let attempt = 0; attempt < retries; attempt++) {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method:  'POST',
+      headers: {
+        'Content-Type':      'application/json',
+        'x-api-key':         process.env.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model:      'claude-haiku-4-5-20251001',
+        max_tokens: 8192,
+        messages:   [{ role: 'user', content: prompt }],
+      }),
+    })
+    const data = await res.json()
+    // Retry transient rate-limit / overload errors with exponential backoff so
+    // unattended overnight ingestion doesn't silently drop sessions on a 429.
+    const t = data.error?.type ?? ''
+    if (res.status === 429 || res.status >= 500 || /rate_limit|overloaded|api_error/i.test(t)) {
+      if (attempt < retries - 1) {
+        const wait = Math.pow(2, attempt) * 2000
+        process.stderr.write(`\n  [retry] extractor ${t || res.status}, waiting ${wait/1000}s...\n`)
+        await new Promise(r => setTimeout(r, wait))
+        continue
+      }
+    }
+    if (data.error) throw new Error(`Anthropic: ${data.error.message}`)
+    bucket.input  += data.usage?.input_tokens  ?? 0
+    bucket.output += data.usage?.output_tokens ?? 0
+    bucket.calls  += 1
+    return data.content[0].text.trim()
+  }
+  throw new Error('Anthropic extractor: max retries exceeded')
 }
 
 const rawBatchedEmbedder = createBatchEmbedder(async (texts) => {
@@ -190,7 +214,35 @@ const embedder = async (text, context) => {
   return rawBatchedEmbedder(text)
 }
 
+// Anthropic chat helper for the Claude fallback (answerer / judge). Returns
+// { text, usage:{input,output} }. Throws on API error so the caller can retry.
+const anthropicChat = async (prompt, model, maxTokens) => {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method:  'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      temperature: 0,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  const data = await res.json()
+  if (data.error) throw new Error(`Anthropic: ${data.error.message}`)
+  return { text: (data.content?.[0]?.text ?? '').trim(), usage: { input: data.usage?.input_tokens ?? 0, output: data.usage?.output_tokens ?? 0 } }
+}
+
 const answerer = async (prompt, retries = 3) => {
+  if (ANSWERER_PROVIDER === 'anthropic') {
+    const { text, usage } = await anthropicChat(prompt, ANSWERER_MODEL, 512)
+    tokenLog.answering.input  += usage.input
+    tokenLog.answering.output += usage.output
+    return text
+  }
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method:  'POST',
@@ -230,6 +282,12 @@ const judge = async (question, expected, got, questionType, isAbstention, source
     question, answer: expected, response: got,
     sourceChunks,
   })
+  if (JUDGE_PROVIDER === 'anthropic') {
+    const { text, usage } = await anthropicChat(prompt, JUDGE_MODEL, 10)
+    tokenLog.judging.input  += usage.input
+    tokenLog.judging.output += usage.output
+    return parseJudgeVerdict(text)
+  }
   for (let attempt = 0; attempt < retries; attempt++) {
     const res = await fetch('https://api.openai.com/v1/chat/completions', {
       method:  'POST',
@@ -460,8 +518,13 @@ const checks = [
   },
 ]
 
+// Only verify providers actually in use — when answerer+judge run on Anthropic
+// (OpenAI-key-unavailable fallback), skip the OpenAI check so it doesn't abort.
+const usesOpenAI = ANSWERER_PROVIDER === 'openai' || JUDGE_PROVIDER === 'openai'
+const activeChecks = checks.filter(c => usesOpenAI || !c.name.startsWith('OpenAI'))
+
 let allPassed = true
-for (const check of checks) {
+for (const check of activeChecks) {
   try {
     const result = await check.fn()
     console.log(`  ✅  ${check.name} — ${result}`)
@@ -578,9 +641,11 @@ const run = {
     category_filter: CATEGORY_FILTER ?? 'all',
     search_top_n:    SEARCH_TOP_N,
     model_extractor: 'claude-haiku-4-5-20251001',
-    model_answerer:  'gpt-4o',
+    model_answerer:  ANSWERER_MODEL,
+    answerer_provider: ANSWERER_PROVIDER,
     model_embedder:  'voyage-3',
-    model_judge:     'gpt-4o',
+    model_judge:     JUDGE_MODEL,
+    judge_provider:  JUDGE_PROVIDER,
     tokens_format:   'v2-phase-keyed',  // see questions[].tokens shape
     judge_format:    'paper-official-v1',  // LongMemEval per-type prompts (./judge-prompts.js)
     con_prompt_version: CON_PROMPT_VERSION,
