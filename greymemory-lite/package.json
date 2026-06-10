@@ -1,0 +1,40 @@
+{
+  "name": "greymemory-lite",
+  "version": "0.1.0",
+  "description": "Paper-faithful memory core for AI agents: SQLite + FTS5/BM25 + vector cosine + RRF fusion, with bring-your-own-LLM extraction. Self-hosted — no data leaves the box.",
+  "type": "module",
+  "main": "src/index.js",
+  "types": "src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.d.ts",
+      "import": "./src/index.js"
+    }
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.8.0"
+  },
+  "keywords": [
+    "memory",
+    "ai-agents",
+    "llm",
+    "sqlite",
+    "fts5",
+    "rag",
+    "longmemeval",
+    "self-hosted"
+  ],
+  "author": "Arunkumar",
+  "license": "Apache-2.0"
+}

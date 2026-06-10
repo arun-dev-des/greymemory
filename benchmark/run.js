@@ -11,7 +11,6 @@ import 'dotenv/config'
 import fs   from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { Memory }              from '../src/memory.js'
 import { createBatchEmbedder } from '../src/batch-embedder.js'
 import { formatForReading, formatRetrievedContext } from '../src/answering.js'
 import { EXTRACTOR_STATIC_PREFIX } from '../src/prompts.js'
@@ -19,6 +18,14 @@ import { encode as encodeGpt4o } from 'gpt-tokenizer/model/gpt-4o'
 import { buildJudgePrompt, parseJudgeVerdict } from './judge-prompts.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// GREYMEMORY_LIB swaps the Memory implementation under the same harness, e.g.
+//   GREYMEMORY_LIB=../greymemory-lite/src/index.js node benchmark/run.js
+// The reading prompt (answering.js above) and judge stay from the main lib so
+// an old-vs-lite A/B isolates ingestion+retrieval. Lite ignores the legacy
+// constructor/search flags this runner passes.
+const GREYMEMORY_LIB = process.env.GREYMEMORY_LIB || '../src/memory.js'
+const { Memory } = await import(GREYMEMORY_LIB)
 
 // ── config ─────────────────────────────────────────────────────────────────
 
