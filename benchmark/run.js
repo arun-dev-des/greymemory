@@ -857,7 +857,10 @@ for (let i = 0; i < questions.length; i++) {
   let correct = false
   let correctWithChunks = null
   let failureReason = null
-  const judgedAnswer = answer.match(/^Answer:\s*(.*)$/m)?.[1]?.trim() ?? answer
+  // Capture from "Answer:" to END of output ([\s\S], not .) — the personalized
+  // reading mode produces multi-sentence answers, and the old single-line match
+  // truncated everything after the first line before judging.
+  const judgedAnswer = answer.match(/^Answer:\s*([\s\S]*)$/m)?.[1]?.trim() ?? answer
 
   // Baseline judge — vendored LongMemEval prompt, paper-comparable.
   correct = await judge(question, expected, judgedAnswer, question_type, isAbstention, null)

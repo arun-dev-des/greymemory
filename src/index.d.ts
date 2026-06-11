@@ -778,9 +778,19 @@ export interface FormatForReadingOptions {
   /**
    * CoN prompt variant. 'v1' is the original Chain-of-Note prompt.
    * 'v2' (see {@link formatForReadingV2}) introduces topic anchors, 3-tier
-   * relevance tagging, and an off-topic self-check. @default 'v1'
+   * relevance tagging, and an off-topic self-check. @default 'v2'
    */
   version?: 'v1' | 'v2';
+  /**
+   * Reading mode (v2 only). 'auto' (default) detects suggestion/advice-shaped
+   * requests ("any tips?", "can you recommend...") from the question text and
+   * switches to a personalized instruction block: items are tagged as usable
+   * user context rather than topic matches, the answer must be generative
+   * advice that names the user's context, and bare abstention is disallowed.
+   * Factual questions keep the original block. 'factual' / 'personalized'
+   * force a mode. @default 'auto'
+   */
+  mode?: 'auto' | 'factual' | 'personalized';
 }
 
 /**

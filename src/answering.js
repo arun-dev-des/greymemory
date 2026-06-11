@@ -287,6 +287,29 @@ function _buildContextItems(results, topN) {
   return items
 }
 
+// Detects suggestion / advice / personalization-shaped requests ("any tips?",
+// "can you suggest a hotel...", "what should I serve..."). These need the
+// personalized reading mode in formatForReadingV2: the factual rules fail them
+// three ways (benchmark run 2026-06-10, SSP 4/15): the abstention rule fires on
+// requests where abstention is never correct (5/11 misses answered "I don't
+// know" with the gold preference IN the window), the `answers` rule outputs the
+// stored fact verbatim instead of suggestions built on it, and topic-matching
+// anchors tag person-shaped context ("experiments with turbinado sugar")
+// off-topic for topic-shaped requests ("improve my cookies").
+function _isPersonalizationRequest(question) {
+  const q = String(question || '')
+  return (
+    /\b(any|some|got any|do you have any)\s+(helpful\s+|other\s+|good\s+)?(tips|advice|suggestions|recommendations|ideas|pointers)\b/i.test(q) ||
+    /\b(can|could|would)\s+you\s+(please\s+)?(suggest|recommend|propose|advise)\b/i.test(q) ||
+    /\b(suggest|recommend)\s+(a|an|some|any|the best|good)\b/i.test(q) ||
+    /\bwhat\s+(should|could|would|can)\s+i\b/i.test(q) ||
+    /\bhelp me\s+(choose|pick|plan|find|decide|come up with)\b/i.test(q) ||
+    /\bi'?m not sure\s+(what|which|where|how|whether)\b/i.test(q) ||
+    /\b(tips|advice|suggestions|recommendations|ideas)\s*\?/i.test(q) ||
+    /\bwhat\s+do\s+you\s+(think|suggest|recommend)\b/i.test(q)
+  )
+}
+
 // Returns just the retrieved-context string the answerer sees — the JSON
 // items block from formatForReading, without the surrounding question +
 // instructions. Use this to measure supermemory-style `contextTok` (tokens
@@ -308,9 +331,12 @@ export function formatForReading({
   // 47–58% gold-memory false-negative rate that v1's binary relevant/not-relevant
   // tagging produced (benchmark runs 2026-05-25/26). Pass version:'v1' to opt out.
   version = 'v2',
+  // 'auto' (default) switches to the personalized reading mode when the question
+  // is suggestion/advice-shaped; 'factual' / 'personalized' force a mode. v2 only.
+  mode = 'auto',
 }) {
   if (version === 'v2') {
-    return formatForReadingV2({ question, questionDate, results, profile, topN })
+    return formatForReadingV2({ question, questionDate, results, profile, topN, mode })
   }
   const items = _buildContextItems(results, topN)
   const N = items.length
@@ -436,8 +462,29 @@ export function formatForReadingV2({
   results = [],
   profile = null,
   topN = 10,
+  // 'auto' | 'factual' | 'personalized'. Auto detects suggestion/advice-shaped
+  // requests from the question text alone and switches to the personalized
+  // instruction block below; 'factual' forces the original behavior.
+  mode = 'auto',
 }) {
-  const items = _buildContextItems(results, topN)
+  const personalized = mode === 'personalized' ||
+    (mode !== 'factual' && _isPersonalizationRequest(question))
+
+  // Personalized window: user-context (preference-type) items frequently arrive
+  // via graph expansion at positions beyond topN and were being sliced off
+  // before the reader ever saw them (benchmark 2026-06-10: one SSP question had
+  // 5 of its 6 preference facts cut). Pull sliced-off preference items back
+  // into the window (capped) — RRF/rerank order is preserved for the head.
+  let windowResults = results
+  let windowTopN = topN
+  if (personalized) {
+    const head = results.slice(0, topN)
+    const tailPrefs = results.slice(topN).filter(r => r.memory_type === 'preference').slice(0, 8)
+    windowResults = [...head, ...tailPrefs]
+    windowTopN = windowResults.length
+  }
+
+  const items = _buildContextItems(windowResults, windowTopN)
   const N = items.length
   const jsonItemsBlock = items.length === 0 ? '(no memories retrieved)' : JSON.stringify(items, null, 2)
 
@@ -463,6 +510,80 @@ Recent context:
 ${profile.dynamic.length > 0 ? profile.dynamic.map(d => `- ${d}`).join('\n') : '(none)'}
 ---
 ` : ''
+
+  // ── Personalized reading mode ──────────────────────────────────────────
+  // For suggestion/advice requests the factual block below fails three ways
+  // (all observed on benchmark 2026-06-10, SSP 4/15 → see commit message):
+  // its abstention rule fires on requests where abstention is never correct,
+  // its `answers` rule outputs the stored fact verbatim instead of advice
+  // built on it, and its topic-anchors tag person-shaped context off-topic.
+  // This block inverts those rules: context-tagging by usefulness-to-the-
+  // request, a mandatory generative answer that names the user's context, and
+  // no bare abstention.
+  if (personalized) {
+    return `You are a personal assistant with access to a user's memory store.
+
+Request: ${question}
+Request date: ${questionDate}
+${profileSection}
+--- RETRIEVED MEMORIES (JSON, sorted chronologically; version chains merged) ---
+${jsonItemsBlock}
+---
+${updatesBanner}
+This request asks for suggestions, advice, or help. The items above are the
+user's KNOWN CONTEXT — their preferences, possessions, habits, skills, past
+purchases, plans, and constraints. A good answer responds to the request AND
+visibly uses this context. Generic advice that ignores the user's context is
+a failure. "I don't know" is a worse one.
+
+Step 0 — Anchors:
+  Anchors: <the request topic, AND the kinds of user context that could shape
+  the answer (relevant gear they own, tastes, skills, routines, prior plans)>
+
+Step 1 — For EACH item 1..${N}, write exactly one line, in order:
+  [i] context: <quoted phrase — a user preference/possession/habit/skill/plan/constraint usable for this request>
+  [i] related: <one phrase — touches the request topic without a usable detail>
+  [i] off-topic: item discusses <quoted noun phrase from the item>
+
+  Rules:
+  • Process all ${N} items, in order. Do NOT skip items. Each quoted phrase
+    MUST come verbatim from THAT item — never reuse a quote across items.
+  • An item about the USER (what they own, like, do, or plan) is "context"
+    even when its topic differs from the request topic. Example: for "how do
+    I improve my cookies?", "the user experiments with turbinado sugar" is
+    context, not off-topic.
+
+Step 1.5 — Self-check (do not skip):
+  Re-read every "off-topic" line. If that item states ANY user preference,
+  possession, habit, skill, or plan that could inform this request, re-tag it:
+  "[i] (revised) context: <quote>".
+
+Step 2 — Write the final answer:
+  • Answer the request directly with concrete, helpful suggestions or advice.
+  • Weave in the user's context by name — reference their specific gear,
+    purchases, skills, classes, or stated preferences from the "context"
+    items, so the advice is visibly personalized.
+  • Do NOT answer with a description of the user ("The user likes X") — answer
+    TO the user with suggestions built on what they like.
+  • NEVER answer "I don't know" or "not enough information". If no item is
+    context or related, give your best general answer to the request and note
+    that no stored context was found for this topic.
+  • Write the answer as one single paragraph (2–5 sentences) on one line.
+
+Output format:
+  Anchors: <list>
+
+  Notes:
+  [1] <tag>: <note>
+  ...
+  [${N}] <tag>: <note>
+
+  (Revisions, if any from Step 1.5:)
+  [i] (revised) context: <quote>
+
+  Answer: <your personalized suggestions, one paragraph>
+`
+  }
 
   return `You are a question-answering system with access to a user's memory store.
 
