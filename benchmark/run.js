@@ -264,7 +264,7 @@ const anthropicChat = async (prompt, model, maxTokens) => {
 
 const answerer = async (prompt, retries = 3) => {
   if (ANSWERER_PROVIDER === 'anthropic') {
-    const { text, usage } = await anthropicChat(prompt, ANSWERER_MODEL, 512)
+    const { text, usage } = await anthropicChat(prompt, ANSWERER_MODEL, 1024)
     tokenLog.answering.input  += usage.input
     tokenLog.answering.output += usage.output
     return text
@@ -278,7 +278,11 @@ const answerer = async (prompt, retries = 3) => {
       },
       body: JSON.stringify({
         model:       'gpt-4o',
-        max_tokens:  512,
+        // 1024, not 512: CoN writes one note per item BEFORE the answer; the
+        // personalized mode's pref-pull can widen the window to ~18 items, and
+        // at 512 a run was observed truncating mid-notes — never emitting the
+        // Answer: line despite its notes having found the gold context.
+        max_tokens:  1024,
         temperature: 0,
         messages:    [{ role: 'user', content: prompt }],
       }),

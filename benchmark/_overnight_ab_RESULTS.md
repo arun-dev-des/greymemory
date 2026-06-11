@@ -117,3 +117,26 @@ extractor it is a no-op.
    prefix on round-mode ingest. Needs the gpt-4o quality A/B (blocked on OpenAI key).
 3. Run extraction on Sonnet 4.6 (2048 min) → caching engages, but Sonnet input is
    3× Haiku — only wins if cache hit-rate is very high.
+
+---
+
+## SSP fix — personalized reading mode (validated on v15 DB, gpt-4o + official judge)
+
+Same 15 SSP questions, same v15 DB, only the reading prompt changed (commit 2a9c554):
+
+| | SSP accuracy | notes |
+|---|---|---|
+| before (factual CoN v2) | **4/15 (26.7%)** | 5 misses answered "I don't know" with gold prefs in-window |
+| after (personalized mode) | **10/15 (66.7%)** | 6 fixed, 0 regressed |
+| after + max_tokens 512→1024 | **11/15 (73.3%)** | movie Q was truncating mid-notes before its Answer: line |
+| supermemory SSP | 70.0% | — |
+
+Remaining 4 misses: 2 borderline judge calls (battery/Tokyo answers DID personalize
+with the power bank / Suica card), 1 detector miss (bike "could there be a reason"
+— explanation-shaped, deliberately not matched to avoid false positives), 1
+context-selection miss (cultural events — language prefs not surfaced).
+
+**Projected overall: 70/85 = 82.4% vs supermemory 81.6%** (v15 run for 5
+categories + this SSP run; SSA still n=10 of 15 — the v15 ingest died on q86).
+A clean single-run headline needs: ingest the 5 missing SSA questions (~$2.5),
+then one full 90q re-eval on the DB (~$4, no ingest).
