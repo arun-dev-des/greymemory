@@ -39,6 +39,16 @@ Tested against [LongMemEval](https://arxiv.org/abs/2410.10813) — the standard 
 
 ---
 
+## One repo, three packages
+
+- **`greymemory`** (this package) — the full memory engine. Contradictions are resolved at **write time**: an LLM classifier detects `UPDATES` / `EXTENDS` relationships, supersedes stale facts, and keeps full version history for time-travel queries, profiles, and derivations.
+- **[`greymemory-lite`](greymemory-lite/README.md)** — the [LongMemEval](https://arxiv.org/abs/2410.10813) paper's recommended design and *nothing else*: ~1,600 lines, one dependency (`better-sqlite3`), zero LLM calls at read time. Contradictions are resolved at **read time** — results arrive chronologically sorted and a Chain-of-Note reading prompt tells the answering model that the latest same-topic item wins. Pick it when you want the simplest design that benchmarks in the same band as far heavier systems.
+- **[`claude-greymemory`](claude-greymemory/README.md)** — a Claude Code plugin that gives Claude persistent, self-hosted memory: hooks capture every conversation into a per-project greymemory database and inject relevant memories back at session start, plus an MCP server (`grey_search` / `grey_add` / `grey_profile`) and `/grey-search`, `/grey-save`, `/grey-forget` slash commands.
+
+The two libraries' databases are **not** interchangeable — lite refuses to open a database it didn't create. See the [feature comparison](greymemory-lite/README.md#how-lite-differs-from-greymemory) in the lite README.
+
+---
+
 ## What's new in v0.4
 
 - **Benchmarked** — LongMemEval integration with reproducible benchmark runner. 6 categories, 15 questions each, automated scoring.
@@ -251,6 +261,16 @@ const results = await memory.search('investor meeting', {
 | `asOf`           | `string`   | `null`  | Time-travel: only return facts that existed at this date |
 | `includeHistory` | `boolean`  | `false` | Include superseded facts |
 | `includeExpired` | `boolean`  | `false` | Include expired episodes |
+| `expandViaGraph` | `boolean`  | `true`  | Follow `EXTENDS` edges and supersession chains from seed results |
+| `expandDepth`    | `number`   | `5`     | Max `EXTENDS` hops to walk during expansion |
+| `expandedLimit`  | `number`   | `10`    | Max additional facts added by graph expansion |
+| `timeAwareQuery` | `boolean`  | `true`  | Auto-extract a date range from the query (one extractor call) |
+| `rerank`         | `boolean`  | `false` | LLM-as-reranker over the candidate pool (one extractor call) |
+| `reranker`       | `function` | `null`  | Pluggable reranker `(query, texts[]) => orderedIndices[]`; overrides the LLM path |
+| `multiQuery`     | `boolean \| number` | `false` | Expand the query into N paraphrases and union candidates (`true` → 3) |
+| `adaptiveAggregation` | `boolean` | `false` | Raise effective topN for count/aggregation questions ("how many", "total"…) |
+| `maxPerSession`  | `number`   | `null`  | Demote results beyond N per session, protecting multi-session diversity |
+| `candidatePool`  | `number`   | `null`  | Candidates fetched before filtering/rerank (default `max(topN*4, 40)`) |
 
 ---
 
@@ -477,13 +497,18 @@ ollama pull mxbai-embed-large
 - [x] asOf time-travel queries
 - [x] Batch embedder
 - [x] LongMemEval benchmark (80.0% vs Supermemory 83.4%)
-- [ ] Memory graph — fact_relations table with typed edges (UPDATES, EXTENDS, SIMILAR_TO, SIBLING)
-- [ ] Graph traversal — cluster retrieval, supersession chain following, sibling expansion
-- [ ] 3-layer context — static profile + dynamic profile + reranked search results
-- [ ] Question-aware reranking — boost preferences/temporal/current-state by question type
+- [x] Graph traversal — search expands seeds through `EXTENDS` edges and supersession chains
+- [x] Reranking — LLM-as-reranker (`rerank`) or pluggable `reranker` fn, plus adaptive topN for aggregation questions
+- [x] Multi-query expansion — LLM paraphrases unioned by best RRF score (`multiQuery`)
+- [x] Episode expiration — extractor-set `expires_at`, enforced in search and profile (`includeExpired` to override)
+- [x] greymemory-lite — standalone paper-faithful core package
+- [x] Claude Code plugin — claude-greymemory (capture/inject hooks, MCP server, slash commands)
+- [ ] Memory graph — fact_relations table with `SIMILAR_TO` / `SIBLING` edges + sibling expansion
+- [ ] 3-layer context — static profile + dynamic profile + reranked search results in one call
+- [ ] Question-type-aware boosts — boost preferences/temporal/current-state by question type
 - [ ] Query decomposition — split compound "A or B?" queries
-- [ ] Memory expiration — configurable TTL per memory type
-- [ ] MCP server — `npx greymemory-mcp` for Claude Code, Cursor, Windsurf
+- [ ] Configurable TTL per memory type
+- [ ] Standalone MCP server — `npx greymemory-mcp` for Cursor, Windsurf (Claude Code is covered by the plugin)
 - [ ] Fine-tuned extraction model — local 7B model, zero API dependency
 - [ ] Community detection — topic clustering in memory graph
 - [ ] Python SDK
