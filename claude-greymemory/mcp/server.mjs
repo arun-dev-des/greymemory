@@ -66,7 +66,7 @@ const renderResults = (results) =>
     .join("\n");
 
 const server = new Server(
-  { name: "greymemory-cc", version: "0.1.0" },
+  { name: "claude-greymemory", version: "0.1.0" },
   { capabilities: { tools: {} } }
 );
 

@@ -3,7 +3,7 @@
 // `stub` extractor + embedder so it runs with no API key and no Ollama.
 //
 // Needs the plugin's deps installed (better-sqlite3, greymemory via file:..):
-//   cd greymemory-cc && npm install && npm run test:integration
+//   cd claude-greymemory && npm install && npm run test:integration
 
 import fs from "node:fs";
 import os from "node:os";
@@ -13,7 +13,7 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const ROOT = path.resolve(__dirname, "..");           // greymemory-cc/
+const ROOT = path.resolve(__dirname, "..");           // claude-greymemory/
 const DATA = fs.mkdtempSync(path.join(os.tmpdir(), "gmcc-itest-"));
 const TX = path.join(DATA, "transcript.jsonl");
 const CONTAINER = "itest";

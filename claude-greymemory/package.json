@@ -1,5 +1,5 @@
 {
-  "name": "greymemory-cc",
+  "name": "claude-greymemory",
   "version": "0.1.0",
   "description": "Claude Code plugin: capture sessions into a self-hosted greymemory DB and inject relevant memories back into context.",
   "type": "module",

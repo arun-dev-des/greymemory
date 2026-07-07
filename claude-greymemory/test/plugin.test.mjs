@@ -1,8 +1,8 @@
-// Unit tests for greymemory-cc's pure logic (lib/transcript, lib/cursor, lib/container).
+// Unit tests for claude-greymemory's pure logic (lib/transcript, lib/cursor, lib/container).
 // Zero dependencies -- imports only node built-ins, so it runs with plain `node` (no npm
 // install, no API key, no Ollama). This is the CI-able tier.
 //
-//   node greymemory-cc/test/plugin.test.mjs     (or: cd greymemory-cc && npm test)
+//   node claude-greymemory/test/plugin.test.mjs     (or: cd claude-greymemory && npm test)
 
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +11,7 @@ import { entriesToMessages } from "../lib/transcript.mjs";
 import { readNewEntries, advanceCursor } from "../lib/cursor.mjs";
 import { resolveContainer } from "../lib/container.mjs";
 import { loadConfig } from "../lib/config.mjs";
+import { buildCodingExtractorPrompt } from "../lib/prompt.mjs";
 
 let failed = 0;
 const ok = (cond, msg) => { console.log((cond ? "  ok -- " : "  FAIL: ") + msg); if (!cond) failed = 1; };
@@ -102,6 +103,39 @@ console.log("\n[transcript] captureTools (opt-in, tool-aware)");
   ok(!/secret/.test(asst), "non-allowlisted Read excluded (input + result)");
 }
 
+// skipTools (denylist over captureTools) + signalKeywords (selective capture). Both opt-in.
+console.log("\n[transcript] skipTools + signalKeywords (opt-in)");
+{
+  const toolEntries = [
+    { type: "user", message: { role: "user", content: "go" } },
+    { type: "assistant", message: { role: "assistant", id: "a1", content: [
+      { type: "text", text: "ok" },
+      { type: "tool_use", id: "e1", name: "Edit", input: { file_path: "a.js", old_string: "x", new_string: "y" } },
+      { type: "tool_use", id: "b1", name: "Bash", input: { command: "npm run build" } },
+    ] } },
+    { type: "user", message: { role: "user", content: [
+      { type: "tool_result", tool_use_id: "e1", content: [{ type: "text", text: "done" }] },
+      { type: "tool_result", tool_use_id: "b1", content: [{ type: "text", text: "built" }] },
+    ] } },
+    { type: "assistant", message: { role: "assistant", id: "a2", content: [{ type: "text", text: "fin" }] } },
+  ];
+  const asst = entriesToMessages(toolEntries, { captureTools: ["Edit", "Bash"], skipTools: ["Bash"] })
+    .find((x) => x.role === "assistant").content;
+  ok(asst.includes("Edited a.js"), "skipTools: Edit captured (allowlisted, not skipped)");
+  ok(!/Ran: npm run build/.test(asst), "skipTools: Bash excluded even though allowlisted");
+
+  const conv = [
+    { type: "user", message: { role: "user", content: "what's for lunch" } },
+    { type: "assistant", message: { role: "assistant", id: "a1", content: [{ type: "text", text: "tacos" }] } },
+    { type: "user", message: { role: "user", content: "remember we chose SQLite" } },
+    { type: "assistant", message: { role: "assistant", id: "a2", content: [{ type: "text", text: "noted" }] } },
+  ];
+  ok(entriesToMessages(conv).length === 4, "signalKeywords: empty -> both rounds kept");
+  const filtered = entriesToMessages(conv, { signalKeywords: ["remember", "decision"] });
+  ok(filtered.length === 2 && filtered[0].content.includes("SQLite"),
+    "signalKeywords: only the round containing a keyword is kept");
+}
+
 console.log("\n[transcript] degenerate inputs never throw");
 {
   let threw = false;
@@ -117,6 +151,23 @@ console.log("\n[transcript] degenerate inputs never throw");
     ok(!m.some((x) => x.content === ""), "empty/blank messages dropped");
   } catch { threw = true; }
   ok(!threw, "no throw on null / empty / unknown blocks");
+}
+
+// ---------------------------- plugin's own extractor prompt ----------------------------
+console.log("\n[prompt] buildCodingExtractorPrompt");
+{
+  const p = buildCodingExtractorPrompt({
+    input: [{ role: "user", content: "fix the auth bug" }, { role: "assistant", content: "patched it" }],
+    existingFacts: [{ memory_type: "fact", value: "uses JWT" }],
+    documentDate: "2026-06-03",
+    entityContext: "Prior: project uses SQLite.",
+  });
+  ok(/Focus on the USER/.test(p), "coding framing present (Supermemory-style)");
+  ok(/RULES:/.test(p) && /EXTRACT:/.test(p) && /SKIP:/.test(p), "RULES / EXTRACT / SKIP sections present");
+  ok(/"memory_type"/.test(p) && /"source_message_index"/.test(p), "greymemory JSON output contract present");
+  ok(/fix the auth bug/.test(p), "conversation embedded");
+  ok(/Prior: project uses SQLite\./.test(p), "entityContext (prior facts) threaded in");
+  ok(/uses JWT/.test(p), "existing memories listed for dedup");
 }
 
 // ---------------------------- cursor watermark ----------------------------
@@ -169,33 +220,46 @@ console.log("\n[container] resolveContainer");
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 
-// ---------------------------- user config (captureTools + injection caps) ----------------------------
-console.log("\n[config] loadConfig -- captureTools opt-in + injection caps");
+// ------------------- user config (captureTools / skipTools / signalKeywords / caps) -------------------
+console.log("\n[config] loadConfig -- captureTools, skipTools, signalKeywords, injection caps");
 {
   const dataDir = tmp("gmcc-config");
   fs.mkdirSync(dataDir, { recursive: true });
-  const envKeys = ["GREYMEMORY_CAPTURE_TOOLS", "GREYMEMORY_MAX_CONTEXT_MEMORIES", "GREYMEMORY_MAX_PROFILE_ITEMS"];
+  const envKeys = ["GREYMEMORY_CAPTURE_TOOLS", "GREYMEMORY_SKIP_TOOLS", "GREYMEMORY_SIGNAL_KEYWORDS",
+                   "GREYMEMORY_MAX_CONTEXT_MEMORIES", "GREYMEMORY_MAX_PROFILE_ITEMS"];
   const saved = Object.fromEntries(envKeys.map((k) => [k, process.env[k]]));
   for (const k of envKeys) delete process.env[k];
 
   const d = loadConfig(dataDir);
-  ok(d.captureTools.length === 0, "default: captureTools off (conversational)");
+  ok(d.captureTools.length === 0 && d.skipTools.length === 0 && d.signalKeywords.length === 0,
+    "defaults: captureTools / skipTools / signalKeywords all empty");
   ok(d.maxContextMemories === 8 && d.maxProfileItems === 0, "default caps: 8 context, 0 profile (= all)");
 
-  fs.writeFileSync(path.join(dataDir, "settings.json"),
-    JSON.stringify({ captureTools: ["Edit", "Bash"], maxContextMemories: 5, maxProfileItems: 3 }));
+  fs.writeFileSync(path.join(dataDir, "settings.json"), JSON.stringify({
+    captureTools: ["Edit", "Bash"], skipTools: ["Read"], signalKeywords: ["remember", "decision"],
+    maxContextMemories: 5, maxProfileItems: 3,
+  }));
   const s = loadConfig(dataDir);
   ok(JSON.stringify(s.captureTools) === '["Edit","Bash"]', "settings.json captureTools honored");
+  ok(JSON.stringify(s.skipTools) === '["Read"]', "settings.json skipTools honored");
+  ok(JSON.stringify(s.signalKeywords) === '["remember","decision"]', "settings.json signalKeywords honored");
   ok(s.maxContextMemories === 5 && s.maxProfileItems === 3, "settings.json injection caps honored");
 
   process.env.GREYMEMORY_CAPTURE_TOOLS = "Write,Task";
+  process.env.GREYMEMORY_SKIP_TOOLS = "Glob,Grep";
+  process.env.GREYMEMORY_SIGNAL_KEYWORDS = "bug,fix";
   process.env.GREYMEMORY_MAX_CONTEXT_MEMORIES = "12";
   const e = loadConfig(dataDir);
   ok(JSON.stringify(e.captureTools) === '["Write","Task"]', "env overrides captureTools");
+  ok(JSON.stringify(e.skipTools) === '["Glob","Grep"]', "env overrides skipTools");
+  ok(JSON.stringify(e.signalKeywords) === '["bug","fix"]', "env overrides signalKeywords");
   ok(e.maxContextMemories === 12 && e.maxProfileItems === 3, "env overrides context cap; profile cap kept from settings.json");
 
   process.env.GREYMEMORY_CAPTURE_TOOLS = "off";
-  ok(loadConfig(dataDir).captureTools.length === 0, "env 'off' disables capture");
+  process.env.GREYMEMORY_SIGNAL_KEYWORDS = "none";
+  const o = loadConfig(dataDir);
+  ok(o.captureTools.length === 0, "env 'off' disables capture");
+  ok(o.signalKeywords.length === 0, "env 'none' disables signalKeywords");
 
   for (const k of envKeys) { if (saved[k] !== undefined) process.env[k] = saved[k]; else delete process.env[k]; }
   fs.rmSync(dataDir, { recursive: true, force: true });

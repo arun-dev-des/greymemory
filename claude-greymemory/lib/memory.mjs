@@ -10,6 +10,7 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 import Anthropic from "@anthropic-ai/sdk";
 import Memory from "greymemory";
+import { buildCodingExtractorPrompt } from "./prompt.mjs";
 
 const _cache = new Map(); // container -> Memory
 
@@ -103,6 +104,7 @@ export async function getMemory({ cwd, container, dataDir }) {
     extractor: makeExtractor(),
     embedder: await makeEmbedder(),
     extractionMode: "round", // per-round provenance suits code sessions
+    extractorPrompt: buildCodingExtractorPrompt, // plugin's own coding extractor prompt (lib/prompt.mjs)
     entityContext:
       "Memory for a software engineer's Claude Code sessions. " +
       "Capture decisions, preferences, bugs and fixes, file paths, and architecture choices.",

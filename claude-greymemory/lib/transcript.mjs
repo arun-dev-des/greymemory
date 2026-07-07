@@ -130,11 +130,18 @@ function summarizeToolUse(name, input, resultText, isError) {
  *        assistant turn as a compact, tool-aware one-liner (see summarizeToolUse). Default []
  *        (drop all tool turns - conversational mode). Set e.g. ["Edit","Write","Bash","Task"]
  *        for coding-agent capture.
+ * @param {string[]} [opts.skipTools]  tool names to NEVER capture, even if in captureTools.
+ * @param {string[]} [opts.signalKeywords]  if non-empty, only rounds whose text contains one of
+ *        these keywords are kept (selective capture). Default [] = keep every round.
  * @returns {{role:'user'|'assistant', content:string}[]}  strictly alternating, ready for add()
  */
 export function entriesToMessages(entries, opts = {}) {
   const captureSet = new Set(opts.captureTools ?? []);
+  const skipSet    = new Set(opts.skipTools ?? []);
   const captureResults = captureSet.size > 0;
+  // signalKeywords: when non-empty, keep ONLY rounds whose text contains a keyword.
+  const signalKw   = (opts.signalKeywords ?? []).map((k) => String(k).toLowerCase()).filter(Boolean);
+  const hasSignal  = (text) => { const s = text.toLowerCase(); return signalKw.some((k) => s.includes(k)); };
 
   // 1. keep only conversation rows, preserve file order
   const conv = (entries ?? []).filter(
@@ -181,7 +188,7 @@ export function entriesToMessages(entries, opts = {}) {
         for (const b of blocksOf(r.message)) {
           if (b?.type !== "tool_result") continue;
           const use = idToUse.get(b.tool_use_id) ?? { name: "tool", input: {} };
-          if (!captureSet.has(use.name)) continue; // skip non-allowlisted tools
+          if (!captureSet.has(use.name) || skipSet.has(use.name)) continue; // not allowlisted, or denied by skipTools
           lines.push(summarizeToolUse(use.name, use.input, toolResultText(b), b.is_error === true));
         }
         logical.push({ role: "tool_result", text: lines.join("\n") });
@@ -211,6 +218,7 @@ export function entriesToMessages(entries, opts = {}) {
     pendingUser = null;
     answer = [];
     if (!u) return; // every prompt fragment was injected/empty -> drop the round
+    if (signalKw.length && !hasSignal(`${u}\n${a}`)) return; // selective capture: no signal keyword -> drop round
     messages.push({ role: "user", content: u });
     if (a) messages.push({ role: "assistant", content: a }); // omit if turn-in-progress
   };

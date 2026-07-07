@@ -1,4 +1,4 @@
-# greymemory-cc
+# claude-greymemory
 
 A Claude Code plugin that gives Claude **persistent, self-hosted memory** across sessions,
 backed by the local [greymemory](https://github.com/arun-dev-des/greymemory) library — no
@@ -35,15 +35,15 @@ All paths read/write the same DB: `${CLAUDE_PLUGIN_DATA}/<container>/greymemory.
 ## Install
 
 ```bash
-cd greymemory-cc
+cd claude-greymemory
 npm install            # links the local greymemory lib via "file:.."
 ```
 
 Then, in Claude Code:
 
 ```
-/plugin marketplace add <path-or-repo-to greymemory-cc>
-/plugin install greymemory-cc@greymemory-plugins
+/plugin marketplace add greymemoryai/claude-greymemory
+/plugin install claude-greymemory
 ```
 
 ## Configuration (env)
@@ -59,6 +59,8 @@ Then, in Claude Code:
 | `GREYMEMORY_EXTRACTOR_MODEL` | no | `claude-haiku-4-5-20251001` | Anthropic model for extraction |
 | `GREYMEMORY_CONTAINER` | no | derived from git | Force a container tag |
 | `GREYMEMORY_CAPTURE_TOOLS` | no | — | Coding-agent capture: comma-separated tools whose calls to fold in, e.g. `Edit,Write,Bash,Task`. `off`/`none` disables. See below. |
+| `GREYMEMORY_SKIP_TOOLS` | no | — | Tools to NEVER capture, even if in captureTools (denylist), e.g. `Read,Glob,Grep`. |
+| `GREYMEMORY_SIGNAL_KEYWORDS` | no | — | If set, capture ONLY rounds containing one of these words (selective capture), e.g. `remember,decision,bug,fix`. |
 | `GREYMEMORY_MAX_CONTEXT_MEMORIES` | no | `8` | Memories searched + injected per prompt. |
 | `GREYMEMORY_MAX_PROFILE_ITEMS` | no | `0` | Profile lines injected at SessionStart; `0` = all. |
 
@@ -76,6 +78,8 @@ allowlist them via **`captureTools`** — either the `GREYMEMORY_CAPTURE_TOOLS` 
 ```json
 {
   "captureTools": ["Edit", "Write", "Bash", "Task"],
+  "skipTools": ["Read", "Glob", "Grep"],
+  "signalKeywords": ["remember", "decision", "bug", "fix"],
   "maxContextMemories": 8,
   "maxProfileItems": 0
 }
@@ -92,6 +96,11 @@ assistant text as a compact, tool-aware one-liner:
 | `Bash` | `Ran: <command> (SUCCESS/FAILED)` |
 | `Task` | `Spawned agent: <description>` |
 | other | `[tool result name=<tool> ok\|error] <result…>` |
+
+**Refinements (both opt-in, default off):** `skipTools` is a denylist subtracted from `captureTools` —
+a tool in both is never captured. `signalKeywords`, when set, makes capture *selective*: only rounds
+whose text contains one of the words are stored; everything else is dropped. Empty (default) captures
+every round.
 
 **Retrieval caps:** `maxContextMemories` (default 8) bounds how many memories are searched and
 injected per prompt; `maxProfileItems` (default 0 = all) caps the profile injected at
@@ -140,7 +149,7 @@ npm run test:integration   # Tier 2 — drives the real hook scripts + MCP serve
   contract, DB writes, conversational + opt-in tool capture, retrieval injection, MCP tools, and dedup with no API
   key and no Ollama. Needs `npm install` first (better-sqlite3 + greymemory).
 - **Tier 3 — live in Claude Code:** install the plugin
-  (`/plugin marketplace add <path-to greymemory-cc>` → `/plugin install greymemory-cc@greymemory-plugins`)
+  (`/plugin marketplace add greymemoryai/claude-greymemory` → `/plugin install claude-greymemory`)
   with `ANTHROPIC_API_KEY` + Ollama, have a conversation, then check the DB grew, run
   `/grey-search`, and confirm SessionStart injection on a new session. `claude --debug` shows
   hooks firing.

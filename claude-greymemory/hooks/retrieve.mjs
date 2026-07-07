@@ -62,7 +62,7 @@ try {
     },
   });
 } catch (err) {
-  process.stderr.write(`[greymemory-cc] retrieve failed: ${err?.message}\n`);
+  process.stderr.write(`[claude-greymemory] retrieve failed: ${err?.message}\n`);
   writeOutput({ continue: true }); // never block the prompt
 }
 

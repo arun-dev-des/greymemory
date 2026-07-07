@@ -20,8 +20,8 @@ try {
 
   // captureTools is user opt-in (settings.json / GREYMEMORY_CAPTURE_TOOLS); default [] keeps
   // capture conversational (tool plumbing dropped). See lib/config.mjs.
-  const { captureTools } = loadConfig(dataDir);
-  const messages = entriesToMessages(entries, { captureTools });
+  const { captureTools, skipTools, signalKeywords } = loadConfig(dataDir);
+  const messages = entriesToMessages(entries, { captureTools, skipTools, signalKeywords });
   if (messages.length > 0) {
     const container = resolveContainer(cwd, dataDir);
     const memory = await getMemory({ cwd, container, dataDir });
@@ -32,7 +32,7 @@ try {
 
   advanceCursor(session_id, lastUuid, dataDir);
 } catch (err) {
-  process.stderr.write(`[greymemory-cc] capture-worker failed: ${err?.message}\n`);
+  process.stderr.write(`[claude-greymemory] capture-worker failed: ${err?.message}\n`);
 }
 
 process.exit(0);
