@@ -11,6 +11,7 @@ import { makeDerivesGraph } from '../data/taxonomy-derives.js'
 import { makeTimeTravelGraph } from '../data/time-travel.js'
 import { makeRetrievalGraph, HIGHLIGHT_STAGES } from '../data/retrieval.js'
 import { makePipelineGraph, PIPELINE_PATCHES } from '../data/pipeline.js'
+import { API_BASE } from '../../viz/lib/api.js'
 import heroGraphJson from '../data/hero-graph.json'
 import './variant-b.css'
 
@@ -733,8 +734,8 @@ function LiveVizFold() {
     if (!load) return
     let done = false
     const ctrl = new AbortController()
-    const t = setTimeout(() => ctrl.abort(), 4000)
-    fetch(`${import.meta.env.BASE_URL}api/viz/datasets`, { signal: ctrl.signal })
+    const t = setTimeout(() => ctrl.abort(), 5000)
+    fetch(`${API_BASE}/api/viz/datasets`, { signal: ctrl.signal })
       .then(r => (r.ok ? r.json() : Promise.reject()))
       .then(d => { if (!done) setApiOk(Array.isArray(d?.datasets) && d.datasets.length > 0) })
       .catch(() => { if (!done) setApiOk(false) })

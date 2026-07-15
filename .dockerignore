@@ -1,0 +1,19 @@
+# Keep the backend build context small. The Dockerfile only needs src/,
+# greymemory-console/server/ (incl. demo-data/greymemory.db), and the root
+# package manifests. NOTE: do not exclude *.db — the slim demo DB must ship.
+node_modules
+**/node_modules
+.git
+.github
+benchmark
+greymemory-console/client
+greymemory-viz
+greymemory-lite
+test files
+example
+bin
+assets
+*.log
+.env
+.env.*
+.vercel

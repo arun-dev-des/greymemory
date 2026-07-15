@@ -1,7 +1,13 @@
 // api.js — fetch wrapper. Every endpoint takes dataset+container.
+//
+// API_BASE lets the statically-hosted client (Vercel) talk to a separately
+// hosted backend (Railway). Empty in dev (same-origin, Vite proxy) and when
+// the server serves the client itself; set VITE_API_BASE at build time to a
+// backend origin, e.g. https://greymemory-console.up.railway.app
+export const API_BASE = (import.meta.env.VITE_API_BASE ?? '').replace(/\/$/, '')
 
 async function get(path) {
-  const r = await fetch(path)
+  const r = await fetch(API_BASE + path)
   if (!r.ok) {
     let msg = `${path} → ${r.status}`
     try { const data = await r.json(); if (data?.error) msg = data.error } catch {}
@@ -11,7 +17,7 @@ async function get(path) {
 }
 
 async function post(path, body) {
-  const r = await fetch(path, {
+  const r = await fetch(API_BASE + path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),

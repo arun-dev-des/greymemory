@@ -14,6 +14,7 @@ import express from 'express'
 import cors    from 'cors'
 import dotenv  from 'dotenv'
 import path    from 'path'
+import rateLimit from 'express-rate-limit'
 import { fileURLToPath } from 'url'
 
 import { createVizRouter }  from './viz/routes.js'
@@ -60,8 +61,20 @@ console.log(`[greymemory-console] diag ROOT_DIR=${ROOT_DIR}`)
 console.log(`[greymemory-console] diag RESULTS_DIR=${RESULTS_DIR}`)
 
 const app = express()
+app.set('trust proxy', 1)   // behind Railway's proxy — needed for correct per-IP limiting
 app.use(cors())
 app.use(express.json({ limit: '4mb' }))   // diag's 4mb (superset of viz's 1mb)
+
+// Live search embeds each query with the LLM/embedder API, so it costs money on
+// a public deploy. Cap it per IP to keep the demo cheap and abuse-resistant.
+const searchLimiter = rateLimit({
+  windowMs: 5 * 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'rate limit reached — please slow down (40 searches / 5 min).' },
+})
+app.use('/api/viz/search', searchLimiter)
 
 app.use('/api/viz',  createVizRouter({ GREYMEMORY_ROOT, memoryModulePath }))
 app.use('/api/diag', createDiagRouter({ ROOT_DIR, RESULTS_DIR }))
