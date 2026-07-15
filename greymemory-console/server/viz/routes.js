@@ -42,7 +42,10 @@ function loadLmeQuestions() {
 export function createVizRouter({ GREYMEMORY_ROOT, memoryModulePath }) {
   const router = express.Router()
 
-  const liveSearchAvailable = !!memoryModulePath && !!process.env.OPENAI_API_KEY
+  // Either embedder key works — buildEmbedder picks by the DB's vector dim
+  // (voyage-3 = 1024, openai = 1536). The demo DB is voyage-3, so VOYAGE alone
+  // must enable live search.
+  const liveSearchAvailable = !!memoryModulePath && (!!process.env.OPENAI_API_KEY || !!process.env.VOYAGE_API_KEY)
 
   // ── Helper: resolve dataset+container from query string ───────────────────
   function resolveContext(req, res) {
