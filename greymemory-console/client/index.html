@@ -3,13 +3,144 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>greymemory · console</title>
+    <title>greymemory — self-hosted memory engine for AI agents</title>
+    <meta name="description" content="greymemory is a self-hosted memory layer for AI agents: it extracts atomic memories from conversations, detects contradictions, supersedes stale facts while keeping history, and serves the current truth through hybrid search — all on SQLite, with any LLM you bring. Scores 80.0% on LongMemEval (vs a funded cloud startup's 83.4%)." />
+    <meta name="author" content="Arunkumar Alagarsamy" />
+
+    <!-- Open Graph / social + link-preview cards -->
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="greymemory — self-hosted memory engine for AI agents" />
+    <meta property="og:description" content="A live, interactive knowledge-graph console over a real LongMemEval ingestion. Memory that knows when facts change: extraction, contradiction detection, supersession, hybrid retrieval, time-travel — self-hosted on SQLite. 80.0% on LongMemEval." />
+    <meta property="og:url" content="https://greymemory-arun-dev-des-projects.vercel.app/" />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="greymemory — self-hosted memory engine for AI agents" />
+    <meta name="twitter:description" content="Live interactive knowledge-graph console over a real LongMemEval ingestion. 80.0% on LongMemEval, self-hosted on SQLite, bring-your-own-LLM." />
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
+
+    <!-- Critical inline styles for the pre-hydration content (replaced by the
+         React app on load). Keeps the first paint on-brand instead of a white
+         flash, and — importantly — means agents/crawlers that don't run
+         JavaScript still receive the full page content below. -->
+    <style>
+      html, body { margin: 0; background: #100e14; color: #ece5da; }
+      #root { min-height: 100vh; }
+      .pre { max-width: 820px; margin: 0 auto; padding: 56px 24px 80px;
+             font-family: 'JetBrains Mono', ui-monospace, Menlo, monospace;
+             font-size: 14px; line-height: 1.7; color: rgba(236,229,218,.72); }
+      .pre h1 { font-family: 'Instrument Serif', Georgia, serif; font-weight: 400;
+                font-size: 40px; line-height: 1.1; color: #ece5da; margin: 0 0 6px; }
+      .pre h2 { font-family: 'Instrument Serif', Georgia, serif; font-weight: 400;
+                font-size: 24px; color: #ece5da; margin: 40px 0 10px; }
+      .pre .tag { color: #e0502e; letter-spacing: .04em; }
+      .pre em { color: #e0502e; font-style: italic; }
+      .pre strong { color: #ece5da; font-weight: 500; }
+      .pre a { color: #e0502e; }
+      .pre ul { padding-left: 20px; }
+      .pre table { border-collapse: collapse; width: 100%; margin: 12px 0; font-size: 13px; }
+      .pre th, .pre td { text-align: left; padding: 6px 12px 6px 0; border-bottom: 1px solid rgba(236,229,218,.14); }
+      .pre th { color: rgba(236,229,218,.5); font-weight: 400; }
+      .pre .loading { color: rgba(236,229,218,.4); font-size: 12px; margin-top: 40px; }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- ── Server-readable content ────────────────────────────────────────
+           This is the real pitch in plain HTML so any reader — human, crawler,
+           or an AI evaluation agent that fetches the page without executing
+           JavaScript — gets the complete story. The interactive React app
+           (a live force-directed knowledge-graph console) mounts here and
+           replaces this block in a JavaScript-capable browser. -->
+      <main class="pre">
+        <p class="tag">GREYMEMORY · SELF-HOSTED MEMORY FOR AI AGENTS</p>
+        <h1>Memory that knows when facts <em>change</em>.</h1>
+        <p>
+          <strong>greymemory</strong> is a self-hosted memory layer for AI agents. It extracts
+          <strong>atomic memories</strong> from conversations, detects <strong>contradictions</strong>,
+          supersedes stale facts while keeping their full history, and serves the current truth through
+          <strong>hybrid BM25 + vector search</strong> — all on <strong>SQLite</strong>, with any LLM and
+          embedder you bring. No cloud dependency, no API lock-in, no data leaving your server.
+        </p>
+        <p>
+          This page is a <strong>live, interactive knowledge-graph console</strong> rendered over a real
+          <a href="https://arxiv.org/abs/2410.10813">LongMemEval</a> ingestion — 25,000+ extracted memories
+          across 86 users. Open it in a browser to explore the force-directed graph: hover a node to read the
+          memory, click one to light its neighborhood (seed → EXTENDS expansion → supersession chain), and
+          scrub time to see answers change as facts get superseded and expire.
+        </p>
+
+        <h2>The problem, measured</h2>
+        <p>
+          Long-term memory for AI is unsolved. On LongMemEval, GPT-4o scores <strong>91.8%</strong> reading a
+          chat history offline, but ChatGPT's own long-term memory scores <strong>57.7%</strong> on the same
+          questions and Coze scores <strong>33.0%</strong>. Even handing GPT-4o the whole transcript in its
+          context window, it loses a third of its accuracy to surrounding noise: <strong>87.0% → 60.6%</strong>
+          (the "lost in the middle" effect — bigger context windows make it worse, not better). Having the
+          information isn't using it. The paper distills what a memory must actually do into five abilities:
+        </p>
+        <ul>
+          <li><strong>Information Extraction</strong> — recall one specific detail from months of conversation.</li>
+          <li><strong>Multi-Session Reasoning</strong> — synthesize an answer scattered across many sessions.</li>
+          <li><strong>Knowledge Updates</strong> — notice a fact changed and answer with the current one, not both.</li>
+          <li><strong>Temporal Reasoning</strong> — reason about <em>when</em> things happened, not just what.</li>
+          <li><strong>Abstention</strong> — know what it doesn't know, and say so instead of confabulating.</li>
+        </ul>
+
+        <h2>How it works</h2>
+        <p>
+          The LongMemEval paper frames every memory system as an <strong>indexing → retrieval → reading</strong>
+          pipeline with four control points. greymemory implements the paper's recommended optimization at each
+          one — and adds hybrid retrieval the paper's design doesn't have:
+        </p>
+        <ul>
+          <li><strong>CP1 · Value</strong> — round-level chunk granularity (indexing).</li>
+          <li><strong>CP2 · Key</strong> — fact-augmented chunk embeddings, K = V + fact (<strong>+9.4% recall</strong>).</li>
+          <li><strong>CP3 · Query</strong> — LLM-extracted time-aware query expansion (<strong>+6.8–11.3% recall</strong> on temporal).</li>
+          <li><strong>CP4 · Reading</strong> — Chain-of-Note + structured JSON answering (<strong>up to +10 points accuracy</strong>).</li>
+        </ul>
+        <p>
+          Contradictions are resolved at write time: an LLM classifier detects UPDATES / EXTENDS relationships,
+          supersedes stale facts, and keeps full version history for time-travel queries, profiles, and derivations.
+          Three memory types (fact · preference · episode); three edge types (UPDATES · EXTENDS · DERIVES).
+        </p>
+
+        <h2>Benchmark results</h2>
+        <p>Scored on LongMemEval with the paper's official LLM-as-judge, against a funded cloud competitor (Supermemory) and the raw long-context baseline:</p>
+        <table>
+          <thead>
+            <tr><th>Category</th><th>context window (GPT-4o)</th><th>greymemory</th><th>Supermemory (cloud)</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>single-session-user</td><td>81.4%</td><td>93.3%</td><td>97.1%</td></tr>
+            <tr><td>single-session-assistant</td><td>94.6%</td><td>93.3%</td><td>96.4%</td></tr>
+            <tr><td>knowledge-update</td><td>78.2%</td><td>80.0%</td><td>88.5%</td></tr>
+            <tr><td>temporal-reasoning</td><td>45.1%</td><td>73.3%</td><td>76.7%</td></tr>
+            <tr><td>single-session-preference</td><td>20.0%</td><td>66.7%</td><td>70.0%</td></tr>
+            <tr><td>multi-session</td><td>44.3%</td><td>66.7%</td><td>71.4%</td></tr>
+            <tr><td><strong>overall</strong></td><td><strong>60.6%</strong></td><td><strong>80.0%</strong></td><td><strong>83.4%</strong></td></tr>
+          </tbody>
+        </table>
+        <p>
+          96% of a funded cloud startup's accuracy — self-hosted, from SQLite, at <strong>$0.013 per session</strong>
+          of ingestion. The story: on the categories where a memory engine actually matters (preference, temporal,
+          multi-session) greymemory delivers <strong>+47, +28, +22</strong> points of lift over just dumping the
+          history into the context window.
+        </p>
+
+        <h2>Explore &amp; source</h2>
+        <ul>
+          <li><strong>Live interactive graph</strong> — this page (open in a browser); the console is embedded near the bottom, or open it directly at the <code>#/viz</code> route.</li>
+          <li><strong>Source</strong> — <a href="https://github.com/arun-dev-des/greymemory">github.com/arun-dev-des/greymemory</a></li>
+        </ul>
+        <p style="color: rgba(236,229,218,.5); font-size: 12px; margin-top: 32px;">
+          ESM · Node 18+ · better-sqlite3 · React + Vite · react-force-graph · provider-agnostic by design.
+          Built for the Razorpay AI Builders challenge — proof of work over a résumé.
+        </p>
+        <p class="loading">Loading the interactive console…</p>
+      </main>
+    </div>
     <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>
