@@ -1,0 +1,13 @@
+# Only greymemory-console/client is built (see vercel.json). Everything else is
+# irrelevant to the static frontend and just slows the upload.
+# NOTE: leading slash = repo-root only, so we don't also exclude the client's
+# own src/ (an unanchored "src" would match greymemory-console/client/src too).
+/benchmark
+/test files
+/greymemory-viz
+/greymemory-lite
+/example
+/src
+/bin
+/greymemory-console/server
+*.db
