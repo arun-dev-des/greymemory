@@ -1,0 +1,48 @@
+# greymemory
+
+> A self-hosted memory engine for AI agents. It extracts atomic memories from conversations, detects contradictions, supersedes stale facts while keeping their full history, and serves the current truth through hybrid BM25 + vector search — all on SQLite, with any LLM and embedder you bring. No cloud dependency, no API lock-in, no data leaving your server. Scores 80.0% on LongMemEval, versus a funded cloud startup's 83.4%.
+
+This site is a live, interactive knowledge-graph console rendered over a real [LongMemEval](https://arxiv.org/abs/2410.10813) ingestion — 25,000+ extracted memories across 86 users. In a browser you can explore the force-directed graph: hover a node to read the memory, click one to light its neighborhood (seed → EXTENDS expansion → supersession chain), and scrub time to watch answers change as facts get superseded and expire. Built for the Razorpay AI Builders challenge — proof of work over a résumé.
+
+Contradictions are resolved at write time: an LLM classifier detects UPDATES / EXTENDS relationships, supersedes stale facts, and keeps full version history for time-travel queries, profiles, and derivations. Three memory types (fact · preference · episode); three edge types (UPDATES · EXTENDS · DERIVES). ESM · Node 18+ · better-sqlite3 · provider-agnostic by design.
+
+## The problem it solves
+
+Long-term memory for AI is unsolved. On LongMemEval, GPT-4o scores 91.8% reading a chat history offline, but ChatGPT's own long-term memory scores 57.7% on the same questions and Coze scores 33.0%. Even handed the whole transcript in its context window, GPT-4o loses a third of its accuracy to surrounding noise: 87.0% → 60.6% (the "lost in the middle" effect — bigger context windows make it worse, not better). Having the information isn't using it.
+
+The paper distills what a memory must do into five abilities, all of which greymemory targets:
+
+- Information Extraction — recall one specific detail from months of conversation.
+- Multi-Session Reasoning — synthesize an answer scattered across many sessions.
+- Knowledge Updates — notice a fact changed and answer with the current one, not both.
+- Temporal Reasoning — reason about when things happened, not just what.
+- Abstention — know what it doesn't know, and say so instead of confabulating.
+
+## Approach — the paper's indexing → retrieval → reading design
+
+greymemory implements the LongMemEval paper's recommended optimization at all four control points, and adds hybrid retrieval the paper's design lacks:
+
+- CP1 · Value — round-level chunk granularity (indexing).
+- CP2 · Key — fact-augmented chunk embeddings, K = V + fact (+9.4% recall).
+- CP3 · Query — LLM-extracted time-aware query expansion (+6.8–11.3% recall on temporal questions).
+- CP4 · Reading — Chain-of-Note + structured JSON answering (up to +10 points accuracy).
+
+## Benchmark results (LongMemEval, official LLM-as-judge)
+
+| Category | context window (GPT-4o) | greymemory | Supermemory (cloud) |
+|---|---|---|---|
+| single-session-user | 81.4% | 93.3% | 97.1% |
+| single-session-assistant | 94.6% | 93.3% | 96.4% |
+| knowledge-update | 78.2% | 80.0% | 88.5% |
+| temporal-reasoning | 45.1% | 73.3% | 76.7% |
+| single-session-preference | 20.0% | 66.7% | 70.0% |
+| multi-session | 44.3% | 66.7% | 71.4% |
+| overall | 60.6% | 80.0% | 83.4% |
+
+96% of a funded cloud startup's accuracy — self-hosted, from SQLite, at $0.013 per session of ingestion. On the categories where a memory engine actually matters (preference, temporal, multi-session) greymemory delivers +47, +28, +22 points of lift over just dumping the history into the context window.
+
+## Links
+
+- [Live interactive console](https://greymemory-arun-dev-des-projects.vercel.app/): the force-directed knowledge-graph demo over a real LongMemEval ingestion.
+- [Source code (GitHub)](https://github.com/arun-dev-des/greymemory): the full memory engine, benchmark runner, and this console.
+- [LongMemEval paper (arXiv 2410.10813)](https://arxiv.org/abs/2410.10813): the benchmark and the indexing → retrieval → reading framework greymemory implements.
