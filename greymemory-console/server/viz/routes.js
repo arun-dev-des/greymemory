@@ -14,8 +14,30 @@
 // memoryModulePath) is done once in the console entry and injected here.
 
 import express from 'express'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
 import { buildGraph, buildStats, getMemoryDetail } from './graph.js'
 import { listDatasets, openDataset, listContainers, getSearchFn } from './datasets.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// Slim LongMemEval index (question_id → question/answer/type), generated from
+// benchmark/data/longmemeval_s_cleaned.json. In the benchmark DBs a container
+// IS the question_id, so this lets a chip show that container's real question.
+// Loaded once, lazily; absent file just means no per-container questions.
+let LME_QUESTIONS = null
+function loadLmeQuestions() {
+  if (LME_QUESTIONS !== null) return LME_QUESTIONS
+  try {
+    const raw = fs.readFileSync(path.join(__dirname, 'longmemeval-questions.json'), 'utf8')
+    const arr = JSON.parse(raw)
+    LME_QUESTIONS = new Map(arr.map(q => [q.question_id, q]))
+  } catch {
+    LME_QUESTIONS = new Map()   // benchmark data not shipped — feature just no-ops
+  }
+  return LME_QUESTIONS
+}
 
 export function createVizRouter({ GREYMEMORY_ROOT, memoryModulePath }) {
   const router = express.Router()
@@ -123,6 +145,16 @@ export function createVizRouter({ GREYMEMORY_ROOT, memoryModulePath }) {
       console.error('[viz/search]', err)
       res.status(500).json({ error: err.message })
     }
+  })
+
+  // ── LongMemEval question for a container ────────────────────────────────────
+  // In benchmark DBs the container is the LongMemEval question_id, so this
+  // returns that container's own gold question + expected answer. Returns
+  // { question: null } for scenario containers with no mapping.
+  router.get('/question/:container', (req, res) => {
+    const q = loadLmeQuestions().get(req.params.container)
+    if (!q) return res.json({ container: req.params.container, question: null })
+    res.json({ container: req.params.container, ...q })
   })
 
   // ── Health ─────────────────────────────────────────────────────────────────

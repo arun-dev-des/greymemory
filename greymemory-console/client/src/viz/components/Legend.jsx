@@ -11,28 +11,23 @@ export function Legend({ stats, mode }) {
     <div className="legend">
       <div className="legend-head">
         <span className="serif">legend</span>
+        {stats && (
+          <span className="legend-stats">
+            {stats.totalMemories} memories · {stats.totalDocuments} docs · {stats.totalConnections} links
+          </span>
+        )}
       </div>
-
-      <Section title="statistics">
-        {stats ? (
-          <>
-            <Row icon={<Dot color={COLOR.fact} />} text={`${stats.totalMemories} memories`} />
-            <Row icon={<DocIcon />} text={`${stats.totalDocuments} documents`} />
-            <Row icon={<Dot color={COLOR.UPDATES} />} text={`${stats.totalConnections} connections`} />
-          </>
-        ) : <span className="faint">—</span>}
-      </Section>
 
       <Section title="nodes">
         <Row icon={<Dot color={COLOR.fact} />}       text="fact" />
         <Row icon={<Dot color={COLOR.preference} />} text="preference" />
         <Row icon={<Dot color={COLOR.episode} />}    text="episode" />
-        <Row icon={<Square color={COLOR.chunk} />}   text="chunk (raw source)" />
+        <Row icon={<Square color={COLOR.chunk} />}   text="raw chunk" />
       </Section>
 
       <Section title="status">
-        <Row icon={<Cross />}                          text="forgotten / expired" />
-        <Row icon={<Dot color={COLOR.dimmed} faint />} text="superseded (older)" />
+        <Row icon={<Cross />}                          text="expired" />
+        <Row icon={<Dot color={COLOR.dimmed} faint />} text="superseded" />
         <Row icon={<Dot color={COLOR.fact} />}         text="latest" />
       </Section>
 
@@ -40,7 +35,7 @@ export function Legend({ stats, mode }) {
         <Row icon={<Line color={COLOR.UPDATES} dashed />} text="updates" />
         <Row icon={<Line color={COLOR.EXTENDS} />}        text="extends" />
         <Row icon={<Line color={COLOR.DERIVES} />}        text="derives" />
-        <Row icon={<Line color={COLOR.SOURCE} />}         text="source chunk" />
+        <Row icon={<Line color={COLOR.SOURCE} />}         text="source" />
       </Section>
 
       {mode === 'debug' && (
@@ -55,38 +50,63 @@ export function Legend({ stats, mode }) {
         .legend {
           position: absolute;
           right: 16px;
-          bottom: 16px;
-          width: 240px;
-          max-height: calc(100vh - 32px);
+          top: 70px;
+          bottom: auto;
+          width: 264px;
+          /* compact: two columns of short-labelled swatches keep it tiny */
+          max-height: min(40vh, calc(100% - 86px));
           overflow-y: auto;
-          padding: 14px 16px;
-          background: var(--bg-panel);
-          backdrop-filter: blur(10px);
+          padding: 10px 13px;
+          background: var(--bg-elevated);
           border: 1px solid var(--border);
           border-radius: var(--radius-lg);
+          box-shadow: 0 10px 34px rgba(0, 0, 0, 0.5);
           z-index: 9;
         }
         .legend-head {
-          font-size: 16px;
-          margin-bottom: 12px;
-          padding-bottom: 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 3px;
+          font-size: 13px;
+          margin-bottom: 7px;
+          padding-bottom: 7px;
           border-bottom: 1px solid var(--border-soft);
         }
-        .legend-section + .legend-section { margin-top: 14px; }
+        .legend-stats {
+          font-family: var(--font-mono, ui-monospace, monospace);
+          font-size: 10px;
+          letter-spacing: 0.02em;
+          color: var(--text-faint);
+          white-space: nowrap;
+        }
+        .legend-section {
+          display: grid;
+          grid-template-columns: 1fr 1fr;
+          grid-auto-rows: 22px;   /* compact, uniform rows without overlap */
+          column-gap: 14px;
+          row-gap: 0;
+          align-content: start;
+        }
+        .legend-section-title { align-self: end; }
+        .legend-section + .legend-section { margin-top: 6px; }
         .legend-section-title {
+          grid-column: 1 / -1;
           font-size: 9px;
           letter-spacing: 0.18em;
           text-transform: uppercase;
           color: var(--text-faint);
-          margin-bottom: 6px;
+          margin-bottom: 2px;
         }
         .legend-row {
           display: flex;
           align-items: center;
           gap: 8px;
+          height: 18px;
           font-size: 11px;
+          line-height: 1;
           color: var(--text-dim);
-          padding: 2px 0;
+          padding: 0;
+          white-space: nowrap;
         }
       `}</style>
     </div>

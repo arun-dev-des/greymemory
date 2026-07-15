@@ -19,6 +19,12 @@ import { TimeScrubber } from './components/TimeScrubber.jsx'
 import { SearchBar } from './components/SearchBar.jsx'
 import { RetrievalReport } from './components/RetrievalReport.jsx'
 
+// When mounted inside the landing page's live-graph fold (via an iframe with
+// ?embed=1), a few standalone-only affordances are suppressed.
+const isEmbedded =
+  typeof window !== 'undefined' &&
+  new URLSearchParams(window.location.search).get('embed') === '1'
+
 export function VizSurface() {
   const [mode, setMode] = useState('explore')
 
@@ -47,14 +53,16 @@ export function VizSurface() {
         setDatasets(data.datasets ?? [])
         setLiveSearchAvailable(!!data.liveSearchAvailable)
 
-        // Auto-select the first dataset and its first container so the
-        // user lands on a working view, not an empty one.
+        // Auto-select the first dataset and a container so the user lands on a
+        // working view. Prefer the FEATURED container (the strong "engineers
+        // 4→5" supersession showcase) when present, else the first non-empty.
+        const FEATURED_CONTAINER = '031748ae'
         const firstDataset = data.datasets?.[0]
         if (firstDataset) {
           setSelectedDataset(firstDataset.id)
-          // Prefer the first container with non-zero facts, fall back to first
           const firstContainer =
-            firstDataset.containers?.find(c => c.factCount > 0)
+            firstDataset.containers?.find(c => c.id === FEATURED_CONTAINER && c.factCount > 0)
+            ?? firstDataset.containers?.find(c => c.factCount > 0)
             ?? firstDataset.containers?.[0]
           if (firstContainer) setSelectedContainer(firstContainer.id)
         }
@@ -138,15 +146,17 @@ export function VizSurface() {
   }, [mode, retrieval])
 
   // ── Search handler ───────────────────────────────────────────────────────
-  const runSearch = useCallback(async (query) => {
-    if (!query?.trim() || !selectedDataset || !selectedContainer) {
+  // `container` can be passed explicitly (e.g. right after a chip switches
+  // context) so we don't depend on the async selectedContainer state update.
+  const runSearch = useCallback(async (query, container = selectedContainer) => {
+    if (!query?.trim() || !selectedDataset || !container) {
       setRetrieval(null)
       return
     }
     try {
       const data = await api.search({
         dataset: selectedDataset,
-        container: selectedContainer,
+        container,
         query,
         topN: 8,
         expandViaGraph: true,
@@ -173,6 +183,27 @@ export function VizSurface() {
     }
   }, [selectedDataset, selectedContainer, graph.nodes])
 
+  // ── Suggested question for the current container ──────────────────────────
+  // In benchmark DBs the container IS a LongMemEval question_id, so we offer
+  // that container's own gold question as a clickable chip — always relevant to
+  // what's loaded, and it searches the same container so it always lands.
+  // Scenario containers have no mapping, so no chip shows.
+  const [containerQuestion, setContainerQuestion] = useState(null)
+  useEffect(() => {
+    setContainerQuestion(null)
+    if (!selectedContainer) return
+    let cancelled = false
+    api.question(selectedContainer)
+      .then(q => { if (!cancelled) setContainerQuestion(q?.question ? q : null) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [selectedContainer])
+
+  const suggestions = useMemo(() => {
+    if (!containerQuestion?.question) return []
+    return [{ label: containerQuestion.question, query: containerQuestion.question }]
+  }, [containerQuestion])
+
   // ── Render ───────────────────────────────────────────────────────────────
   return (
     <>
@@ -191,6 +222,7 @@ export function VizSurface() {
 
       <SearchBar
         onSearch={runSearch}
+        suggestions={suggestions}
         disabled={!liveSearchAvailable || !selectedDataset || !selectedContainer}
         active={mode === 'debug'}
       />
@@ -233,6 +265,29 @@ export function VizSurface() {
           onClose={() => setSelected(null)}
         />
       )}
+
+      {/* Hidden when embedded as a fold (?embed=1) so the iframe can't
+          navigate itself back to the landing page. */}
+      {!isEmbedded && <a href="#/" className="viz-about-link">← what is this?</a>}
+      <style>{`
+        .viz-about-link {
+          position: absolute;
+          bottom: 14px;
+          left: 16px;
+          z-index: 10;
+          font-size: 11px;
+          letter-spacing: 0.5px;
+          color: rgba(200, 210, 220, 0.45);
+          text-decoration: none;
+          padding: 6px 10px;
+          border: 1px solid rgba(255, 255, 255, 0.08);
+          border-radius: 7px;
+          background: rgba(16, 20, 26, 0.7);
+          backdrop-filter: blur(8px);
+          transition: color 160ms, border-color 160ms;
+        }
+        .viz-about-link:hover { color: #5fd1e0; border-color: #5fd1e0; }
+      `}</style>
 
       {datasetError && (
         <div className="dataset-error panel">

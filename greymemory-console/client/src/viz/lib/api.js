@@ -43,6 +43,11 @@ export const api = {
   memory: ({ dataset, id }) =>
     get(`/api/viz/memory/${id}?${qs({ dataset })}`),
 
+  // The LongMemEval question whose id equals this container (benchmark DBs).
+  // Returns { question: null } when there's no mapping (e.g. scenario DBs).
+  question: (container) =>
+    get(`/api/viz/question/${encodeURIComponent(container)}`),
+
   search: ({ dataset, container, query, topN = 8, expandViaGraph = true }) =>
     post('/api/viz/search', { dataset, container, query, topN, expandViaGraph }),
 }

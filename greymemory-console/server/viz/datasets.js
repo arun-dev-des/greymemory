@@ -139,12 +139,75 @@ function naturalCompare(a, b) {
  * The Memory class is dynamically imported once per process and reused;
  * only the per-pair Memory *instance* is cached.
  */
+// Read one stored embedding and return its dimension, so we can match the query
+// embedder to whatever wrote the DB. Vectors are stored as JSON text (number[])
+// or a Float32 blob. Falls back to chunk_embeddings, then null.
+function probeStoredDim(db) {
+  const dimOf = (v) => {
+    if (v == null) return null
+    if (Buffer.isBuffer(v)) return v.length / 4
+    try { const a = JSON.parse(v); return Array.isArray(a) ? a.length : null } catch { return null }
+  }
+  for (const table of ['embeddings', 'chunk_embeddings']) {
+    try {
+      const row = db.prepare(`SELECT vector FROM ${table} WHERE vector IS NOT NULL LIMIT 1`).get()
+      const d = dimOf(row?.vector)
+      if (d) return d
+    } catch { /* table may not exist */ }
+  }
+  return null
+}
+
+// Build a query embedder for the given stored dimension. 1024 → voyage-3,
+// 1536 → OpenAI. Returns null if the matching provider key is missing.
+function buildEmbedder(storedDim) {
+  if (storedDim === 1024 && process.env.VOYAGE_API_KEY) {
+    const model = process.env.VOYAGE_MODEL ?? 'voyage-3'
+    return async (text) => {
+      const resp = await fetch('https://api.voyageai.com/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.VOYAGE_API_KEY}`,
+        },
+        body: JSON.stringify({ model, input: text }),
+      })
+      if (!resp.ok) throw new Error(`voyage embedding api ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
+      const data = await resp.json()
+      return data.data[0].embedding
+    }
+  }
+
+  // Default / 1536: OpenAI. Request an explicit dimension when the DB isn't the
+  // model's native 1536, so text-embedding-3-* returns a matching-length vector.
+  if (process.env.OPENAI_API_KEY) {
+    const model = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small'
+    return async (text) => {
+      const body = { model, input: text }
+      if (storedDim && storedDim !== 1536) body.dimensions = storedDim
+      const resp = await fetch('https://api.openai.com/v1/embeddings', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify(body),
+      })
+      if (!resp.ok) throw new Error(`embedding api ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
+      const data = await resp.json()
+      return data.data[0].embedding
+    }
+  }
+
+  return null
+}
+
 export async function getSearchFn({ db, dataset, container, memoryModulePath }) {
   const cacheKey = `${dataset.absPath}::${container}`
   if (memoryCache.has(cacheKey)) return memoryCache.get(cacheKey)
 
-  const hasOpenAIKey = !!process.env.OPENAI_API_KEY
-  if (!hasOpenAIKey) return null
+  // Need at least one embedding provider key; buildEmbedder picks by stored dim.
+  if (!process.env.OPENAI_API_KEY && !process.env.VOYAGE_API_KEY) return null
 
   if (!memoryModulePath) return null
 
@@ -158,20 +221,15 @@ export async function getSearchFn({ db, dataset, container, memoryModulePath }) 
     return null
   }
 
-  const embeddingModel = process.env.EMBEDDING_MODEL ?? 'text-embedding-3-small'
-
-  const embedder = async (text) => {
-    const resp = await fetch('https://api.openai.com/v1/embeddings', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({ model: embeddingModel, input: text }),
-    })
-    if (!resp.ok) throw new Error(`embedding api ${resp.status}: ${(await resp.text()).slice(0, 200)}`)
-    const data = await resp.json()
-    return data.data[0].embedding
+  // The query embedder MUST match the model that wrote this DB — cosine over
+  // mismatched dimensions silently returns 0, and the library refuses outright.
+  // We probe one stored vector's dimension and pick the provider accordingly:
+  //   1024 → voyage-3 (the benchmark embedder), 1536 → OpenAI text-embedding-3-*.
+  const storedDim = probeStoredDim(db)
+  const embedder = buildEmbedder(storedDim)
+  if (!embedder) {
+    console.warn(`[datasets] no embedder for ${storedDim}-dim vectors in ${dataset.id} — search disabled`)
+    return null
   }
 
   // Stub extractor — search() never invokes it

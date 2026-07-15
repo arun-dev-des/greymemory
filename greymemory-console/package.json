@@ -8,7 +8,8 @@
     "dev": "concurrently -n server,client -c blue,green \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
     "build": "npm --prefix client run build",
     "start": "npm --prefix server run start",
-    "install:all": "npm --prefix server install && npm --prefix client install"
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "export:hero": "node server/scripts/export-hero-graph.mjs"
   },
   "devDependencies": {
     "concurrently": "^9.0.0"

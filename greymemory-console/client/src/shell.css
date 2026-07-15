@@ -86,10 +86,12 @@ body {
 }
 
 .surface-viz,
-.surface-diag {
+.surface-diag,
+.surface-story {
   position: absolute;
   inset: 0;
 }
 
-.surface-viz  { overflow: hidden; }  /* viz fills its area with a fixed canvas */
-.surface-diag { overflow: auto;   }  /* diag scrolls its tabular content      */
+.surface-viz   { overflow: hidden; }  /* viz fills its area with a fixed canvas */
+.surface-diag  { overflow: auto;   }  /* diag scrolls its tabular content      */
+.surface-story { overflow-y: auto; }  /* story is a long scrolling page        */
