@@ -46,13 +46,16 @@
     </style>
   </head>
   <body>
-    <div id="root">
-      <!-- ── Server-readable content ────────────────────────────────────────
-           This is the real pitch in plain HTML so any reader — human, crawler,
-           or an AI evaluation agent that fetches the page without executing
-           JavaScript — gets the complete story. The interactive React app
-           (a live force-directed knowledge-graph console) mounts here and
-           replaces this block in a JavaScript-capable browser. -->
+    <div id="root"></div>
+
+    <!-- ── Server-readable content (outside #root) ──────────────────────────
+         The real pitch in plain HTML so ANY reader — human, crawler, or an AI
+         evaluation agent that fetches the page without executing JavaScript —
+         gets the complete story. Kept OUTSIDE the React mount (#root) so even
+         readability extractors that skip SPA root divs still pick it up.
+         main.jsx removes this block on mount, so JS browsers see only the
+         interactive force-directed knowledge-graph console. -->
+    <div id="seo">
       <main class="pre">
         <p class="tag">GREYMEMORY · SELF-HOSTED MEMORY FOR AI AGENTS</p>
         <h1>Memory that knows when facts <em>change</em>.</h1>
