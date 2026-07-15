@@ -11,6 +11,7 @@ import { makeDerivesGraph } from '../data/taxonomy-derives.js'
 import { makeTimeTravelGraph } from '../data/time-travel.js'
 import { makeRetrievalGraph, HIGHLIGHT_STAGES } from '../data/retrieval.js'
 import { makePipelineGraph, PIPELINE_PATCHES } from '../data/pipeline.js'
+import heroGraphJson from '../data/hero-graph.json'
 import './variant-b.css'
 
 /* ── shared editorial furniture ──────────────────────────────────────────── */
@@ -710,8 +711,8 @@ function BenchSection() {
 /* ── § 07 · the live graph, embedded as a fold ───────────────────────────── */
 
 function LiveVizFold() {
-  // Lazy-mount the console iframe when the fold nears the viewport, so the
-  // landing page's initial load never pays for a second app + WebGL canvas.
+  // Lazy-mount when the fold nears the viewport, so the landing page's initial
+  // load never pays for a second app + graph up front.
   const ref = useRef(null)
   const [load, setLoad] = useState(false)
   useEffect(() => {
@@ -724,9 +725,48 @@ function LiveVizFold() {
     return () => io.disconnect()
   }, [])
 
-  // Same-origin: load index.html at the viz route; ?embed=1 tells VizSurface
-  // to suppress its standalone back-link.
+  // Probe for the console backend. On a static host (e.g. Vercel) there's no
+  // Express API + SQLite, so instead of a dead iframe we fall back to a real
+  // client-side interactive graph over the exported data.
+  const [apiOk, setApiOk] = useState(null) // null=checking, true=live, false=static
+  useEffect(() => {
+    if (!load) return
+    let done = false
+    const ctrl = new AbortController()
+    const t = setTimeout(() => ctrl.abort(), 4000)
+    fetch(`${import.meta.env.BASE_URL}api/viz/datasets`, { signal: ctrl.signal })
+      .then(r => (r.ok ? r.json() : Promise.reject()))
+      .then(d => { if (!done) setApiOk(Array.isArray(d?.datasets) && d.datasets.length > 0) })
+      .catch(() => { if (!done) setApiOk(false) })
+      .finally(() => clearTimeout(t))
+    return () => { done = true; ctrl.abort(); clearTimeout(t) }
+  }, [load])
+
   const src = `${import.meta.env.BASE_URL}?embed=1#/viz`
+
+  // Client-side fallback graph (real interaction: drag · hover · click-to-light)
+  const [fallbackData] = useState(() => ({
+    nodes: heroGraphJson.nodes.map(n => ({ ...n })),
+    links: heroGraphJson.links.map(l => ({ ...l })),
+  }))
+  const [adjacency] = useState(() => {
+    const adj = new Map()
+    for (const l of heroGraphJson.links) {
+      if (!adj.has(l.source)) adj.set(l.source, [])
+      if (!adj.has(l.target)) adj.set(l.target, [])
+      adj.get(l.source).push({ id: l.target, relation: l.relation })
+      adj.get(l.target).push({ id: l.source, relation: l.relation })
+    }
+    return adj
+  })
+  const [highlights, setHighlights] = useState(null)
+  const lightNeighborhood = (node) => {
+    const m = new Map([[node.id, { kind: 'seed' }]])
+    for (const nb of adjacency.get(node.id) ?? []) {
+      m.set(nb.id, { kind: nb.relation === 'UPDATES' ? 'history' : 'expanded' })
+    }
+    setHighlights(m)
+  }
 
   return (
     <section className="vb-section vb-liveviz" id="live" ref={ref}>
@@ -734,9 +774,8 @@ function LiveVizFold() {
         <div className="vb-kicker"><span className="vb-secno">§ 07</span>the door · play with it</div>
         <h2 className="vb-h2">Now read the <em>real</em> graph.</h2>
         <p className="vb-body">
-          Not a diagram — the live console, embedded right here, over a full LongMemEval ingestion
-          (25,000+ memories, 86 users). Click the suggested question; watch retrieval light the seeds,
-          the EXTENDS expansion, and the supersession chain. Every color means what it did above.
+          Not a diagram — a real LongMemEval memory graph. Hover a node to read the memory, click one
+          to light its neighborhood, drag to explore. Every color means what it did above.
         </p>
         <div className="vb-legend">
           <span className="vb-key"><span className="sw" style={{ background: '#e8eef5' }} />fact</span>
@@ -750,10 +789,33 @@ function LiveVizFold() {
       </div>
 
       <div className="vb-liveviz-frame" id="live-graph">
-        {load
-          ? <iframe className="vb-liveviz-iframe" src={src} title="greymemory — live memory graph" loading="lazy" />
-          : <div className="vb-liveviz-poster">loading the live console…</div>}
-        <a className="vb-liveviz-full" href="#/viz" target="_blank" rel="noreferrer">open full screen ↗</a>
+        {!load || apiOk === null ? (
+          <div className="vb-liveviz-poster">loading the graph…</div>
+        ) : apiOk ? (
+          <>
+            <iframe className="vb-liveviz-iframe" src={src} title="greymemory — live memory graph" loading="lazy" />
+            <a className="vb-liveviz-full" href="#/viz" target="_blank" rel="noreferrer">open full screen ↗</a>
+          </>
+        ) : (
+          <div className="vb-liveviz-static">
+            <EmbeddedGraph
+              nodes={fallbackData.nodes}
+              links={fallbackData.links}
+              height="100%"
+              drift
+              fit="always"
+              fitPadding={50}
+              showTooltip
+              highlights={highlights}
+              onNodeClick={lightNeighborhood}
+              onBackgroundClick={() => setHighlights(null)}
+            />
+            <div className="vb-liveviz-cap">
+              interactive graph · full live LLM search runs against the console backend —{' '}
+              <a href="https://github.com/arun-dev-des/greymemory" target="_blank" rel="noreferrer">run it locally ↗</a>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   )

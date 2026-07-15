@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "npm --prefix greymemory-console/client install",
+  "buildCommand": "npm --prefix greymemory-console/client run build",
+  "outputDirectory": "greymemory-console/client/dist",
+  "framework": null
+}
