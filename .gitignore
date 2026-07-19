@@ -24,3 +24,6 @@ test-v3-*.js
 # greymemory-lite artifacts
 .greymemory-lite*/
 greymemory-lite/package-lock.json
+.vercel
+greymemory-console/server/demo-data/*.db-shm
+greymemory-console/server/demo-data/*.db-wal

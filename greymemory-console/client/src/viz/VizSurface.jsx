@@ -16,7 +16,7 @@ import { Header } from './components/Header.jsx'
 import { Legend } from './components/Legend.jsx'
 import { InspectPanel } from './components/InspectPanel.jsx'
 import { TimeScrubber } from './components/TimeScrubber.jsx'
-import { SearchBar } from './components/SearchBar.jsx'
+import { TryPanel } from './components/TryPanel.jsx'
 import { RetrievalReport } from './components/RetrievalReport.jsx'
 
 // When mounted inside the landing page's live-graph fold (via an iframe with
@@ -199,11 +199,6 @@ export function VizSurface() {
     return () => { cancelled = true }
   }, [selectedContainer])
 
-  const suggestions = useMemo(() => {
-    if (!containerQuestion?.question) return []
-    return [{ label: containerQuestion.question, query: containerQuestion.question }]
-  }, [containerQuestion])
-
   // ── Render ───────────────────────────────────────────────────────────────
   return (
     <>
@@ -220,9 +215,12 @@ export function VizSurface() {
         loading={loading}
       />
 
-      <SearchBar
-        onSearch={runSearch}
-        suggestions={suggestions}
+      {/* No free-text search on the public surface — one curated, clickable
+          question per container (the container's own LongMemEval question). */}
+      <TryPanel
+        key={selectedContainer}
+        question={containerQuestion?.question ?? null}
+        onRun={runSearch}
         disabled={!liveSearchAvailable || !selectedDataset || !selectedContainer}
         active={mode === 'debug'}
       />

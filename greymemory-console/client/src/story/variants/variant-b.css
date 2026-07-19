@@ -93,34 +93,54 @@
   text-wrap: balance;
 }
 
-/* the rotating "[icon] Name" — its own centered line, in the accent */
-.var-b .vb-agent-line {
-  display: block;
-  margin-top: 8px;
-  min-height: 1.12em;
-  font-family: var(--serif);
-  font-size: clamp(38px, 6vw, 74px);
-  font-weight: 360;
-  font-variation-settings: 'opsz' 144;
-  line-height: 1.06;
-  letter-spacing: -0.01em;
-  color: var(--vermillion);
+.var-b .vb-hero-h1 em { font-style: italic; color: var(--vermillion); }
+
+/* The rotating "[icon] Name", set inline in the dek. Only the active name is in
+ * the DOM; nowrap + justify-items:start keep it at its intrinsic width whatever
+ * the slot is pinned to (in JS), so measuring it isn't circular. The pin is what
+ * animates, so the sentence around it never reflows mid-swap. */
+.var-b .vb-agent-slot {
+  display: inline-grid;
+  justify-items: start;
+  vertical-align: baseline;
+  transition: width 200ms ease-out;
+  /* `clip` not `hidden`: an incoming name overhangs the still-animating width,
+   * and .surface-story's overflow-y:auto computes overflow-x to auto — so an
+   * unclipped overhang flashes a horizontal scrollbar. `clip` isn't a scroll
+   * container, so it also keeps the slot's baseline in the text line, and leaves
+   * overflow-y visible for the rise-in. */
+  overflow-x: clip;
 }
 .var-b .vb-agent {
+  grid-area: 1 / 1;
   display: inline-flex;
   align-items: center;
-  gap: 0.32em;
+  gap: 0.3em;
+  white-space: nowrap;
+  color: var(--vermillion);
   animation: vb-agent-in 0.5s cubic-bezier(0.2, 0.7, 0.3, 1) both;
-}
-.var-b .vb-agent-mark {
-  display: inline-flex;
-  font-size: 0.8em;
-  line-height: 0;
-  transform: translateY(0.02em);
 }
 @keyframes vb-agent-in {
   from { opacity: 0; transform: translateY(0.3em); }
   to   { opacity: 1; transform: none; }
+}
+.var-b .vb-agent-mark {
+  display: inline-flex;
+  font-size: 0.9em;
+  line-height: 0;
+  transform: translateY(0.02em);
+}
+
+.var-b .vb-sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .var-b .vb-hero-dek {
@@ -157,36 +177,33 @@
 .var-b .vb-cta-fill:hover { background: transparent; color: var(--vermillion); }
 .var-b .vb-cta-fill .vb-arrow-i { font-size: 15px; line-height: 0; }
 
+.var-b .vb-cta-ghost {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.85em;
+  background: transparent;
+  color: var(--bone-dim);
+  font-family: var(--mono);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  padding: 15px 22px;
+  border: 1px solid var(--hairline);
+  cursor: pointer;
+  transition: border-color 0.15s, color 0.15s;
+}
+.var-b .vb-cta-ghost:hover { border-color: var(--bone-dim); color: var(--bone); }
+.var-b .vb-cta-cmd::before { content: '$ '; color: var(--bone-faint); }
+.var-b .vb-cta-copy {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--vermillion);
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .var-b .vb-agent-slot { transition: none; }
   .var-b .vb-agent { animation: none; }
 }
-
-/* legacy dek/cta (used by the closing “door” section) */
-.var-b .vb-dek {
-  margin: 34px 0 0;
-  max-width: 34em;
-  font-size: 22px;
-  font-weight: 340;
-  line-height: 1.5;
-  color: var(--bone-dim);
-}
-.var-b .vb-dek em { color: var(--bone); }
-
-.var-b .vb-cta {
-  display: inline-block;
-  margin-top: 34px;
-  font-family: var(--serif);
-  font-style: italic;
-  font-size: 22px;
-  color: var(--bone);
-  text-decoration: none;
-  border-bottom: 1px solid var(--vermillion);
-  padding-bottom: 3px;
-  transition: color 0.2s;
-}
-.var-b .vb-cta:hover { color: var(--vermillion); }
-.var-b .vb-arrow { color: var(--vermillion); font-style: normal; }
-.var-b .vb-cta-big { font-size: 34px; margin-top: 40px; }
 
 /* ── stat band ────────────────────────────────────────────────────────── */
 
@@ -214,12 +231,15 @@
   line-height: 1;
   color: var(--bone);
 }
+/* Sentence case, not micro-caps: these labels carry proper nouns whose casing is
+ * the point (SQLite, LongMemEval, LLM-as-judge). --bone-faint measured 2.5:1 on
+ * --ink — below AA at any size; --bone-dim is 5.2:1. */
 .var-b .vb-stat .l {
   font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--bone-faint);
+  font-size: 12px;
+  letter-spacing: 0.02em;
+  line-height: 1.45;
+  color: var(--bone-dim);
 }
 
 /* ── sections ─────────────────────────────────────────────────────────── */
@@ -349,68 +369,77 @@
 .var-b .vb-replay:disabled { opacity: 0.35; cursor: default; }
 .var-b .vb-tax-plate { position: relative; }
 
-/* ── § 01 · pull-stat ─────────────────────────────────────────────────── */
+/* ── § 01 · the scoreboard: two apps, same scale ──────────────────────── */
 
-.var-b .vb-pull-wrap {
+.var-b .vb-duo-wrap {
   max-width: 1140px;
   margin: 8px auto 64px;
   padding: 0 28px;
-  display: grid;
-  grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr);
-  gap: 56px;
-  align-items: end;
 }
 
-.var-b .vb-pull-big {
+.var-b .vb-duo {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-top: 1px solid var(--hairline);
+  border-bottom: 1px solid var(--hairline);
+}
+.var-b .vb-duo-cell {
+  padding: 34px 24px 38px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 16px;
+}
+.var-b .vb-duo-cell + .vb-duo-cell { border-left: 1px solid var(--hairline); }
+
+.var-b .vb-duo-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--bone-dim);
+}
+.var-b .vb-duo-brand .vb-brandmark { margin-right: 0; font-size: 17px; vertical-align: 0; }
+
+.var-b .vb-duo-num {
   font-family: var(--serif);
-  font-size: clamp(120px, 17vw, 210px);
-  font-weight: 300;
+  font-size: clamp(52px, 6.5vw, 80px);
+  font-weight: 500;
   font-variation-settings: 'opsz' 144;
-  line-height: 0.9;
+  line-height: 0.95;
   letter-spacing: -0.03em;
   color: var(--vermillion);
 }
 .var-b .vb-pull-pct { font-size: 0.45em; font-weight: 340; }
-.var-b .vb-pull-cap {
-  margin-top: 18px;
+
+.var-b .vb-duo-cap {
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 12px;
   letter-spacing: 0.06em;
-  color: var(--bone-dim);
+  color: var(--bone-faint);
 }
 
-.var-b .vb-pull-side { display: flex; flex-direction: column; }
-.var-b .vb-side-stat {
-  border-top: 1px solid var(--hairline);
-  padding: 14px 0 18px;
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-.var-b .vb-side-stat .n {
-  font-family: var(--serif);
-  font-size: 44px;
-  font-weight: 330;
-  line-height: 1;
-  color: var(--bone);
-}
-.var-b .vb-side-stat .l {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
-  color: var(--bone-faint);
+.var-b .vb-duo-note {
+  margin: 24px auto 0;
   max-width: 30em;
-}
-.var-b .vb-side-note {
-  border-top: 1px solid var(--hairline);
-  padding-top: 16px;
-  margin: 0;
+  text-align: center;
   font-family: var(--serif);
   font-style: italic;
   font-size: 22px;
   line-height: 1.4;
   color: var(--bone);
+}
+
+.var-b .vb-brandmark {
+  display: inline-flex;
+  margin-right: 8px;
+  font-size: 15px;
+  vertical-align: -0.2em;
+  color: var(--bone-dim);
 }
 
 /* ── § 01 · ability index ─────────────────────────────────────────────── */
@@ -424,7 +453,7 @@
   border: none;
   width: 100%;
   display: grid;
-  grid-template-columns: 64px 1fr auto 24px;
+  grid-template-columns: 64px 1fr 24px;
   align-items: baseline;
   gap: 16px;
   padding: 16px 0;
@@ -447,11 +476,19 @@
   font-weight: 340;
   line-height: 1.2;
 }
-.var-b .vb-ab-abbr {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.2em;
-  color: var(--bone-faint);
+.var-b .vb-ab-title {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+.var-b .vb-ab-desc {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 15px;
+  line-height: 1.4;
+  color: var(--bone-dim);
+  max-width: 34em;
 }
 .var-b .vb-ab-plus {
   font-family: var(--mono);
@@ -461,24 +498,84 @@
 }
 
 .var-b .vb-ab-body {
-  padding: 0 0 20px 80px;
+  padding: 0 0 24px 80px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* the worked example: sessions as lived → question asked later → the catch */
+.var-b .vb-ab-ex {
+  border-left: 2px solid var(--hairline);
+  padding: 4px 0 4px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.var-b .vb-ab-sess {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  max-width: 46em;
+}
+.var-b .vb-ab-sdate {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+.var-b .vb-ab-sdate.asked { color: var(--vermillion); }
+.var-b .vb-ab-gap {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--bone-faint);
 }
 .var-b .vb-ab-q {
+  margin: 0;
   font-family: var(--serif);
   font-style: italic;
   font-size: 22px;
   line-height: 1.35;
   color: var(--bone);
 }
-.var-b .vb-ab-mech {
+.var-b .vb-ab-a {
+  margin: 0;
+  font-family: var(--serif);
+  font-size: 20px;
+  line-height: 1.35;
+  color: var(--bone);
+}
+.var-b .vb-ab-qa {
+  display: inline-block;
+  min-width: 74px;
   font-family: var(--mono);
-  font-size: 12px;
-  letter-spacing: 0.08em;
+  font-style: normal;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--bone-faint);
+  vertical-align: 0.25em;
+}
+.var-b .vb-ab-a .vb-ab-qa { color: var(--vermillion); }
+.var-b .vb-ab-why {
+  margin: 0;
+  max-width: 46em;
+  font-family: var(--serif);
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--bone-dim);
+}
+.var-b .vb-ab-why .lbl {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
   color: var(--vermillion);
 }
+.var-b .vb-ab-bridge { margin-top: 30px; }
 
 /* ── § 02 · pipeline ──────────────────────────────────────────────────── */
 
@@ -574,33 +671,107 @@
 }
 .var-b .vb-answer .a.stale { color: #ff6b8a; }
 
-.var-b .vb-slider {
-  -webkit-appearance: none;
-  appearance: none;
-  width: 100%;
-  height: 22px;
-  margin: 8px 0 4px;
-  background: transparent;
-  cursor: pointer;
+/* the timeline scrubber: month ruler + event dots + playhead. All positions
+   are % of the Jan→Oct span; the invisible range input owns interaction. */
+.var-b .vb-tl {
+  position: relative;
+  height: 74px;
+  margin: 14px 0 2px;
 }
-.var-b .vb-slider::-webkit-slider-runnable-track {
+.var-b .vb-tl-line {
+  position: absolute;
+  left: 0; right: 0; top: 35px;
   height: 1px;
   background: var(--hairline);
 }
-.var-b .vb-slider::-webkit-slider-thumb {
-  -webkit-appearance: none;
-  width: 15px;
-  height: 15px;
+.var-b .vb-tl-fill {
+  position: absolute;
+  left: 0; top: 35px;
+  height: 1px;
+  background: var(--vermillion);
+  opacity: 0.7;
+  transition: width 0.18s ease-out;
+}
+.var-b .vb-tl-mtick {
+  position: absolute;
+  top: 31px;
+  width: 1px;
+  height: 9px;
+  background: var(--hairline);
+}
+.var-b .vb-tl-event {
+  position: absolute;
+  top: 35px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  border: 1.5px solid var(--c);
+  background: transparent;
+  transition: background 0.2s;
+}
+.var-b .vb-tl-event.lit { background: var(--c); }
+.var-b .vb-tl-head {
+  position: absolute;
+  top: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: translateX(-50%);
+  pointer-events: none;
+  transition: left 0.18s ease-out;
+  z-index: 1;
+}
+.var-b .vb-tl-asof {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--vermillion);
+  white-space: nowrap;
+  margin-bottom: 3px;
+}
+.var-b .vb-tl-head.edge-l .vb-tl-asof { transform: translateX(50%); }
+.var-b .vb-tl-head.edge-r .vb-tl-asof { transform: translateX(-50%); }
+.var-b .vb-tl-stem { width: 1px; height: 9px; background: var(--vermillion); }
+.var-b .vb-tl-dot {
+  width: 7px;
+  height: 7px;
+  margin-top: -1px;
   border-radius: 50%;
   background: var(--vermillion);
+}
+.var-b .vb-tl-input {
+  -webkit-appearance: none;
+  appearance: none;
+  position: absolute;
+  left: 0; top: 20px;
+  width: 100%;
+  height: 30px;
+  margin: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+.var-b .vb-tl:focus-within .vb-tl-asof { text-decoration: underline; text-underline-offset: 3px; }
+.var-b .vb-tl-month {
+  appearance: none;
+  background: transparent;
   border: none;
-  margin-top: -7px;
+  position: absolute;
+  top: 50px;
+  transform: translateX(-50%);
+  padding: 2px 4px;
+  cursor: pointer;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  transition: color 0.15s;
 }
-.var-b .vb-slider::-moz-range-track { height: 1px; background: var(--hairline); }
-.var-b .vb-slider::-moz-range-thumb {
-  width: 15px; height: 15px; border-radius: 50%;
-  background: var(--vermillion); border: none;
-}
+.var-b .vb-tl-month:hover { color: var(--bone); }
+.var-b .vb-tl-month.past { color: var(--bone-dim); }
+.var-b .vb-tl-month.cur { color: var(--vermillion); }
 
 .var-b .vb-time-row {
   display: flex;
@@ -609,14 +780,20 @@
   gap: 20px;
   flex-wrap: wrap;
 }
-.var-b .vb-asof {
+
+/* mechanism line: how asOf works, in the plate's data voice */
+.var-b .vb-time-mech {
+  margin: 18px 0 0;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+  max-width: 62em;
   font-family: var(--mono);
   font-size: 12px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--vermillion);
-  white-space: nowrap;
+  line-height: 1.75;
+  letter-spacing: 0.02em;
+  color: var(--bone-dim);
 }
+.var-b .vb-time-mech .hl { color: var(--vermillion); }
 .var-b .vb-ticks { display: flex; gap: 18px; flex-wrap: wrap; }
 .var-b .vb-tick {
   display: inline-flex;
@@ -743,36 +920,9 @@
 .var-b .vb-bench th.base, .var-b .vb-bench td.base { color: var(--bone-faint); }
 .var-b .vb-bench td.base { font-size: 17px; }
 .var-b .vb-bench tr.total td.base { color: var(--bone-faint); }
+.var-b .vb-bench th.drop, .var-b .vb-bench td.drop { color: var(--vermillion); }
 
-/* ── indirect-evidence exhibit (§01) ─────────────────────────────────────── */
-.var-b .vb-evidence {
-  margin: 34px 0 40px;
-  border-top: 1px solid var(--hairline);
-  border-bottom: 1px solid var(--hairline);
-  padding: 18px 0 22px;
-}
-.var-b .vb-ev-head {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 16px;
-  flex-wrap: wrap;
-  margin-bottom: 16px;
-}
-.var-b .vb-ev-label {
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--vermillion);
-}
-.var-b .vb-ev-toggle { display: flex; gap: 4px; }
-.var-b .vb-ev-convo {
-  display: flex;
-  flex-direction: column;
-  gap: 10px;
-  max-width: 46em;
-}
+/* ── conversation lines (§01 ability exhibits) ───────────────────────────── */
 .var-b .vb-ev-line {
   margin: 0;
   font-family: var(--serif);
@@ -792,31 +942,20 @@
   vertical-align: 0.15em;
 }
 .var-b .vb-ev-line.user .vb-ev-who { color: var(--vermillion); }
-.var-b .vb-ev-note {
-  margin: 18px 0 0;
-  max-width: 46em;
-  font-family: var(--serif);
-  font-size: 15px;
-  line-height: 1.6;
-  color: var(--bone-dim);
-}
-.var-b .vb-ev-note em { color: var(--bone); font-style: italic; }
-.var-b .vb-ev-note b { color: var(--vermillion); font-weight: 400; }
 
 /* ── live-graph fold (§07): the real console, embedded ───────────────────── */
 .var-b .vb-liveviz-frame {
   position: relative;
   width: 100%;
-  margin: 36px 0 0;         /* full-bleed, edge to edge */
+  margin: 36px 0 0;
+  padding: 0 48px;          /* near full-bleed — just a 48px breathing gutter */
 }
 .var-b .vb-liveviz-iframe,
 .var-b .vb-liveviz-poster {
   display: block;
   width: 100%;
   height: min(90vh, 960px);
-  border: none;
-  border-top: 1px solid var(--hairline);
-  border-bottom: 1px solid var(--hairline);
+  border: 1px solid var(--hairline);
   background: #06080b;      /* viz ground, so the frame reads dark while loading */
 }
 .var-b .vb-liveviz-poster {
@@ -832,7 +971,7 @@
 .var-b .vb-liveviz-full {
   position: absolute;
   bottom: 20px;
-  right: 18px;
+  right: 64px;    /* 48px frame gutter + 16px inset from the iframe edge */
   z-index: 3;
   font-family: var(--mono);
   font-size: 11px;
@@ -852,8 +991,7 @@
   position: relative;
   width: 100%;
   height: min(90vh, 960px);
-  border-top: 1px solid var(--hairline);
-  border-bottom: 1px solid var(--hairline);
+  border: 1px solid var(--hairline);
   background: #06080b;
 }
 .var-b .vb-liveviz-static .embedded-graph {
@@ -924,7 +1062,24 @@
   color: var(--bone-dim);
   text-align: left;
   transition: color 0.15s;
+  position: relative;
 }
+
+/* auto-cycle dwell indicator: a hairline that fills the active row's bottom
+   edge over the step duration (duration + color set inline per row) */
+.var-b .vb-sc-load {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  transform: scaleX(0);
+  transform-origin: left;
+  animation-name: vb-sc-load-fill;
+  animation-timing-function: linear;
+  animation-fill-mode: forwards;
+}
+@keyframes vb-sc-load-fill { to { transform: scaleX(1); } }
 .var-b .vb-sc-row:last-child { border-bottom: 1px solid var(--hairline); }
 .var-b .vb-sc-row:hover { color: var(--bone); }
 .var-b .vb-sc-row.active { color: var(--bone); border-top-color: var(--bone-dim); }
@@ -1039,17 +1194,21 @@
 /* ── responsive ───────────────────────────────────────────────────────── */
 
 @media (max-width: 900px) {
-  .var-b .vb-pull-wrap { grid-template-columns: 1fr; gap: 30px; }
   .var-b .vb-statband { grid-template-columns: 1fr 1fr; row-gap: 26px; }
   .var-b .vb-stat:nth-child(3) { border-left: none; padding-left: 0; }
 }
 
 @media (max-width: 620px) {
   .var-b .vb-h2 { font-size: 36px; }
+  .var-b .vb-duo { grid-template-columns: 1fr; }
+  .var-b .vb-duo-cell + .vb-duo-cell { border-left: none; border-top: 1px solid var(--hairline); }
   .var-b .vb-ab-head { grid-template-columns: 44px 1fr 24px; }
-  .var-b .vb-ab-abbr { display: none; }
-  .var-b .vb-ab-body { padding-left: 60px; }
+  .var-b .vb-ab-body { padding-left: 0; }
+  .var-b .vb-ab-ex { padding-left: 14px; }
   .var-b .vb-answers { grid-template-columns: 1fr; }
+  .var-b .vb-tl-month.alt { display: none; }
+  .var-b .vb-liveviz-frame { padding: 0 20px; }
+  .var-b .vb-liveviz-full { right: 36px; }
   .var-b .vb-statband { grid-template-columns: 1fr; }
   .var-b .vb-stat { border-left: none; padding-left: 0; }
   .var-b .vb-masthead .vb-mast-mid { display: none; }

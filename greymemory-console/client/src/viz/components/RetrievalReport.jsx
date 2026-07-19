@@ -91,7 +91,9 @@ const style = (
       left: 16px;
       bottom: 16px;
       width: 380px;
-      max-height: calc(100vh - 200px);
+      /* stay clear of the TryPanel above (top 70px + ~200px tall) — the panel
+         must never cover the report head / "seeds" heading */
+      max-height: calc(100vh - 300px);
       overflow-y: auto;
       padding: 14px 16px;
       background: var(--bg-panel);

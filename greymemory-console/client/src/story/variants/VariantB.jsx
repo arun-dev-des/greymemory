@@ -2,7 +2,7 @@
 // Serif-led (Fraunces), museum-plate exhibits with numbered figure captions,
 // hairline rules, one vermillion accent. Copy is cut to captions + pull-stats;
 // the live graphs carry the story.
-import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
+import { useState, useMemo, useCallback, useRef, useEffect, useLayoutEffect } from 'react'
 import { EmbeddedGraph } from '../EmbeddedGraph.jsx'
 import { useGraphReveal, useInView } from '../useGraphReveal.js'
 import { makeUpdatesGraph } from '../data/taxonomy-updates.js'
@@ -64,31 +64,101 @@ function AgentMark({ kind }) {
     return <svg {...p}><path d="M9.5 3C5.5 6 5.5 18 9.5 21" /><path d="M14.5 3c4 3 4 15 0 18" /></svg>
   if (kind === 'hermes')
     return <svg {...p}><path d="M4 15.5c6-5 12-5.2 16-3.3" /><path d="M7 18.4c4-3 8-3.3 12-1.6" /></svg>
+  if (kind === 'custom')
+    return <svg {...p}><circle cx="12" cy="12" r="8.6" strokeDasharray="2.4 3.1" /><path d="M12 8.7v6.6M8.7 12h6.6" /></svg>
   return <svg {...p}><polyline points="6 8 11 12 6 16" /><line x1="13" y1="16.4" x2="18" y2="16.4" /></svg>
 }
 
+// Casing verified against each project's own branding (July 2026): OpenCode and
+// OpenClaw are camel-cased by their maintainers; lowercase `opencode` is only
+// the CLI binary / npm package, not the prose name.
 const AGENTS = [
-  { name: 'Claude', mark: 'claude' },
-  { name: 'Openclaw', mark: 'claw' },
+  { name: 'Claude Code', mark: 'claude' },
+  { name: 'OpenCode', mark: 'code' },
   { name: 'Hermes', mark: 'hermes' },
-  { name: 'Opencode', mark: 'code' },
+  { name: 'OpenClaw', mark: 'claw' },
+  { name: 'your own', mark: 'custom' },
 ]
+const ROTATE_MS = 1600 // dwell per name, inclusive of the 0.5s rise-in
 
-function RotatingAgent() {
-  const [i, setI] = useState(0)
+function usePrefersReducedMotion() {
+  const q = '(prefers-reduced-motion: reduce)'
+  const [reduce, setReduce] = useState(() => window.matchMedia?.(q).matches ?? false)
   useEffect(() => {
-    const t = setInterval(() => setI(x => (x + 1) % AGENTS.length), 2200)
-    return () => clearInterval(t)
+    const mq = window.matchMedia?.(q)
+    if (!mq) return
+    const on = e => setReduce(e.matches)
+    mq.addEventListener('change', on)
+    return () => mq.removeEventListener('change', on)
   }, [])
-  const a = AGENTS[i]
+  return reduce
+}
+
+// Cycles the list indefinitely; each name rises in as the previous one is
+// replaced.
+function RotatingAgent() {
+  const reduce = usePrefersReducedMotion()
+  const [i, setI] = useState(0)
+  const slotRef = useRef(null)
+  const [w, setW] = useState(null)
+
+  const idx = reduce ? 0 : i
+
+  useEffect(() => {
+    if (reduce) return
+    const t = setInterval(() => setI(x => (x + 1) % AGENTS.length), ROTATE_MS)
+    return () => clearInterval(t)
+  }, [reduce])
+
+  // Pin the slot to the active name's width so the sentence wrapped around it
+  // never reflows on swap. The name is nowrap and justify-self:start, so it keeps
+  // its intrinsic width whatever the slot is pinned to — measuring it isn't
+  // circular, and translateY on the rise-in doesn't perturb the measured width.
+  // Re-measure once the webfont lands; Fraunces metrics differ from the fallback.
+  const measure = useCallback(() => {
+    const on = slotRef.current?.querySelector('.vb-agent')
+    if (on) setW(on.getBoundingClientRect().width)
+  }, [])
+  useLayoutEffect(() => { measure() }, [idx, measure])
+  useEffect(() => { document.fonts?.ready.then(measure) }, [measure])
+
+  const a = AGENTS[idx]
   return (
-    <span className="vb-agent-line" aria-live="polite">
-      {/* key remounts the span each tick so the enter animation re-fires */}
-      <span className="vb-agent" key={i}>
+    <span className="vb-agent-slot" ref={slotRef} style={w ? { width: `${w}px` } : undefined}>
+      {/* One static string for AT — a live region would announce every tick. */}
+      <span className="vb-sr-only">Claude Code, OpenCode, or your own</span>
+      {/* key remounts the span each tick so the rise-in animation re-fires */}
+      <span key={idx} aria-hidden="true" className="vb-agent">
         <span className="vb-agent-mark"><AgentMark kind={a.mark} /></span>
         {a.name}
       </span>
     </span>
+  )
+}
+
+const INSTALL_CMD = 'npm install greymemory'
+
+function CopyInstall() {
+  const [copied, setCopied] = useState(false)
+  const timer = useRef(null)
+  useEffect(() => () => clearTimeout(timer.current), [])
+
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(INSTALL_CMD)
+    } catch {
+      return // clipboard denied or insecure origin — leave the label truthful
+    }
+    setCopied(true)
+    clearTimeout(timer.current)
+    timer.current = setTimeout(() => setCopied(false), 1600)
+  }
+
+  return (
+    <button className="vb-cta-ghost" onClick={copy} aria-label={`Copy "${INSTALL_CMD}" to clipboard`}>
+      <span className="vb-cta-cmd">{INSTALL_CMD}</span>
+      <span className="vb-cta-copy" role="status">{copied ? '✓ copied' : 'copy'}</span>
+    </button>
   )
 }
 
@@ -97,69 +167,170 @@ function Hero() {
     <>
       <header className="vb-masthead">
         <span>greymemory</span>
-        <span className="vb-mast-mid">a field study in machine memory</span>
+        <span className="vb-mast-mid">SELF-HOSTED MEMORY ENGINE</span>
         <span>no. 001</span>
       </header>
 
       <div className="vb-hero-center">
-        <h1 className="vb-hero-h1">
-          Self-hosted context engine<br />for AI agents like
-        </h1>
-        <RotatingAgent />
-        <p className="vb-dek vb-hero-dek">
-          A self-hosted memory layer: atomic memories extracted from conversation,
-          contradictions detected, history kept — served from one SQLite file, with any LLM you bring.
+        <h1 className="vb-hero-h1">Memory that knows when facts <em>change</em>.</h1>
+        <p className="vb-hero-dek">
+          Atomic memories extracted from conversation. Contradictions caught, stale facts
+          superseded — history kept. Served from a single SQLite file to AI agents like{' '}
+          <RotatingAgent />
         </p>
         <div className="vb-hero-ctas">
-          <a className="vb-cta-fill" href="#live" onClick={scrollToLive}>Try the live graph <span className="vb-arrow-i">↓</span></a>
+          <a className="vb-cta-fill" href="#live" onClick={scrollToLive}>Explore the live graph <span className="vb-arrow-i">→</span></a>
+          {/* Secondary CTA parked, not deleted — drop <CopyInstall /> back in here to
+              restore it. CopyInstall + .vb-cta-ghost styles are left intact. */}
         </div>
       </div>
 
       <div className="vb-statband">
-        <div className="vb-stat"><span className="n">80.0%</span><span className="l">LongMemEval overall</span></div>
-        <div className="vb-stat"><span className="n">115k</span><span className="l">tokens per haystack</span></div>
-        <div className="vb-stat"><span className="n">25,000+</span><span className="l">memories in the live demo</span></div>
-        <div className="vb-stat"><span className="n">1 file</span><span className="l">SQLite — no cloud deps</span></div>
+        <div className="vb-stat"><span className="n">80.0%</span><span className="l">LongMemEval overall · official LLM-as-judge</span></div>
+        <div className="vb-stat"><span className="n">$0.013</span><span className="l">per session of ingestion</span></div>
+        <div className="vb-stat"><span className="n">25,000+</span><span className="l">memories on the live graph below</span></div>
+        <div className="vb-stat"><span className="n">1 file</span><span className="l">SQLite. No cloud, no lock-in.</span></div>
       </div>
     </>
   )
 }
 
-/* ── § 01 · the problem: pull-stat + ability index ───────────────────────── */
+/* ── § 01 · the problem: ability index + pull-stat ───────────────────────── */
 
+// LongMemEval's five tested abilities, each as a worked example: the sessions
+// as lived, the question asked weeks later, and why naive storage fails it.
 const ABILITIES = [
-  { n: '01', abbr: 'IE', name: 'Information Extraction',
-    q: '“Where did I initially keep my old sneakers?”', mech: 'hybrid BM25 + vector search' },
-  { n: '02', abbr: 'MR', name: 'Multi-Session Reasoning',
-    q: '“How many Korean restaurants have I tried in my city?”', mech: 'graph expansion via EXTENDS' },
-  { n: '03', abbr: 'KU', name: 'Knowledge Updates',
-    q: '“How many engineers do I lead now?”', mech: 'UPDATES supersession' },
-  { n: '04', abbr: 'TR', name: 'Temporal Reasoning',
-    q: '“How many days passed between my two fishing trips?”', mech: 'event dates + time-aware queries' },
-  { n: '05', abbr: 'ABS', name: 'Abstention',
-    q: '“How many autographed footballs do I own?” — they collect baseballs', mech: 'the hard one — resist confabulating; greymemory handles it only partially' },
+  { n: '01', name: 'Information Extraction',
+    desc: 'recall one specific detail from months of conversation.',
+    sessions: [
+      { date: '2026/03/05 (Thu) 08:12', msgs: [
+        { who: 'user', text: 'Can you help me plan nut-free lunches for the week? Mrs. Alvarez just banned nuts in my daughter’s class and I’m out of ideas.' },
+        { who: 'assistant', text: 'Of course. Here are five nut-free lunches that pack well and survive a backpack: …' },
+      ] },
+    ],
+    gap: '3 months later',
+    asked: '2026/06/15 (Mon)',
+    q: 'Who’s my daughter’s teacher?',
+    a: 'Mrs. Alvarez.',
+    why: 'The name surfaced inside a lunch-planning request, never as “her teacher is Mrs. Alvarez.” Store only explicit statements and it was never kept — so retrieval has nothing to find.' },
+  { n: '02', name: 'Multi-Session Reasoning',
+    desc: 'assemble one answer scattered across many sessions.',
+    sessions: [
+      { date: '2026/02/14 (Sat) 19:40', msgs: [
+        { who: 'user', text: 'Took my partner to that new Korean BBQ place downtown for Valentine’s — the galbi was incredible.' },
+        { who: 'assistant', text: 'Sounds like a great night! Want me to keep a list of your favorite spots?' },
+      ] },
+      { date: '2026/03/17 (Tue) 13:05', msgs: [
+        { who: 'user', text: 'Tried the little Thai spot near the office today. Best pad see ew I’ve had.' },
+        { who: 'assistant', text: 'Nice find. Want me to save it for your next lunch out?' },
+      ] },
+      { date: '2026/05/03 (Sun) 20:25', msgs: [
+        { who: 'user', text: 'We finally went to the Ethiopian restaurant everyone keeps recommending. Eating with injera was so fun.' },
+        { who: 'assistant', text: 'Injera is the best part. Want ideas for what to order next time?' },
+      ] },
+      { date: '2026/06/09 (Tue) 12:30', msgs: [
+        { who: 'user', text: 'Grabbed dinner at the new ramen bar last night — waited 40 minutes but worth it.' },
+        { who: 'assistant', text: 'Worth the wait, then! Want me to note it for date nights?' },
+      ] },
+    ],
+    asked: '2026/06/30 (Tue)',
+    q: 'How many new restaurants have I tried this year?',
+    a: 'Four.',
+    why: 'Four separate sessions about four unrelated dinners — Korean BBQ, Thai, Ethiopian, ramen — joined only by the abstract idea of “a new restaurant I tried.” No single query surfaces all four; the system has to gather them, then count.' },
+  { n: '03', name: 'Knowledge Updates',
+    desc: 'notice a fact changed, and answer with the current one — not both.',
+    sessions: [
+      { date: '2026/01/19 (Mon) 22:10', msgs: [
+        { who: 'user', text: 'Reviewing every PR myself is still manageable with four engineers, but it’s getting tight.' },
+        { who: 'assistant', text: 'Want a few strategies for scaling code review before it becomes the bottleneck?' },
+      ] },
+      { date: '2026/04/27 (Mon) 09:30', msgs: [
+        { who: 'user', text: 'Onboarding is brutal now that we’re six — two backend hires started this morning.' },
+        { who: 'assistant', text: 'Want an onboarding checklist to make the next hires smoother?' },
+      ] },
+    ],
+    asked: '2026/06/15 (Mon)',
+    q: 'How many engineers do I lead now?',
+    a: 'Six — not “four and six.”',
+    why: 'The old number isn’t wrong, it’s stale: ask what the team looked like in January and four is still true. But “now” wants the current one. Without supersession the system keeps both alive and hands you the ambiguity.' },
+  { n: '04', name: 'Temporal Reasoning',
+    desc: 'reason about when things happened, not just what.',
+    sessions: [
+      { date: '2026/02/03 (Tue) 21:47', msgs: [
+        { who: 'user', text: '40 minutes of downtime tonight — worst outage we’ve had. Writing the postmortem now.' },
+        { who: 'assistant', text: 'Rough night. Want a postmortem template — timeline, root cause, action items?' },
+      ] },
+      { date: '2026/05/20 (Wed) 03:12', msgs: [
+        { who: 'user', text: 'Full outage again — the DB failover didn’t fire.' },
+        { who: 'assistant', text: 'Want to walk through the failover config to find why it didn’t trigger?' },
+      ] },
+      { date: '2026/06/10 (Wed) 16:40', msgs: [
+        { who: 'user', text: 'Near-miss today — caught the memory leak before it took prod down.' },
+        { who: 'assistant', text: 'Good catch. Want to add an alert so it’s flagged earlier next time?' },
+      ] },
+    ],
+    asked: '2026/06/18 (Thu)',
+    q: 'How long was it between our last two real outages?',
+    a: 'About 15 weeks.',
+    why: 'That number is written down nowhere — it’s Feb 3 → May 20, computed from two dates the system had to store as the event dates, not the dates they happened to be mentioned. And “real outages” has to rule out the June near-miss.' },
+  { n: '05', name: 'Abstention',
+    desc: 'know what it doesn’t know, and say so instead of confabulating.',
+    sessions: [
+      { date: '2026/06/12 (Fri) 20:15', msgs: [
+        { who: 'user', text: 'My sister’s wedding is eating every weekend this month — I’m maid of honor and the seating chart is chaos.' },
+        { who: 'assistant', text: 'Happy to help — want a hand organizing the seating chart?' },
+      ] },
+    ],
+    asked: '2026/06/20 (Sat)',
+    q: 'What did I think of my brother’s wedding?',
+    a: '“You haven’t mentioned a brother.”',
+    why: 'The system knows about a wedding and a sibling, so the helpful reflex is to answer about the sister’s. Resisting that — and naming the false premise instead of inventing an opinion — is the skill. For most models, a confident wrong answer beats an honest “I don’t know.”' },
 ]
 
+function AbilityExhibit({ a }) {
+  return (
+    <div className="vb-ab-body">
+      <div className="vb-ab-ex">
+        {a.sessions.map(s => (
+          <div key={s.date} className="vb-ab-sess">
+            <div className="vb-ab-sdate">session · {s.date}</div>
+            {s.msgs.map((m, i) => (
+              <p key={i} className={`vb-ev-line ${m.who}`}>
+                <span className="vb-ev-who">{m.who}</span>{m.text}
+              </p>
+            ))}
+          </div>
+        ))}
+        {a.gap && <div className="vb-ab-gap">— {a.gap} —</div>}
+        <div className="vb-ab-sess">
+          <div className="vb-ab-sdate asked">asked · {a.asked}</div>
+          <p className="vb-ab-q"><span className="vb-ab-qa">Q →</span>{a.q}</p>
+          <p className="vb-ab-a"><span className="vb-ab-qa">A →</span>{a.a}</p>
+        </div>
+      </div>
+      <p className="vb-ab-why"><span className="lbl">why it’s hard</span>{a.why}</p>
+    </div>
+  )
+}
+
 function AbilityIndex() {
-  const [open, setOpen] = useState('KU')
+  const [open, setOpen] = useState(null)
   return (
     <div className="vb-abilities">
       {ABILITIES.map(a => {
-        const isOpen = open === a.abbr
+        const isOpen = open === a.n
         return (
-          <div key={a.abbr} className={`vb-ab-row ${isOpen ? 'open' : ''}`}>
-            <button className="vb-ab-head" onClick={() => setOpen(isOpen ? null : a.abbr)}>
+          <div key={a.n} className={`vb-ab-row ${isOpen ? 'open' : ''}`}>
+            <button className="vb-ab-head" aria-expanded={isOpen}
+              onClick={() => setOpen(isOpen ? null : a.n)}>
               <span className="vb-ab-num">{a.n}</span>
-              <span className="vb-ab-name">{a.name}</span>
-              <span className="vb-ab-abbr">{a.abbr}</span>
+              <span className="vb-ab-title">
+                <span className="vb-ab-name">{a.name}</span>
+                <span className="vb-ab-desc">{a.desc}</span>
+              </span>
               <span className="vb-ab-plus">{isOpen ? '−' : '+'}</span>
             </button>
-            {isOpen && (
-              <div className="vb-ab-body">
-                <span className="vb-ab-q">{a.q}</span>
-                <span className="vb-ab-mech">→ {a.mech}</span>
-              </div>
-            )}
+            {isOpen && <AbilityExhibit a={a} />}
           </div>
         )
       })}
@@ -167,85 +338,104 @@ function AbilityIndex() {
   )
 }
 
-// The paper's central difficulty (§3.2): the user LLM is instructed to reveal
-// facts INDIRECTLY. Toggle the same fact between how a benchmark declares it and
-// how a real person buries it — extraction, not retrieval, is the hard part.
-const EVIDENCE = {
-  direct: [
-    { who: 'user', text: 'I bought a new car last month.' },
-    { who: 'assistant', text: 'Congrats! What kind did you get?' },
-    { who: 'user', text: 'A Honda Civic.' },
-  ],
-  indirect: [
-    { who: 'user', text: 'Can you explain the difference between collision and comprehensive coverage? I’m looking at insurance options for my Honda.' },
-    { who: 'assistant', text: 'Sure — collision covers damage to your own car from accidents; comprehensive covers theft, weather, and the rest…' },
-    { who: 'user', text: 'Got it. I just bought it last month, so I’m trying to get the right policy.' },
-  ],
+// Suggestive monoline marks in the same designed set as AgentMark — evocative
+// of each app's icon, not brand-logo reproductions.
+function BrandMark({ kind }) {
+  const p = {
+    width: '1em', height: '1em', viewBox: '0 0 24 24', fill: 'none',
+    stroke: 'currentColor', strokeWidth: 1.8, strokeLinecap: 'round', strokeLinejoin: 'round',
+  }
+  if (kind === 'chatgpt') // segmented knot-ring around a hollow core
+    return (
+      <span className="vb-brandmark">
+        <svg {...p}><circle cx="12" cy="12" r="8.2" strokeDasharray="6.7 1.9" /><path d="M12 9.6l2.1 1.2v2.4L12 14.4l-2.1-1.2v-2.4z" /></svg>
+      </span>
+    )
+  // coze — rounded app tile with two eyes
+  return (
+    <span className="vb-brandmark">
+      <svg {...p}><rect x="4.2" y="5.6" width="15.6" height="12.8" rx="3.6" /><path d="M9.3 10.6v2.4M14.7 10.6v2.4" /></svg>
+    </span>
+  )
 }
 
-function IndirectEvidence() {
-  const [mode, setMode] = useState('indirect')
+// [reader, oracle-context accuracy, full-history accuracy, drop] — the paper's
+// no-Chain-of-Note reading comparison: same reader, same questions, only the
+// context changes.
+const NOISE_ROWS = [
+  ['GPT-4o', '87.0', '60.6', '30.3'],
+  ['Llama 3.1 70B', '74.4', '33.4', '55.1'],
+  ['Llama 3.1 8B', '71.0', '45.4', '36.1'],
+  ['Phi-3 128k 14B', '70.2', '38.0', '45.9'],
+  ['Phi-3.5 Mini 4B', '66.0', '34.2', '48.1'],
+]
+
+function NoiseTable() {
   return (
-    <div className="vb-evidence">
-      <div className="vb-ev-head">
-        <span className="vb-ev-label">the same fact, two ways</span>
-        <span className="vb-ev-toggle">
-          {['direct', 'indirect'].map(k => (
-            <button key={k}
-              className={`vb-step ${mode === k ? 'active' : ''}`}
-              onClick={() => setMode(k)}>{k}</button>
+    <div className="vb-cp-scroll">
+      <table className="vb-bench">
+        <thead>
+          <tr>
+            <th>reader</th>
+            <th className="num">oracle context</th>
+            <th className="num">full history</th>
+            <th className="num drop">drop</th>
+          </tr>
+        </thead>
+        <tbody>
+          {NOISE_ROWS.map(([reader, oracle, full, drop]) => (
+            <tr key={reader}>
+              <td>{reader}</td>
+              <td className="num">{oracle}%</td>
+              <td className="num">{full}%</td>
+              <td className="num drop">−{drop}%</td>
+            </tr>
           ))}
-        </span>
-      </div>
-      <div className="vb-ev-convo">
-        {EVIDENCE[mode].map((m, i) => (
-          <p key={i} className={`vb-ev-line ${m.who}`}>
-            <span className="vb-ev-who">{m.who}</span>{m.text}
-          </p>
-        ))}
-      </div>
-      <p className="vb-ev-note">
-        Both convey <em>“user has a Honda, bought last month.”</em> LongMemEval instructs its
-        simulator to reveal facts the <b>indirect</b> way, because that’s how people actually talk.
-        A system that only extracts explicit “I bought X” statements never records the fact — so
-        retrieval can’t recover it. greymemory’s extractor carries a STATE CHANGE RULE:
-        catch it <em>even when stated casually mid-sentence as an aside.</em>
-      </p>
+        </tbody>
+      </table>
     </div>
   )
 }
 
 function ProblemSection() {
   return (
-    <Section no="01" kicker="the problem, measured · LongMemEval — arXiv 2410.10813">
-      <div className="vb-pull-wrap">
-        <div className="vb-pull">
-          <div className="vb-pull-big">57.7<span className="vb-pull-pct">%</span></div>
-          <div className="vb-pull-cap">ChatGPT long-term memory, scored on LongMemEval.</div>
-        </div>
-        <div className="vb-pull-side">
-          <div className="vb-side-stat">
-            <span className="n">91.8%</span>
-            <span className="l">GPT-4o with the full transcript in context — offline</span>
+    <Section no="01" kicker="the problem, measured · LongMemEval · arXiv 2410.10813">
+      <div className="vb-col">
+        <p className="vb-body">
+          LongMemEval, a comprehensive benchmark of long-term memory in chat assistants, breaks
+          the job into <b>five core abilities</b> and tests them across ~500 hand-built questions.
+          Each entry below is a worked example — open one.
+        </p>
+        <AbilityIndex />
+        <p className="vb-body vb-ab-bridge">
+          That’s the job. Here’s how the systems people actually use score at it.
+        </p>
+      </div>
+
+      <div className="vb-duo-wrap">
+        <div className="vb-duo">
+          <div className="vb-duo-cell">
+            <div className="vb-duo-brand"><BrandMark kind="chatgpt" />ChatGPT-4o</div>
+            <div className="vb-duo-num">60.6 <span className="vb-pull-pct">%</span></div>
+            <div className="vb-duo-cap">long-term memory, scored on LongMemEval</div>
           </div>
-          <div className="vb-side-stat">
-            <span className="n">33.0%</span>
-            <span className="l">Coze long-term memory, same questions</span>
+          <div className="vb-duo-cell">
+            <div className="vb-duo-brand"><BrandMark kind="coze" />LLAMA 3.1 70B</div>
+            <div className="vb-duo-num">33.4 <span className="vb-pull-pct">%</span></div>
+            <div className="vb-duo-cap">long-term memory, same questions</div>
           </div>
-          <p className="vb-side-note">Same questions. The gap is not the model — it is the memory.</p>
         </div>
+        <p className="vb-duo-note">Same questions. The gap is not the model — it is the memory.</p>
       </div>
 
       <div className="vb-col">
         <p className="vb-body">
-          It isn’t only proprietary memory that fails. Hand GPT-4o the whole transcript in its
+          It isn’t only proprietary memory that fails. Hand any LLM the whole transcript in its
           context window — the answer <em>is right there</em> — and it still loses a third of its
-          accuracy to the surrounding noise: <b>87.0% → 60.6%</b>. Bigger context windows make this
+          accuracy to the surrounding noise. Bigger context windows make this
           worse, not better (<em>lost in the middle</em>). Having the information isn’t using it.
         </p>
-        <IndirectEvidence />
-        <p className="vb-body">The paper distills what a memory must actually <em>do</em> into five abilities.</p>
-        <AbilityIndex />
+        <NoiseTable />
       </div>
     </Section>
   )
@@ -255,7 +445,10 @@ function ProblemSection() {
 // Reference format: headline + lede + numbered index in the left column;
 // the selected item's plate on the right with kicker · title · description.
 
-function IndexShowcase({ no, kicker, title, lede, extra, items, active, onSelect, meta, accent = 'var(--vermillion)', children }) {
+// `progress` (optional): { ms, key } — while auto-cycling, the active row grows
+// a hairline that fills over the dwell; the key remount restarts the fill on
+// every advance. Pass null once the reader takes over.
+function IndexShowcase({ no, kicker, title, lede, extra, items, active, onSelect, meta, accent = 'var(--vermillion)', progress = null, children }) {
   return (
     <section className="vb-section vb-showcase-sec">
       <div className="vb-showcase">
@@ -276,6 +469,10 @@ function IndexShowcase({ no, kicker, title, lede, extra, items, active, onSelect
                   <span className="vb-sc-num">{it.num}</span>
                   <span className="vb-sc-name">{it.label}</span>
                   <span className="vb-sc-mark" style={isActive ? { background: color } : undefined} />
+                  {isActive && progress && (
+                    <span key={progress.key} className="vb-sc-load" aria-hidden="true"
+                      style={{ background: color, animationDuration: `${progress.ms}ms` }} />
+                  )}
                 </button>
               )
             })}
@@ -298,12 +495,14 @@ function IndexShowcase({ no, kicker, title, lede, extra, items, active, onSelect
 /* ── § 02 · mechanism: pipeline + CP table ───────────────────────────────── */
 
 const PIPE_STEPS = [
-  { key: 'chunks', label: 'persist chunks' },
-  { key: 'extract', label: 'extract' },
+  { key: 'chunks', label: 'persist raw chunks' },
+  { key: 'extract', label: 'extract facts' },
   { key: 'dedup', label: 'dedup' },
-  { key: 'classify', label: 'classify' },
-  { key: 'graph', label: 'graph' },
+  { key: 'classify', label: 'detect relationship & classify facts' },
+  { key: 'graph', label: 'versioned graph' },
 ]
+const PIPE_STEP_MS = 2700 // 1.2s base + 1.5s per tab
+const PIPE_LAST_MS = 4500 // assembled graph holds longer before the wrap
 
 const PIPE_TITLES = {
   chunks: 'Persist raw chunks',
@@ -325,27 +524,29 @@ function PipelineFigure() {
   const [step, setStep] = useState(0)
   const k = PIPE_STEPS[step].key
 
-  // Perform once on first scroll into view: assemble through the five steps,
-  // then hand control back to the reader's clicks.
+  // Loop the walkthrough while the exhibit is on screen: 0 → 4, hold the
+  // assembled graph a beat longer, wrap around. A click on any step hands
+  // control to the reader and ends the loop.
+  const reduce = usePrefersReducedMotion()
   const wrapRef = useRef(null)
   const inView = useInView(wrapRef)
-  const autoRef = useRef({ played: false, timer: null })
+  const [autoOn, setAutoOn] = useState(true)
+  const timerRef = useRef(null)
+  const dwell = step === PIPE_STEPS.length - 1 ? PIPE_LAST_MS : PIPE_STEP_MS
   useEffect(() => {
-    const auto = autoRef.current
-    if (!inView || auto.played) return
-    auto.played = true
-    auto.timer = setInterval(() => {
-      setStep(s => {
-        if (s >= PIPE_STEPS.length - 1) { clearInterval(auto.timer); return s }
-        return s + 1
-      })
-    }, 1200)
-    return () => clearInterval(auto.timer)
-  }, [inView])
+    if (!inView || reduce || !autoOn) return
+    timerRef.current = setTimeout(
+      () => setStep(s => (s + 1) % PIPE_STEPS.length),
+      dwell,
+    )
+    return () => clearTimeout(timerRef.current)
+  }, [inView, reduce, autoOn, step, dwell])
   const manualStep = (key) => {
-    clearInterval(autoRef.current.timer)
+    setAutoOn(false)
+    clearTimeout(timerRef.current)
     setStep(PIPE_STEPS.findIndex(s => s.key === key))
   }
+  const progress = inView && !reduce && autoOn ? { ms: dwell, key: step } : null
 
   const [pipe] = useState(() => makePipelineGraph())
   const nodes = useMemo(() => pipe.nodes.filter(n => (n.step ?? 0) <= step), [pipe, step])
@@ -378,6 +579,7 @@ function PipelineFigure() {
         items={PIPE_STEPS.map((s, i) => ({ key: s.key, num: `0${i + 1}`, label: s.label }))}
         active={k}
         onSelect={manualStep}
+        progress={progress}
         meta={{
           kicker: `0${step + 1} · ${PIPE_STEPS[step].label}`,
           title: PIPE_TITLES[k],
@@ -408,7 +610,7 @@ function PipelineFigure() {
               <tr>
                 <td className="cp">CP1 · value <span className="stage">indexing</span></td>
                 <td>short snippets</td><td>round</td>
-                <td className="us">round chunks + facts</td><td className="gain">sharper units</td>
+                <td className="us">round chunks</td><td className="gain">sharper units</td>
               </tr>
               <tr>
                 <td className="cp">CP2 · key <span className="stage">indexing</span></td>
@@ -455,38 +657,65 @@ const TAX_TITLES = {
   DERIVES: 'Inference — new memories from old ones',
 }
 
+const TAX_KEYS = Object.keys(TAX_FACTORIES)
+// Dwell per tab while auto-cycling — long enough for the slowest reveal
+// (stepMs 750 × its timeline) plus a beat on the finished graph.
+const TAX_CYCLE_MS = 6500
+
 function TaxonomyFigure() {
   const [tab, setTab] = useState('UPDATES')
   const [inView, setInView] = useState(false)
-  const keys = Object.keys(TAX_FACTORIES)
+  // Rotate UPDATES → EXTENDS → DERIVES while the exhibit is on screen; each
+  // swap remounts the reveal so the build-up replays. Any click (tab or
+  // replay) hands control to the reader and ends the cycle.
+  const reduce = usePrefersReducedMotion()
+  const [autoOn, setAutoOn] = useState(true)
+  const timerRef = useRef(null)
+  useEffect(() => {
+    if (!inView || reduce || !autoOn) return
+    timerRef.current = setTimeout(
+      () => setTab(t => TAX_KEYS[(TAX_KEYS.indexOf(t) + 1) % TAX_KEYS.length]),
+      TAX_CYCLE_MS,
+    )
+    return () => clearTimeout(timerRef.current)
+  }, [inView, reduce, autoOn, tab])
+  const stopCycle = () => {
+    setAutoOn(false)
+    clearTimeout(timerRef.current)
+  }
+  const selectTab = (t) => {
+    stopCycle()
+    setTab(t)
+  }
   return (
     <IndexShowcase
       no="03"
       kicker="knowledge updates"
       title={<>Three edges, three <em>meanings.</em></>}
       lede="Memories don’t just accumulate — they relate. The classifier assigns one of three edge types, each with hard guardrails. Real scenario data; every animation replays."
-      items={keys.map((kk, i) => ({ key: kk, num: `0${i + 1}`, label: kk, color: TAX_COLOR[kk] }))}
+      items={TAX_KEYS.map((kk, i) => ({ key: kk, num: `0${i + 1}`, label: kk, color: TAX_COLOR[kk] }))}
       active={tab}
-      onSelect={setTab}
+      onSelect={selectTab}
+      progress={inView && !reduce && autoOn ? { ms: TAX_CYCLE_MS, key: tab } : null}
       meta={{
-        kicker: `0${keys.indexOf(tab) + 1} · ${tab}`,
+        kicker: `0${TAX_KEYS.indexOf(tab) + 1} · ${tab}`,
         title: TAX_TITLES[tab],
         desc: TAX_CAP[tab],
         color: TAX_COLOR[tab],
       }}
     >
-      <TaxReveal key={tab} tab={tab} inView={inView} onVisible={setInView} />
+      <TaxReveal key={tab} tab={tab} inView={inView} onVisible={setInView} onInteract={stopCycle} />
     </IndexShowcase>
   )
 }
 
-function TaxReveal({ tab, inView, onVisible }) {
+function TaxReveal({ tab, inView, onVisible, onInteract }) {
   const factory = TAX_FACTORIES[tab]
   const { nodes, links, done, replay } = useGraphReveal(factory, { stepMs: 750, active: inView })
   return (
     <div className="vb-tax-plate">
       <EmbeddedGraph nodes={nodes} links={links} height="100%" labelZoom={1.1} onVisible={onVisible} />
-      <button className="vb-replay" onClick={replay} disabled={!done}>↻ replay</button>
+      <button className="vb-replay" onClick={() => { onInteract?.(); replay() }} disabled={!done}>↻ replay</button>
     </div>
   )
 }
@@ -496,7 +725,29 @@ function TaxReveal({ tab, inView, onVisible }) {
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct']
 
 function TimeFigure() {
-  const [m, setM] = useState(9)
+  // Auto-scrub Jan → Oct on a loop while the figure is on screen, so the
+  // timeline reads as animated rather than a static control. Any scrub or
+  // month click hands control to the reader (❚❚ / ▶ toggle it back); readers
+  // with reduced motion get the full end state and no loop.
+  const reduce = usePrefersReducedMotion()
+  const [m, setM] = useState(() => (reduce ? 9 : 0))
+  const [autoOn, setAutoOn] = useState(true)
+  const wrapRef = useRef(null)
+  const inView = useInView(wrapRef)
+  const timerRef = useRef(null)
+  useEffect(() => {
+    if (!inView || reduce || !autoOn) return
+    timerRef.current = setTimeout(
+      () => setM(x => (x + 1) % MONTHS.length),
+      m === MONTHS.length - 1 ? 3000 : 1200,
+    )
+    return () => clearTimeout(timerRef.current)
+  }, [inView, reduce, autoOn, m])
+  const scrub = (val) => {
+    setAutoOn(false)
+    clearTimeout(timerRef.current)
+    setM(val)
+  }
 
   const [tt] = useState(() => {
     const data = makeTimeTravelGraph()
@@ -542,11 +793,17 @@ function TimeFigure() {
   ]
 
   return (
+    <div ref={wrapRef}>
     <Figure
       num="01"
-      title="time travel — the same graph, asked as of any month"
+      title="time travel: the same graph, asked as of any month."
       height={280}
-      note="No re-ingestion: search(query, { asOf }) is just filters over kept history. The live demo has this as the scrubber mode."
+      note="No reprocessing. Most memory systems overwrite, so the past is gone the moment a fact changes. Here it's retained — rewinding is a filter, not a recomputation."
+      toolbar={reduce ? null : (
+        <button className="vb-step vb-run" onClick={() => setAutoOn(a => !a)}>
+          {autoOn ? '❚❚ pause' : '▶ play'}
+        </button>
+      )}
     >
       <EmbeddedGraph nodes={nodes} links={links} nodeOverrides={overrides} height={280} labelZoom={1.1} />
       <div className="vb-time-ui">
@@ -560,10 +817,39 @@ function TimeFigure() {
             <span className={`a ${gymExpired ? 'stale' : ''}`}>→ {gym}</span>
           </div>
         </div>
-        <input className="vb-slider" type="range" min="0" max="9" value={m}
-          onChange={e => setM(Number(e.target.value))} />
+        {/* the scrubber drawn as what it is: a timeline — month ruler, event
+            dots on the track, a playhead carrying the as-of label. An invisible
+            range input on top keeps drag + keyboard + click-to-jump. */}
+        <div className="vb-tl">
+          <div className="vb-tl-line" />
+          <div className="vb-tl-fill" style={{ width: `${(m / 9) * 100}%` }} />
+          {MONTHS.map((mo, i) => (
+            <span key={`t-${mo}`} className="vb-tl-mtick" style={{ left: `${(i / 9) * 100}%` }} />
+          ))}
+          {ticks.map(t => (
+            <span key={t.cap}
+              className={`vb-tl-event ${m >= t.at ? 'lit' : ''}`}
+              style={{ left: `${(t.at / 9) * 100}%`, '--c': t.color }}
+              title={t.cap} />
+          ))}
+          <div className={`vb-tl-head ${m === 0 ? 'edge-l' : ''} ${m >= 8 ? 'edge-r' : ''}`}
+            style={{ left: `${(m / 9) * 100}%` }}>
+            <span className="vb-tl-asof">as of · {MONTHS[m]} 2023</span>
+            <span className="vb-tl-stem" />
+            <span className="vb-tl-dot" />
+          </div>
+          <input className="vb-tl-input" type="range" min="0" max="9" value={m}
+            aria-label="as-of month"
+            onChange={e => scrub(Number(e.target.value))} />
+          {MONTHS.map((mo, i) => (
+            <button key={mo}
+              className={`vb-tl-month ${i === m ? 'cur' : ''} ${i <= m ? 'past' : ''} ${i % 2 ? 'alt' : ''}`}
+              style={{ left: `${(i / 9) * 100}%` }}
+              onClick={() => scrub(i)}>{mo}</button>
+          ))}
+        </div>
+
         <div className="vb-time-row">
-          <span className="vb-asof">as of · {MONTHS[m]} 2023</span>
           <span className="vb-ticks">
             {ticks.map(t => (
               <span key={t.cap} className="vb-tick" style={{ opacity: m >= t.at ? 1 : 0.35 }}>
@@ -573,8 +859,15 @@ function TimeFigure() {
             ))}
           </span>
         </div>
+
+        <p className="vb-time-mech">
+          Every fact carries a validity window. <span className="hl">asOf</span> filters the graph
+          to what held on that date and resolves supersession as it stood then — same rows, a
+          different clock.
+        </p>
       </div>
     </Figure>
+    </div>
   )
 }
 
@@ -833,7 +1126,14 @@ export function VariantB() {
       <PipelineFigure />
       <TaxonomyFigure />
 
-      <Section no="04" kicker="temporal reasoning" title={<>Ask the past.</>}>
+      <Section no="04" kicker="temporal reasoning · time travel" title={<>Ask the past.</>}>
+        <div className="vb-col">
+          <p className="vb-body">
+            Memory that overwrites can only answer <em>now</em>. Because greymemory keeps every
+            version with the window it was true, you can point it at any past date and read the
+            answer that was current then — no re-ingestion, no replay.
+          </p>
+        </div>
         <TimeFigure />
       </Section>
 
