@@ -136,32 +136,6 @@ function RotatingAgent() {
   )
 }
 
-const INSTALL_CMD = 'npm install greymemory'
-
-function CopyInstall() {
-  const [copied, setCopied] = useState(false)
-  const timer = useRef(null)
-  useEffect(() => () => clearTimeout(timer.current), [])
-
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(INSTALL_CMD)
-    } catch {
-      return // clipboard denied or insecure origin — leave the label truthful
-    }
-    setCopied(true)
-    clearTimeout(timer.current)
-    timer.current = setTimeout(() => setCopied(false), 1600)
-  }
-
-  return (
-    <button className="vb-cta-ghost" onClick={copy} aria-label={`Copy "${INSTALL_CMD}" to clipboard`}>
-      <span className="vb-cta-cmd">{INSTALL_CMD}</span>
-      <span className="vb-cta-copy" role="status">{copied ? '✓ copied' : 'copy'}</span>
-    </button>
-  )
-}
-
 function Hero() {
   return (
     <>
@@ -180,8 +154,11 @@ function Hero() {
         </p>
         <div className="vb-hero-ctas">
           <a className="vb-cta-fill" href="#live" onClick={scrollToLive}>Explore the live graph <span className="vb-arrow-i">→</span></a>
-          {/* Secondary CTA parked, not deleted — drop <CopyInstall /> back in here to
-              restore it. CopyInstall + .vb-cta-ghost styles are left intact. */}
+          <a className="vb-cta-ghost" href="https://www.npmjs.com/package/greymemory"
+            target="_blank" rel="noreferrer">
+            <span className="vb-cta-cmd">npm install greymemory</span>
+            <span className="vb-cta-copy">npm ↗</span>
+          </a>
         </div>
       </div>
 
