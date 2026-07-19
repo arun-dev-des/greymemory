@@ -25,15 +25,28 @@ jobs:
           node "test files/test-task-3-dedup.js"
           node "test files/test-task-4-structured.js"
 
-      # ── greymemory-cc plugin ─────────────────────────────────
+      # ── greymemory-lite ───────────────────────────────────────
+      - name: Install lite deps
+        working-directory: greymemory-lite
+        run: npm install --no-audit --no-fund
+
+      - name: Lite tests (offline — incl. pack-smoke import guard)
+        working-directory: greymemory-lite
+        run: npm test
+
+      - name: Lite type surface (tsc strict)
+        working-directory: greymemory-lite
+        run: npx tsc --noEmit --strict --skipLibCheck --ignoreConfig src/index.d.ts
+
+      # ── claude-greymemory plugin ─────────────────────────────────
       - name: Install plugin deps
-        working-directory: greymemory-cc
+        working-directory: claude-greymemory
         run: npm install --no-audit --no-fund
 
       - name: Plugin unit tests
-        working-directory: greymemory-cc
+        working-directory: claude-greymemory
         run: npm test
 
       - name: Plugin integration tests (offline — stub extractor + embedder)
-        working-directory: greymemory-cc
+        working-directory: claude-greymemory
         run: npm run test:integration

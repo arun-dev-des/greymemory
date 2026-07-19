@@ -5,6 +5,7 @@ benchmark/
 test-*.js
 test-*.ts
 quick-test.js
+test files/.tmp-*
 
 # generated files
 greymemory.config.js
