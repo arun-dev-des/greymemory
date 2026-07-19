@@ -166,7 +166,7 @@ function Hero() {
       <div className="vb-statband">
         <div className="vb-stat"><span className="n">80.0%</span><span className="l">LongMemEval overall · official LLM-as-judge</span></div>
         <div className="vb-stat"><span className="n">$0.013</span><span className="l">per session of ingestion</span></div>
-        <div className="vb-stat"><span className="n">25,000+</span><span className="l">memories on the live graph below</span></div>
+        <div className="vb-stat"><span className="n">25,000+</span><span className="l">memories extracted across the 86-user benchmark run</span></div>
         <div className="vb-stat"><span className="n">1 file</span><span className="l">SQLite. No cloud, no lock-in.</span></div>
       </div>
     </>

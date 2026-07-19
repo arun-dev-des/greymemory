@@ -16,6 +16,8 @@
     <meta name="twitter:title" content="greymemory — self-hosted memory engine for AI agents" />
     <meta name="twitter:description" content="Memory that knows when facts change — served from a single SQLite file to agents like Claude Code, OpenCode, or your own, with any LLM you bring. 80.0% on LongMemEval, self-hosted." />
 
+    <link rel="alternate" type="text/plain" href="/llms.txt" title="llms.txt — agent-readable site summary">
+
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=JetBrains+Mono:wght@300;400;500;600&display=swap" rel="stylesheet">
@@ -69,8 +71,9 @@
         </p>
         <p>
           This page is a <strong>live, interactive knowledge-graph console</strong> rendered over a real
-          <a href="https://arxiv.org/abs/2410.10813">LongMemEval</a> ingestion — 25,000+ extracted memories
-          across 86 users. Open it in a browser to explore the force-directed graph: hover a node to read the
+          <a href="https://arxiv.org/abs/2410.10813">LongMemEval</a> ingestion (the full benchmark run spans
+          25,000+ extracted memories across 86 users; the hosted demo serves four of them live).
+          Open it in a browser to explore the force-directed graph: hover a node to read the
           memory, click one to light its neighborhood (seed → EXTENDS expansion → supersession chain), and
           scrub time to see answers change as facts get superseded and expire.
         </p>
@@ -137,6 +140,7 @@
         <ul>
           <li><strong>Live interactive graph</strong> — this page (open in a browser); the console is embedded near the bottom, or open it directly at the <code>#/viz</code> route.</li>
           <li><strong>Source</strong> — <a href="https://github.com/arun-dev-des/greymemory">github.com/arun-dev-des/greymemory</a></li>
+          <li><strong>For agents</strong> — <a href="/llms.txt">/llms.txt</a>, a machine-readable summary of this site.</li>
         </ul>
         <p style="color: rgba(236,229,218,.5); font-size: 12px; margin-top: 32px;">
           ESM · Node 18+ · better-sqlite3 · React + Vite · react-force-graph · provider-agnostic by design.
