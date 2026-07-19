@@ -2,6 +2,8 @@
 
 > Self-hosted memory for AI agents. Extracts facts, detects contradictions, builds user profiles. Bring your own LLM. Your data never leaves your server.
 
+**[▶ Live demo — greymemory.vercel.app](https://greymemory.vercel.app)** — the full story with interactive exhibits, ending in a real LongMemEval memory graph served live from SQLite: hover to read memories, click to light a retrieval neighborhood, and run a one-click `memory.search()` against the live database. ([npm](https://www.npmjs.com/package/greymemory) · [llms.txt](https://greymemory.vercel.app/llms.txt))
+
 **Why the name?** Named after Grey Matter from Ben 10 — the tiniest alien in the universe, but the smartest being in existence. Also a nod to grey matter in the brain, where intelligence actually lives. Small footprint. Quietly powerful.
 
 ---
@@ -67,6 +69,8 @@ The two libraries' databases are **not** interchangeable — lite refuses to ope
 ![greymemory's memory graph — 218 memories from a LongMemEval run, showing fact/preference/episode nodes linked by EXTENDS, UPDATES, and source-chunk edges](assets/memory-graph.png)
 
 The bundled **greymemory-console** renders your memory graph live over the same SQLite — nodes coloured by type (fact / preference / episode / raw chunk), edges by relation (`EXTENDS`, `UPDATES`, `DERIVES`, source-chunk), plus a time scrubber and live hybrid search. The capture above is a real 218-memory container from a LongMemEval run.
+
+A hosted instance runs at **[greymemory.vercel.app](https://greymemory.vercel.app)** (static client on Vercel, graph API + SQLite on Railway, serving four real LongMemEval users), or run it locally over your own database:
 
 ```bash
 cd greymemory-console && npm run install:all && npm run dev
