@@ -37,7 +37,7 @@ Tested against [LongMemEval](https://arxiv.org/abs/2410.10813) — the standard 
 | multi-session | **66.7%** | 71.4% | -4.7% |
 | **Overall** | **80.0%** | **83.4%** | **-3.4%** |
 
-80% of a funded startup's accuracy. Zero cloud dependency. $0.013 per session ingestion cost. SQLite on your own machine.
+96% of a funded startup's accuracy. Zero cloud dependency. $0.013 per session ingestion cost. SQLite on your own machine.
 
 ---
 
