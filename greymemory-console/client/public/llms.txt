@@ -41,8 +41,13 @@ greymemory implements the LongMemEval paper's recommended optimization at all fo
 
 96% of a funded cloud startup's accuracy — self-hosted, from SQLite, at $0.013 per session of ingestion. On the categories where a memory engine actually matters (preference, temporal, multi-session) greymemory delivers +47, +28, +22 points of lift over just dumping the history into the context window.
 
+## Install
+
+`npm install greymemory` — published on npm (ESM, Node 18+, better-sqlite3 under the hood). Bring your own LLM and embedder as two async functions; `npx greymemory init` scaffolds the config.
+
 ## Links
 
+- [npm package](https://www.npmjs.com/package/greymemory): `npm install greymemory` — the library itself.
 - [Live interactive console](https://greymemory-arun-dev-des-projects.vercel.app/): the force-directed knowledge-graph demo over a real LongMemEval ingestion.
 - [Live graph API](https://greymemory-console-production.up.railway.app/api/viz/datasets): the JSON backend behind the demo — `/api/viz/datasets`, `/api/viz/graph?dataset=greymemory&container=<id>`, `/api/viz/question/<container>`; live search is rate-limited per IP.
 - [Source code (GitHub)](https://github.com/arun-dev-des/greymemory): the full memory engine, benchmark runner, and this console.
