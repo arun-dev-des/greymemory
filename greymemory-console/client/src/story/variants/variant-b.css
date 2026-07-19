@@ -1191,6 +1191,15 @@
   letter-spacing: 0.1em;
   color: var(--bone-faint);
 }
+.var-b .vb-colo-links { display: flex; gap: 18px; }
+.var-b .vb-colo-links a,
+.var-b .vb-mast-link {
+  color: var(--bone-dim);
+  text-decoration: none;
+  transition: color 0.15s;
+}
+.var-b .vb-colo-links a:hover,
+.var-b .vb-mast-link:hover { color: var(--vermillion); }
 
 /* ── responsive ───────────────────────────────────────────────────────── */
 

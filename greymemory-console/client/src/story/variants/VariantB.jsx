@@ -142,7 +142,8 @@ function Hero() {
       <header className="vb-masthead">
         <span>greymemory</span>
         <span className="vb-mast-mid">SELF-HOSTED MEMORY ENGINE</span>
-        <span>no. 001</span>
+        <span>no. 001 · <a className="vb-mast-link" href="https://github.com/arun-dev-des/greymemory"
+          target="_blank" rel="noreferrer">GitHub ↗</a></span>
       </header>
 
       <div className="vb-hero-center">
@@ -1123,6 +1124,10 @@ export function VariantB() {
 
       <footer className="vb-colophon">
         <span>greymemory — ESM · Node 18+ · better-sqlite3 · provider-agnostic by design</span>
+        <span className="vb-colo-links">
+          <a href="https://github.com/arun-dev-des/greymemory" target="_blank" rel="noreferrer">GitHub ↗</a>
+          <a href="https://www.npmjs.com/package/greymemory" target="_blank" rel="noreferrer">npm ↗</a>
+        </span>
         <span>ingestion → extraction → relationships → hybrid search → time travel</span>
       </footer>
     </div>
