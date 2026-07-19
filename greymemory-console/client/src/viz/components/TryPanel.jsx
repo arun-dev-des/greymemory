@@ -36,13 +36,13 @@ export function TryPanel({ question, onRun, disabled, active }) {
         <span className="try-text">{question}</span>
         <span className="try-run">{running ? '◌ running' : ran ? '↻ run again' : '▶ run'}</span>
       </button>
-      <div className="try-hint">
-        {running
-          ? 'running memory.search() on the live database…'
-          : ran
-            ? 'seeds cyan · expansion green · history purple — click to run again'
-            : 'click the question — the graph lights up with what retrieval finds'}
-      </div>
+      {(running || ran) && (
+        <div className="try-hint">
+          {running
+            ? 'running memory.search() on the live database…'
+            : 'seeds cyan · expansion green · history purple — click to run again'}
+        </div>
+      )}
 
       <style>{`
         .try-panel {

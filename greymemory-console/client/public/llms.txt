@@ -2,7 +2,7 @@
 
 > A self-hosted memory engine for AI agents. It extracts atomic memories from conversations, detects contradictions, supersedes stale facts while keeping their full history, and serves the current truth through hybrid BM25 + vector search — all on SQLite, with any LLM and embedder you bring. No cloud dependency, no API lock-in, no data leaving your server. Scores 80.0% on LongMemEval, versus a funded cloud startup's 83.4%.
 
-This site is a live, interactive knowledge-graph console rendered over a real [LongMemEval](https://arxiv.org/abs/2410.10813) ingestion — 25,000+ extracted memories across 86 users. In a browser you can explore the force-directed graph: hover a node to read the memory, click one to light its neighborhood (seed → EXTENDS expansion → supersession chain), and scrub time to watch answers change as facts get superseded and expire. Built for the Razorpay AI Builders challenge — proof of work over a résumé.
+This site is a live, interactive knowledge-graph console rendered over a real [LongMemEval](https://arxiv.org/abs/2410.10813) ingestion (the full benchmark run is 25,000+ extracted memories across 86 users; the hosted demo serves four of those users, live from SQLite). The landing page walks the whole argument: the five memory abilities as worked conversation examples, ChatGPT (57.7%) vs Coze (33.0%) scored on the same questions, a reader-noise table (oracle context vs full history per model), an animated ingestion pipeline that resolves a real contradiction, the three edge types, a time-travel timeline you can scrub, and a retrieval walkthrough. At the bottom sits the real graph: hover a node to read the memory, click one to light its neighborhood (seed → EXTENDS expansion → supersession chain), and press the one-click "try" question to run a real `memory.search()` against the live database and watch retrieval light up the graph. Built for the Razorpay AI Builders challenge — proof of work over a résumé.
 
 Contradictions are resolved at write time: an LLM classifier detects UPDATES / EXTENDS relationships, supersedes stale facts, and keeps full version history for time-travel queries, profiles, and derivations. Three memory types (fact · preference · episode); three edge types (UPDATES · EXTENDS · DERIVES). ESM · Node 18+ · better-sqlite3 · provider-agnostic by design.
 
@@ -44,5 +44,6 @@ greymemory implements the LongMemEval paper's recommended optimization at all fo
 ## Links
 
 - [Live interactive console](https://greymemory-arun-dev-des-projects.vercel.app/): the force-directed knowledge-graph demo over a real LongMemEval ingestion.
+- [Live graph API](https://greymemory-console-production.up.railway.app/api/viz/datasets): the JSON backend behind the demo — `/api/viz/datasets`, `/api/viz/graph?dataset=greymemory&container=<id>`, `/api/viz/question/<container>`; live search is rate-limited per IP.
 - [Source code (GitHub)](https://github.com/arun-dev-des/greymemory): the full memory engine, benchmark runner, and this console.
 - [LongMemEval paper (arXiv 2410.10813)](https://arxiv.org/abs/2410.10813): the benchmark and the indexing → retrieval → reading framework greymemory implements.
